@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thunder"
+version = "0.0.0"
+authors = [{ name = "ecstayalive", email = "ecstayalive@163.com" }]
+description = ""
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = [
+    "torch",
+    "numpy",
+    "gymnasium",
+    "wandb",
+    "mamba_ssm",
+    "tqdm",
+    "rich",
+    "rich_argparse",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black"]
+
+[project.urls]
+"Homepage" = "https://github.com/ecstayalive/thunder"
+"Bug Tracker" = "https://github.com/ecstayalive/thunder/issues"
+
+[project.scripts]
+
+[tool.setuptools.packages.find]
+where = ["thunder"]
