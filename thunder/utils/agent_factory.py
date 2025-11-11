@@ -1,3 +1,7 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,38 +12,207 @@ from thunder.rl import DecActor, GeneralActor, GeneralVNet, NetFactory, RoaActor
 from thunder.rl.distributions import ConsistentGaussian
 from thunder.rl.utils import DimAdaptRMlp, EmbedConvRMlp
 
-__all__ = ["SetupAgent"]
+
+@dataclass
+class AgentPack:
+    agent: Any
+    actor: nn.Module
+    critic: nn.Module
+
+
+@dataclass
+class ModelPack:
+    actor: nn.Module
+    critic: nn.Module
+
+
+@dataclass
+class RegistryEntry:
+    model_builder: "ModelBuilder"
+    # params_builder: Any
+    agent_cls: Any
+
+
+AGENT_REGISTRY: Dict[str, RegistryEntry] = {}
+
+
+def register_agent(name: str, agent_cls: Any):
+    """ """
+
+    def decorator(model_builder: object):
+        AGENT_REGISTRY[name.lower()] = RegistryEntry(model_builder(), agent_cls)
+        return model_builder
+
+    return decorator
+
+
+class ModelBuilder(ABC):
+    """
+    Need a unified interface to build models for different algorithms.
+    """
+
+    @abstractmethod
+    def build(
+        self,
+        cfg: Dict[str, Any],
+        actor_obs_dim: int,
+        critic_obs_dim: int,
+        action_dim: int,
+        heightmap_shape: tuple,
+        foot_heightmap_shape: tuple,
+        device: torch.device,
+        optimize_model: bool = True,
+        pretrained_model_path: Optional[str] = None,
+    ) -> ModelPack:
+        raise NotImplementedError
 
 
 class AgentFactory:
     """ """
 
-    def __init__(self, algo_name: str, device=None):
-        self._agent_mapping = {
-            "ppo": self.ppo_agent,
-            "roa_ppo": self.roa_ppo_agent,
-            "sac": self.sac_agent,
+    def __init__(self):
+        self._model_cache: Dict[str, AgentPack] = {}
+
+    def create(
+        self,
+        algo_name: str,
+        env: Any,
+        cfg: Dict[str, Any],
+        algo_cfg: Dict[str, Any],
+        device: torch.device,
+        optimize_model: bool = True,
+        pretrained_model_path: Optional[str] = None,
+        info: Optional[Dict[str, Any]] = None,
+    ) -> AgentPack:
+        """
+        Creates an agent pack containing the agent, actor, and critic.
+
+        Args:
+            algo_name: The name of the algorithm to create (e.g., "ppo").
+            env: The environment object, used to extract necessary dimensions and info.
+            cfg: General configuration dictionary.
+            algo_cfg: Algorithm-specific hyperparameters.
+            device: The torch device.
+            actor: An optional pre-existing actor module.
+            critic: An optional pre-existing critic module.
+            optimize_model: Flag to compile the models.
+            pretrained_model_path: Path to a pre-trained model.
+            info: Dictionary for optional observation IDs.
+
+        Returns:
+            An AgentPack containing the instantiated agent, actor, and critic.
+        """
+        algo_name_lower = algo_name.lower()
+        entry = AGENT_REGISTRY.get(algo_name_lower)
+        if not entry:
+            raise ValueError(f"The '{algo_name}' is not registered.")
+        if algo_name_lower not in self._model_cache:
+            info = info or {}
+            builder_kwargs = {
+                "cfg": cfg,
+                "actor_obs_dim": env.getObDim(info.get("actor_obs_id", 0)),
+                "critic_obs_dim": env.getObDim(info.get("critic_obs_id", 0)),
+                "action_dim": env.action_dim,
+                "heightmap_shape": env.getLocalHeightMapShape(),
+                "foot_heightmap_shape": env.getLocalFootHeightMapShape(),
+                "device": device,
+                "optimize_model": optimize_model,
+                "pretrained_model_path": pretrained_model_path,
+            }
+            models = entry.model_builder.build(**builder_kwargs)
+            self._model_cache[algo_name_lower] = models
+        else:
+            models = self._model_cache[algo_name_lower]
+        actor, critic = models.actor, models.critic
+
+        # Need a abstract factory method to extract agent-specific params
+        q_limits = env.getRobotJointLimits()
+        q0 = env.getRobotJointPos0()
+        init_std = 0.5 * np.minimum(q0 - q_limits[:, 0], q_limits[:, 1] - q0)
+        init_std = np.minimum(0.5 * env.getRobotMaxTorDq(), init_std)
+        agent_specific_params = {
+            "num_envs": env.num_envs if hasattr(env, "num_envs") else 1,
+            "num_collects": cfg["update_every_n_steps"],
+            "init_std": init_std,
         }
+        AgentClass = entry.agent_cls
+        agent = AgentClass(actor, critic, device=device, **agent_specific_params, **algo_cfg)
+        return AgentPack(agent=agent, actor=actor, critic=critic)
 
-    def ppo_agent(self): ...
 
-    def roa_ppo_agent(self): ...
+@register_agent("ppo", algo.PPO)
+class PpoModelBuilder(ModelBuilder):
+    def build(
+        self,
+        cfg: Dict[str, Any],
+        actor_obs_dim: int,
+        critic_obs_dim: int,
+        action_dim: int,
+        heightmap_shape: tuple,
+        foot_heightmap_shape: tuple,
+        device: torch.device,
+        optimize_model: bool = True,
+        pretrained_model_path: Optional[str] = None,
+    ) -> ModelPack:
+        arch_cfg = cfg["architecture"]
+        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        # c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        # c_rmlp_head = EmbedLstmMlp(
+        #     critic_obs_dim - c_conv_head.in_features + c_conv_head.out_features,
+        #     c_conv_head.out_features,
+        #     1,
+        #     256,
+        #     [256, 256],
+        #     embed_type="shortcut",
+        # )
+        # critic_kernel = EmbedConvRMlp(c_conv_head, c_rmlp_head)
+        critic_kernel, _ = NetFactory.make(critic_obs_dim, 1, arch_cfg["critic"]["kernel"])
+        critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
+        # Actor Network
+        # a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        # a_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        # a_rmlp_head = EmbedLstmMlp(
+        #     actor_obs_dim - a_conv_head.in_features + a_conv_head.out_features,
+        #     a_conv_head.out_features,
+        #     256,
+        #     256,
+        #     embed_type="shortcut",
+        # )
+        # enc = EmbedConvRMlp(a_conv_head, a_rmlp_head)
+        # dec = ConsistentGaussian(256, action_dim, [256])
+        # actor = GeneralActor(DimAdaptRMlp(enc), dec)
+        actor = GeneralActor.make(arch_cfg["actor"], actor_obs_dim, action_dim)
+        orthogonal_modules_(actor, critic)
+        if pretrained_model_path is not None:
+            actor.restore(pretrained_model_path)
+        if optimize_model:
+            actor = torch.compile(actor, mode="max-autotune")
+            critic = torch.compile(critic)
 
-    def sac_agent(self): ...
+        return ModelPack(actor=actor, critic=critic)
 
-    def actor(self, actor_cfg: dict): ...
 
-    def critic(self, critic_cfg: dict): ...
+@register_agent("sac", algo.SAC)
+class SacModelBuilder(ModelBuilder):
+
+    def build(
+        self,
+        cfg,
+        algo_cfg,
+        actor_obs_dim,
+        critic_obs_dim,
+        action_dim,
+        env_specific_info,
+        device,
+        optimize_model=True,
+        pretrained_model_path=None,
+    ): ...
 
 
 class SetupAgent:
     """ """
 
-    def __init__(
-        self,
-        algo_name: str,
-        device=None,
-    ):
+    def __init__(self, algo_name: str, device=None):
         self.alg_name = algo_name
         try:
             factory_name = algo_name.lower()
@@ -95,10 +268,9 @@ def setup_ppo(
         init_std = 0.5 * np.minimum(q0 - q_limits[:, 0], q_limits[:, 1] - q0)
         init_std = np.minimum(0.5 * env.single_obj.getRobotMaxTorDq(), init_std)
         arch_cfg = cfg["architecture"]
-        height_map_shape = env.local_heightmap_shape
-        conv_head = Conv2dBlock(
-            height_map_shape, (16, 16, 32), (3, 3, 3), pool_kernel=(2, 2), gap=True
-        )
+        heightmap_shape = env.local_heightmap_shape
+        foot_heightmap_shape = env.local_foot_heightmap_shape
+        conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((2, 5), (2, 5)), ((1, 3), (1, 3)))
         rmlp_head = EmbedLstmMlp(
             env.getObDim(info.get("critic_obs_id", 0))
             - conv_head.in_features
@@ -114,11 +286,25 @@ def setup_ppo(
         #     env.getObDim(info.get("critic_obs_id", 0)), 1, arch_cfg["critic"]["kernel"]
         # )
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
-        actor = GeneralActor.make(
-            arch_cfg["actor"],
-            env.getObDim(info.get("actor_obs_id", 0)),
-            env.action_dim,
+
+        conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        rmlp_head = EmbedLstmMlp(
+            env.getObDim(info.get("actor_obs_id", 0))
+            - conv_head.in_features
+            + conv_head.out_features,
+            conv_head.out_features,
+            256,
+            256,
+            embed_type="normal",
         )
+        enc = EmbedConvRMlp(conv_head, rmlp_head)
+        dec = ConsistentGaussian(256, env.action_dim, [256])
+        actor = GeneralActor(DimAdaptRMlp(enc), dec)
+        # actor = GeneralActor.make(
+        #     arch_cfg["actor"],
+        #     env.getObDim(info.get("actor_obs_id", 0)),
+        #     env.action_dim,
+        # )
         orthogonal_modules_(actor, critic)
         if pretrained_model_path is not None:
             actor.restore(pretrained_model_path)

@@ -5,6 +5,7 @@ from textwrap import dedent
 from typing import (
     Any,
     List,
+    Literal,
     Optional,
     Union,
     _GenericAlias,
@@ -141,79 +142,80 @@ class ArgParseMeta(type):
             explicit_help = None
             short_alias = None
             has_explicit_default = assigned_value is not ...
-            # --- Check if ArgsOpt is used ---
             if isinstance(assigned_value, ArgsOpt):
                 arg_opt = assigned_value
                 explicit_help = arg_opt.help
                 short_alias = arg_opt.short
-                # Check if ArgsOpt specifies a default
                 if arg_opt.default is not _ARGS_OPT_DEFAULT_SENTINEL:
-                    has_explicit_default = True  # ArgsOpt provides the default
-                    assigned_value = arg_opt.default  # Use this as the effective assigned value
+                    has_explicit_default = True
+                    assigned_value = arg_opt.default
                 else:
-                    # ArgsOpt used without default, treat as no default assigned
                     has_explicit_default = False
                     assigned_value = ...
             help_text = explicit_help or attr_docs.get(attr_name) or f"Value for {attr_name}"
 
-            # --- Determine type details ---
             origin = get_origin(type_hint)
-            type_args = get_args(type_hint)
-            is_optional_syntax = origin is Union and type(None) in type_args
-            is_list_syntax = origin is list or origin is List
-
+            is_optional_syntax = origin is Union and type(None) in get_args(type_hint)
             actual_type = type_hint
             if is_optional_syntax:
-                actual_type = next((t for t in type_args if t is not type(None)), type_hint)
-            elif is_list_syntax and type_args:
-                actual_type = type_args[0]
-            # Tyro style
-            type_name = getattr(actual_type, "__name__", str(actual_type))
-            if isinstance(type_hint, _GenericAlias):
-                type_name = str(type_hint).replace("typing.", "")
+                actual_type = next(
+                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
+                )
 
-            help_parts = [help_text, f"[dim](type: {type_name})[/dim]"]
-
-            is_required = not has_explicit_default and not is_optional_syntax
-            final_default = None
-
-            if not is_required:
-                if has_explicit_default:
-                    # Use the default found (either direct or from ArgsOpt)
-                    final_default = assigned_value
-                elif is_list_syntax:
-                    # Optional list without default -> empty list
-                    final_default = []
-                # else: final_default is None, which is correct
-                if final_default is not None and final_default != []:
-                    help_parts.append(f"[dim](default: {final_default!r})[/dim]")
-
-            final_help = " ".join(help_parts)
-
-            # --- Argument Parser Config ---
             long_name = f"--{attr_name.replace('_', '-')}"
             arg_names = [alias for alias in [short_alias, long_name] if alias]
-            kwargs = {"dest": attr_name, "help": final_help}
+            kwargs = {"dest": attr_name}
+            type_name = ""
 
-            if is_required:
-                kwargs["required"] = True
-            else:
-                kwargs["default"] = final_default
+            actual_origin = get_origin(actual_type)
+            is_list_syntax = actual_origin is list or actual_origin is List
 
-            if actual_type is bool:
-                if not kwargs.get("default", False):
+            if actual_origin is Literal:
+                choices = get_args(actual_type)
+                if not choices:
+                    # print(f"Warning: Empty Literal for {attr_name}. Skipping.")
+                    continue
+                kwargs["choices"] = choices
+                kwargs["type"] = type(choices[0])
+                type_name = f"{{{', '.join(map(str, choices))}}}"
+            elif actual_type is bool:
+                if not (has_explicit_default and assigned_value is True):
                     kwargs["action"] = "store_true"
                 else:
                     kwargs["action"] = "store_false"
+                type_name = "bool"
             elif is_list_syntax:
-                kwargs["type"] = actual_type if actual_type not in [list, List] else str
-                kwargs["nargs"] = "+" if is_required else "*"
+                list_item_type = get_args(actual_type)[0] if get_args(actual_type) else str
+                kwargs["type"] = list_item_type
+                is_required_list = not has_explicit_default and not is_optional_syntax
+                kwargs["nargs"] = "+" if is_required_list else "*"
+                type_name = str(actual_type).replace("typing.", "")
             elif actual_type in [int, float, str]:
                 kwargs["type"] = actual_type
+                type_name = actual_type.__name__
             else:
                 print(f"Warning: Unsupported type: {actual_type} for {attr_name}")
                 continue
+            is_required = not has_explicit_default and not is_optional_syntax
+            final_default = None
+            if is_required:
+                kwargs["required"] = True
+            else:
+                if has_explicit_default:
+                    final_default = assigned_value
+                elif is_list_syntax:
+                    final_default = []
+                # else: final_default is None for Optional[T]
+                kwargs["default"] = final_default
 
+            help_parts = [help_text]
+            if "action" not in kwargs:
+                help_parts.append(f"[dim](type: {type_name})[/dim]")
+
+            if final_default is not None and final_default != []:
+                help_parts.append(f"[dim](default: {final_default!r})[/dim]")
+
+            kwargs["help"] = " ".join(help_parts)
             argparse_configs[attr_name] = (arg_names, kwargs)
 
         new_cls._argparse_configs = argparse_configs
@@ -261,13 +263,6 @@ class ArgParseMeta(type):
 
 
 class ArgBase(metaclass=ArgParseMeta):
-    """Base class for argument parsing using argparse.
-    `...` indicates the attribution is required and no default assigned.
-    `None` indicates the attribution is optional with default None.
-    Attributes are defined via type hints. Use `ArgsOpt` to provide
-    defaults and argparse options simultaneously.
-    """
-
     def __init__(self, **kwargs):
         # Initialize attributes based on parsed values or defaults held by argparse
         config_keys = getattr(self.__class__, "_argparse_configs", {}).keys()

@@ -53,7 +53,7 @@ class MambaBlock(nn.Module):
             padding=d_conv - 1,
             groups=self.d_inner,
             bias=conv_bias,
-            **factory_kwargs
+            **factory_kwargs,
         )
         self.x_proj = nn.Linear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs

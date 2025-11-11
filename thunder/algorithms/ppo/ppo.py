@@ -14,7 +14,7 @@ from .buffer import RolloutBuffer
 GIGA = 2**30
 
 
-class PpoArgs:
+class PpoConf:
     actor: GeneralActor
     critic: GeneralVNet
     num_envs: int

@@ -193,7 +193,7 @@ class InferenceActor(nn.Module):
         self._datatype, self._device = param.dtype, param.device
 
     @torch.inference_mode()
-    def forward(self, x, *, stochastic=False):
+    def forward(self, x: torch.Tensor, *, stochastic=False):
         x = torch.as_tensor(x, dtype=self._datatype, device=self._device)
         if stochastic:
             y, self._hidden = self.actor.act_stochastic(x, self._hidden)
