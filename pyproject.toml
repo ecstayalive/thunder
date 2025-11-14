@@ -29,6 +29,3 @@ dev = ["pytest", "black"]
 "Bug Tracker" = "https://github.com/ecstayalive/thunder/issues"
 
 [project.scripts]
-
-[tool.setuptools.packages.find]
-where = ["thunder"]
