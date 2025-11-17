@@ -1,12 +1,12 @@
 import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+import torch.nn.functional as F
 
+import thunder.ops as ops
 from thunder.nn.mapping import ACTIVATION_CLS_NAME
-
-__all__ = ["MambaBlock"]
 
 
 class MambaBlock(nn.Module):
@@ -84,7 +84,9 @@ class MambaBlock(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.D._no_weight_decay = True
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input: torch.Tensor, state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             input: the input tensor, time series data
@@ -100,14 +102,14 @@ class MambaBlock(nn.Module):
         x = x.transpose(1, 2)  # (B, L, ED)
         x = self.activate_layer(x)
 
-        y = self.ssm(x, z)
+        y, state = self.ssm(x, z, state)
         output = self.out_proj(y)
-        return output
+        return output, state
 
-    def ssm(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """
-        TODO: Rewrite selective_scan_fn to avoid relying on third-party package
-        """
+    def ssm(
+        self, x: torch.Tensor, z: torch.Tensor, state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ """
         A = -torch.exp(self.A_log)  # (ED, N)
         # D = self.D  # (ED,)
         deltaBC = self.x_proj(x)  # (B, L, dt_rank+2*N)
@@ -121,16 +123,158 @@ class MambaBlock(nn.Module):
         B = B.transpose(1, 2)
         C = C.transpose(1, 2)
         z = z.transpose(1, 2)
-        y = selective_scan_fn(
-            x,
-            delta,
-            A,
-            B,
-            C,
-            self.D,
-            z=z,
-            delta_softplus=True,
-            delta_bias=self.dt_proj.bias.float(),
+        y, last_state = ops.selective_scan(
+            x, delta, A, B, C, self.D, z, self.dt_proj.bias.float(), state, delta_softplus=True
         )
+
         y = y.transpose(1, 2)  # (B, L, ED)
-        return y
+        return y, last_state
+
+
+class Mamba2Block(nn.Module):
+    """
+    A implementation of the Mamba2Block as described in the paper
+    "Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality"
+    "https://arxiv.org/abs/2405.21060"
+
+    Args:
+
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        headdim: int = 128,
+        block_len: int = 64,
+        A_init_range=(1.0, 16.0),
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init_floor: float = 1e-4,
+        bias: bool = False,
+        conv_bias: bool = True,
+        activation: str = "silu",
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.d_inner = int(expand * d_model)
+        self.headdim = headdim
+        self.block_len = block_len
+
+        assert (
+            self.d_inner % self.headdim == 0
+        ), f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}"
+        self.nheads = self.d_inner // self.headdim  # H
+
+        self.in_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=bias, **factory_kwargs)
+
+        # depthwise causal conv
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner,
+            bias=conv_bias,
+            **factory_kwargs,
+        )
+        #  dt:   (B, L, nheads)
+        #  B,C:  (B, L, nheads, d_state)
+        self.ssm_proj = nn.Linear(
+            self.d_inner,
+            self.nheads + 2 * self.nheads * self.d_state,  # dt  # B / C
+            bias=False,
+            **factory_kwargs,
+        )
+
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A_log = torch.log(A).to(dtype=dtype)
+        self.A_log = nn.Parameter(A_log)  # (H,)
+        self.A_log._no_weight_decay = True
+
+        # D skip per head
+        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+        self.D._no_weight_decay = True
+
+        # dt bias initialization：softplus(dt_bias) belong to [dt_min, dt_max]
+        dt = torch.exp(
+            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)  # (H,)
+        self.dt_bias._no_weight_decay = True
+        act_cls = getattr(nn, ACTIVATION_CLS_NAME.get(activation, "SiLU"))
+        self.activate_layer = act_cls()
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            input: [B, L, D]
+            return: [B, L, D]
+        """
+        Bsz, L, _ = input.shape
+        xz = self.in_proj(input)  # (B, L, 2*ED)
+        x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
+        x = x.transpose(1, 2)  # (B, ED, L)
+        x = self.conv1d(x)[..., :L]  # (B, ED, L)
+        x = x.transpose(1, 2)  # (B, L, ED)
+        x = self.activate_layer(x)  # (B, L, ED)
+
+        y, last_state = self._ssm_mamba2(x, state)  # (B, L, ED)
+
+        # sigmoid gating
+        y = y * torch.sigmoid(z)
+
+        out = self.out_proj(y)  # (B, L, D)
+        return out, last_state
+
+    def _ssm_mamba2(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Project dt, B, C from x. Construct discrete SSM parameters A_t, X_t
+        """
+        Bsz, L, ED = x.shape
+        H = self.nheads
+        P = self.headdim
+        N = self.d_state
+        # dt_raw, B, C
+        ssm_params = self.ssm_proj(x)  # (B, L, H + 2*H*N)
+        dt_raw, B_raw, C_raw = torch.split(
+            ssm_params,
+            [H, H * N, H * N],
+            dim=-1,
+        )
+        dt = F.softplus(dt_raw + self.dt_bias.view(1, 1, H))  # (B, L, H)
+        B_mat = B_raw.view(Bsz, L, H, N)  # (B, L, H, N)
+        C_mat = C_raw.view(Bsz, L, H, N)  # (B, L, H, N)
+        X = x.view(Bsz, L, H, P)  # (B, L, H, P)
+        # A -> A_t
+        A_cont = -torch.exp(self.A_log)  # (H,)
+        A_t = dt * A_cont.view(1, 1, H)  # (B, L, H)
+        X_disc = X * dt.unsqueeze(-1)  # (B, L, H, P)
+        A_disc = A_t  # (B, L, H)
+        # SSD + initial_states
+        Y_heads, last_state = ops.ssd_minimal(
+            X_disc,
+            A_disc,
+            B_mat,
+            C_mat,
+            self.block_len,
+            initial_states=state,  # (B, H, P, N) or None
+        )  # Y_heads: (B, L, H, P)
+        # final_state: (B, H, P, N)
+        # 5) D skip
+        Y_heads = Y_heads + self.D.view(1, 1, H, 1) * X
+        y = Y_heads.reshape(Bsz, L, ED)  # (B, L, ED)
+        return y, last_state

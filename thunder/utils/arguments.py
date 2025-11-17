@@ -235,8 +235,6 @@ class ArgParseMeta(type):
         docs = {}
         current_attr = None
         in_attr_section = False
-        # Regex to find the start of an attribute description
-        # It looks for "attribute_name (optional_type): description"
         attr_start_regex = re.compile(r"^\s*(\w+)\s*(?:\(.*\))?:\s*(.*)")
 
         lines = docstring.strip().splitlines()

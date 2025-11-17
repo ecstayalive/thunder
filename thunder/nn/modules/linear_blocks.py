@@ -4,8 +4,9 @@ from typing import Iterator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from thunder.nn.mapping import ACTIVATION_CLS_NAME
 from torch import Tensor
+
+from thunder.nn.mapping import ACTIVATION_CLS_NAME
 
 from .activation import Sin
 

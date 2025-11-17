@@ -15,10 +15,10 @@ dependencies = [
     "numpy",
     "gymnasium",
     "wandb",
-    "mamba_ssm",
     "tqdm",
     "rich",
     "rich_argparse",
+    "pytest",
 ]
 
 [project.optional-dependencies]
