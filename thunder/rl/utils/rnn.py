@@ -2,21 +2,7 @@ from typing import Iterator, Optional, Tuple, overload
 
 import torch
 import torch.nn as nn
-
-from thunder.nn import Conv2dBlock, EmbedLstmMlp, GruMlp, LstmMlp
-
-__all__ = [
-    "get_trajectory_lengths",
-    "split_trajectory",
-    "get_trajectory_mask",
-    "unpad_trajectory",
-    "get_hidden_mask",
-    "EmbedConvRMlp",
-    "DimAdaptRMlp",
-    "is_recurrent",
-    "any_recurrent",
-    "all_recurrent",
-]
+from thunder.nn import *
 
 
 @torch.jit.script
@@ -152,41 +138,6 @@ def get_hidden_mask(dones: torch.Tensor) -> torch.Tensor:
     return last_was_done.permute(1, 0)
 
 
-class EmbedConvRMlp(nn.Module):
-    """
-    Args:
-        conv_head: The convolutional head of the network.
-        recurrent_mlp: The recurrent multi-layer perception.
-    """
-
-    def __init__(self, conv_head: Conv2dBlock, recurrent_mlp: LstmMlp | GruMlp | EmbedLstmMlp):
-        super().__init__()
-        self.conv_in_shape = conv_head.in_shape
-        self.conv_in_features = conv_head.in_features
-        self.conv_head = conv_head
-        self.recurrent_mlp = recurrent_mlp
-
-    def forward(self, input: torch.Tensor, hx) -> Tuple[torch.Tensor, ...]:
-        seq_len, batch_size, _ = input.shape
-        rnn_input: torch.Tensor = input[..., : -self.conv_in_features]
-        conv_input: torch.Tensor = (
-            input[..., -self.conv_in_features :]
-            .unflatten(-1, self.conv_in_shape)
-            .flatten(end_dim=1)
-        )
-        conv_output: torch.Tensor = (
-            self.conv_head(conv_input)
-            .flatten(start_dim=-3, end_dim=-1)
-            .unflatten(0, (seq_len, batch_size))
-        )
-        input = torch.cat([rnn_input, conv_output], dim=-1)
-        return self.recurrent_mlp(input, hx)
-
-    def scriptable(self):
-        """ """
-        ...
-
-
 class DimAdaptRMlp(nn.Module):
     """Dimension Adaptive Recurrent Multi-Layer Perception
     Because we created thousands of simulation instances
@@ -204,7 +155,7 @@ class DimAdaptRMlp(nn.Module):
 
     is_recurrent = True
 
-    def __init__(self, recurrent_mlp: LstmMlp | GruMlp | EmbedConvRMlp):
+    def __init__(self, recurrent_mlp: LstmMlp | GruMlp):
         super().__init__()
         self.recurrent_mlp = recurrent_mlp
 
@@ -232,10 +183,7 @@ class DimAdaptRMlp(nn.Module):
             return output, hidden
 
     def scriptable(self):
-        if isinstance(self.recurrent_mlp, EmbedConvRMlp):
-            return self.recurrent_mlp.scriptable()
-        else:
-            return self.recurrent_mlp
+        return self.recurrent_mlp
 
 
 def is_recurrent(network: nn.Module) -> bool:

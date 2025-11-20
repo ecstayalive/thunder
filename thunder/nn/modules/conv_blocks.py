@@ -4,7 +4,6 @@ from typing import Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
-
 from thunder.nn.mapping import ACTIVATION_CLS_NAME
 
 __all__ = ["_ConvNdBlock", "Conv1dBlock", "Conv2dBlock", "ResBasicBlock", "ResBottleneckBlock"]
@@ -391,4 +390,5 @@ class ResBottleneckBlock(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         straight_output = self.straight_pass(input)
         short_cut_output = self.short_cut_pass(input)
+        return straight_output + short_cut_output
         return straight_output + short_cut_output

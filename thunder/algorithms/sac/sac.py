@@ -97,18 +97,14 @@ class SAC:
             init_value = 1.0
             if "_" in self.ent_coef:
                 init_value = float(self.ent_coef.split("_")[1])
-                assert (
-                    init_value > 0.0
-                ), "The initial value of ent_coef must be greater than 0"
+                assert init_value > 0.0, "The initial value of ent_coef must be greater than 0"
 
             # Note: we optimize the log of the entropy coeff which is slightly different from the paper
             # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
-            self.log_ent_coef = th.log(
-                th.ones(1, device=self.device) * init_value
-            ).requires_grad_(True)
-            self.ent_coef_optimizer = th.optim.Adam(
-                [self.log_ent_coef], lr=self.learning_rate
+            self.log_ent_coef = th.log(th.ones(1, device=self.device) * init_value).requires_grad_(
+                True
             )
+            self.ent_coef_optimizer = th.optim.Adam([self.log_ent_coef], lr=self.learning_rate)
         else:
             # Force conversion to float
             # this will throw an error if a malformed string (different from 'auto')
@@ -165,9 +161,7 @@ class SAC:
                 # add entropy term
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
-                target_q_values = (
-                    batch.rewards + ~batch.dones * self.gamma * next_q_values
-                )
+                target_q_values = batch.rewards + ~batch.dones * self.gamma * next_q_values
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
@@ -175,8 +169,7 @@ class SAC:
 
             # Compute critic loss
             critic_loss = 0.5 * sum(
-                nn.functional.mse_loss(current_q, target_q_values)
-                for current_q in current_q_values
+                nn.functional.mse_loss(current_q, target_q_values) for current_q in current_q_values
             )
             critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
@@ -188,9 +181,7 @@ class SAC:
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
             # Min over all critic networks
-            q_values_pi = th.cat(
-                self.critic.evaluate(batch.critic_obs, actions_pi), dim=1
-            )
+            q_values_pi = th.cat(self.critic.evaluate(batch.critic_obs, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
@@ -233,10 +224,7 @@ class SAC:
         if self.replay_buffer.num_samples < self.learning_starts:
             # Warmup phase
             actions = (
-                np.random.rand(self.num_envs, self.actor.action_shape[-1]).astype(
-                    np.float32
-                )
-                * 2.0
+                np.random.rand(self.num_envs, self.actor.action_shape[-1]).astype(np.float32) * 2.0
                 - 1.0
             )
         else:

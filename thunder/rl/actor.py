@@ -23,9 +23,7 @@ __all__ = [
 
 
 class Actor(ABC, nn.Module):
-    """Abstract base class for actors.
-    TODO:
-    """
+    """Abstract base class for actor."""
 
     @abstractmethod
     def explore(self, *args, **kwargs):
@@ -35,6 +33,9 @@ class Actor(ABC, nn.Module):
             **kwargs: Additional arguments.
         """
         ...
+
+    @abstractmethod
+    def act(self, *args, **kwargs): ...
 
 
 class GeneralActor(nn.Module):

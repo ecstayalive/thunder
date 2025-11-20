@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from typing import Iterator, Optional, Tuple
 
 import torch
@@ -10,6 +11,9 @@ from thunder.rl.utils import any_recurrent, is_recurrent
 from .utils.factory import NetFactory
 
 __all__ = ["GeneralVNet", "GeneralQNet", "MultiHeadVNet", "MultiHeadQNet", "MultiVNet", "MultiQNet"]
+
+
+class Critic(ABC, nn.Module): ...
 
 
 class GeneralVNet(nn.Module):
@@ -183,4 +187,5 @@ class MultiQNet(nn.Module):
             output, hx = zip(*[m(q_obs) for m in self.q_nets])
         else:
             output, hx = zip(*[m(q_obs, h) for m, h in zip(self.q_nets, hidden)])
+        return torch.cat(output, dim=-1), tuple(hx)
         return torch.cat(output, dim=-1), tuple(hx)
