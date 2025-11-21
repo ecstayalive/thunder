@@ -5,10 +5,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Type
 
 import numpy as np
+import thunder.algorithms as algo
 import torch
 import torch.nn as nn
-
-import thunder.algorithms as algo
 from thunder.models import *
 from thunder.nn import *
 from thunder.rl import DecActor, GeneralActor, GeneralVNet, NetFactory, RoaActor
@@ -256,7 +255,7 @@ class PerceptionModelFactory:
         heightmap_shape = env.getLocalHeightMapShape()
         foot_heightmap_shape = env.getLocalFootHeightMapShape()
         c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
-        critic_kernel = BeliefPerception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
+        critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
         a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
@@ -291,11 +290,11 @@ class AttentionModelFactory:
         heightmap_shape = env.getLocalHeightMapShape()
         foot_heightmap_shape = env.getLocalFootHeightMapShape()
         c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
-        critic_kernel = AttentionPerception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
+        critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
         a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (3, 3), (2, 2))
-        enc = AttentionPerception(actor_obs_dim, 256, 256, a_conv_head)
+        enc = AttentionBeliefPerception(actor_obs_dim, 256, 256, a_conv_head)
         dec = ConsistentGaussian(256, action_dim, [256])
         actor = GeneralActor(DimAdaptRMlp(enc), dec)
         orthogonal_modules_(actor, critic)
@@ -690,4 +689,5 @@ def setup_sac(env, cfg: dict, algo_cfg: dict, device, info: dict):
         critic = Agent.Critic.make(arch_cfg["critic"], env.ob_dim, env.action_dim)
         info["actor"], info["critic"] = actor, critic
 
+    return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)
     return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)

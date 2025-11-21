@@ -55,7 +55,7 @@ class MultiHeadAttention(nn.Module):
         Returns:
             output: (..., L, E)
         """
-        q_shape = query.shape[:-2]
+        q_shape = query.shape
         L = query.size(-2)
         S = key.size(-2)
         use_causal = self.is_causal and (L == S) and (attn_mask is None)
