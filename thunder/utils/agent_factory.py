@@ -691,3 +691,4 @@ def setup_sac(env, cfg: dict, algo_cfg: dict, device, info: dict):
 
     return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)
     return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)
+    return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)

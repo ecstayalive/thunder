@@ -3,6 +3,7 @@ from typing import Iterator, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from thunder.nn.functional import position_embedding_2d
 from thunder.nn.modules import LinearBlock, MultiHeadAttention, _ConvNdBlock
 
 
@@ -135,7 +136,7 @@ class BeliefPerception(nn.Module):
         rnn_hidden_size: int,
         conv_head: _ConvNdBlock,
         mlp_shape: Iterator[int] = None,
-        gate_hidden_ratio: float = 0.25,
+        gate_hidden_ratio: float = 0.2,
         rnn_num_layers: int = 1,
         rnn_dropout: float = 0.0,
         activation: str = "softsign",
@@ -183,6 +184,10 @@ class BeliefPerception(nn.Module):
 
 
 class AttentionBeliefPerception(nn.Module):
+    """_summary_
+    Args:
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -192,7 +197,7 @@ class AttentionBeliefPerception(nn.Module):
         mlp_shape: Iterator[int] = None,
         embed_dim: int = 32,
         num_heads: int = 4,
-        gate_hidden_ratio: float = 0.25,
+        gate_hidden_ratio: float = 0.2,
         rnn_num_layers: int = 1,
         rnn_dropout: float = 0.0,
         activation: str = "softsign",
@@ -203,8 +208,16 @@ class AttentionBeliefPerception(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.conv_head = conv_head
+        c_out, h_out, w_out = self.conv_head.out_shape
+        self.q_dim = in_features - self.conv_head.in_features
+        self.embed_dim = embed_dim
+        self.mha = MultiHeadAttention(
+            embed_dim, num_heads, q_dim=self.q_dim, k_dim=c_out, v_dim=c_out
+        )
+        self.register_buffer("pos_embedding", position_embedding_2d(c_out, h_out, w_out))
+        self.pos_embedding: torch.Tensor
         self.rnn = nn.LSTM(
-            in_features - self.conv_head.in_features + self.conv_head.out_channels,
+            self.q_dim + self.embed_dim,
             rnn_hidden_size,
             rnn_num_layers,
             dropout=rnn_dropout,
@@ -212,16 +225,6 @@ class AttentionBeliefPerception(nn.Module):
         )
         self.gate_dim = int(gate_hidden_ratio * rnn_hidden_size)
         self.mlp_dim = rnn_hidden_size - self.gate_dim
-        self.embed_dim = embed_dim
-        self.mha = MultiHeadAttention(
-            embed_dim,
-            num_heads,
-            q_dim=self.mlp_dim,
-            k_dim=self.conv_head.out_channels,
-            v_dim=self.conv_head.out_channels,
-            is_causal=False,
-        )
-        self.v_norm = nn.LayerNorm(self.embed_dim)
         self.mlp = LinearBlock(
             self.mlp_dim,
             out_features,
@@ -230,26 +233,25 @@ class AttentionBeliefPerception(nn.Module):
             activate_output,
             **factory_kwargs,
         )
+        self.v_norm = nn.LayerNorm(c_out)
         self.gate_project = nn.Sequential(nn.Linear(self.gate_dim, self.embed_dim), nn.Sigmoid())
         self.project = nn.Linear(self.embed_dim, self.mlp_dim)
 
     def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         seq_len, batch_size, _ = input.shape
-        input1: torch.Tensor = input[..., : -self.conv_head.in_features]
+        query: torch.Tensor = input[..., : self.q_dim]
         conv_input: torch.Tensor = (
-            input[..., -self.conv_head.in_features :]
-            .unflatten(-1, self.conv_head.in_shape)
-            .flatten(end_dim=1)
+            input[..., self.q_dim :].unflatten(-1, self.conv_head.in_shape).flatten(end_dim=1)
         )
-        # [T*B, C, L, W] => [T, B, C]
-        conv_output: torch.Tensor = self.conv_head(conv_input)
-        conv_features = conv_output.mean([-2, -1]).unflatten(0, (seq_len, batch_size))
-        rnn_output, rnn_hidden = self.rnn(torch.cat([input1, conv_features], dim=-1), hx)
         # [T*B, C, L, W] => [T*B, L*W, C]
-        kv = conv_output.flatten(2).transpose(1, 2)
-        values = self.v_norm(
-            self.mha(rnn_output[..., : -self.gate_dim].view(-1, 1, self.mlp_dim), kv, kv)
-        ).view(seq_len, batch_size, self.embed_dim)
+        conv_output: torch.Tensor = self.conv_head(conv_input)
+        conv_output = conv_output + self.pos_embedding
+        kv = self.v_norm(conv_output.flatten(2).transpose(1, 2))
+        values = self.mha(query.view(-1, 1, self.q_dim), kv, kv).view(
+            seq_len, batch_size, self.embed_dim
+        )
+        rnn_output, rnn_hidden = self.rnn(torch.cat([query, values], dim=-1), hx)
         gated = self.gate_project(rnn_output[..., -self.gate_dim :])
         output = self.mlp(rnn_output[..., : -self.gate_dim] + self.project(values * gated))
+        return output, rnn_hidden
         return output, rnn_hidden

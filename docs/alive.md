@@ -32,13 +32,16 @@ $$
 $$
 
 $$
-\begin{gather}
--D_{KL}(q(s)||p(s|o)) + \ln p(o) = -D_{KL}(q(s) || p(s)) + \mathbb{E}_{q(s)} \left[ \ln(p(o|s)) \right] \\
+\begin{align}
+-D_{KL}(q(s)||p(s|o)) + \ln p(o) = -D_{KL}(q(s) || p(s)) + \mathbb{E}_{q(s)} \left[ \ln(p(o|s)) \right]
+\end{align}
+$$
+
+$$
 \begin{align}
 \ln p(o) &= -D_{KL}(q(s) || p(s)) + \mathbb{E}_{q(s)} \left[ \ln(p(o|s)) \right] + D_{KL}(q(s)||p(s|o)) \\
 &= -F + D_{KL}(q(s)||p(s|o))
 \end {align}
-\end{gather}
 $$
 
 We wish for the state estimated from observations to resemble our prior estimation state as closely as possible, meaning $D_{KL}(q(s)||p(s|o))$ should be minimised. Within a dataset, the probability $p(o)$ is constant; thus, when the KL divergence is minimised, the problem transforms into one of minimising free energy $F=D_{KL}(q(s) || p(s)) - \mathbb{E}_{q(s)} \left[ \ln(p(o|s)) \right]$. This is variational inference: converting a difficult-to-optimise problem into one that can be optimised.
@@ -81,11 +84,6 @@ The employment of the Q-function enables the avoidance of the reconstruction of 
 It is imperative that an alternative approach to optimisation is adopted. In active inference, the reinforcement learning optimisation problem is transformed into a inference problem. In other words, the preceding optimisation problem – namely, the action to be taken in order to maximise the expected cumulative reward – is thus rendered: knowing the existence of a successful state that maximises the expected cumulative reward, what action is most likely to have been taken? This view has also been used in [MPO](https://arxiv.org/abs/1806.06920)
 
 However, relying solely on $G(\pi, s_0)$ does not appear to achieve learning as efficient as that of biological organisms. I suspect one reason is that, although we select actions based on free energy, we do not actively seek higher-value states. One example is that when undertaking tasks, we contemplate the future target state and then derive a reasonable course of action based on the current state. For state $s_t$ and our generative model, we believe it can reach any state after a finite number of time steps. One objective of the actor is to find a suitable path along this trajectory. Particularly, if we possess a structured world model, it seems unreasonable not to actively seek out states within this structured space(We use RSSM currently).One question is how we should incorporate this cost into our objective function? And how should we design this architecture?
-
-## GPT5-Answer
-Great—let’s turn your idea into a precise, math-first framework. I’ll use a standard latent world model and show (A) how to search in latent space, including how to turn rewards into a desired latent-state distribution and plan a path to it; and (B) how IL, IRL, and RL become concrete learning procedures inside this world-model agent.
-
----
 
 ## Notation (compact)
 
@@ -280,7 +278,3 @@ $$
 * **Latent goals:** learn a goal encoder $g=f_\kappa(z)$ and a distance $d(g,g')$; set $U(z_H;p_g)=-d(f_\kappa(z_H),g)$.
 * **Stability:** softly tie the planner’s terminal utility to $V(z)$ so search follows learned value ridges rather than raw reconstruction features.
 * **Unified training:** even under IL/IRL, always keep the SAC-style critics and value heads consistent with the soft Bellman in the learned dynamics; this makes later RL fine-tuning seamless.
-
----
-
-If you’d like, I can turn this into a short “theory → pseudocode” note (ELBO, soft-VI, SAC losses, goal-conditioned MPC objective) you can drop straight into a paper’s Methods section.
