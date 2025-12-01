@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Type
 
 import numpy as np
-import thunder.algorithms as algo
 import torch
 import torch.nn as nn
+
+import thunder.algorithms as algo
 from thunder.models import *
 from thunder.nn import *
 from thunder.rl import DecActor, GeneralActor, GeneralVNet, NetFactory, RoaActor
@@ -58,7 +59,7 @@ class AgentPack(dict):
 @dataclass
 class AlgoEntry:
     name: str
-    agent_cls: Type[Any]
+    algo_cls: Type[Any]
     param_builder: SpecBuilder
     default_model_name: str
 
@@ -68,7 +69,12 @@ ALGOS_REGISTRY: Dict[str, AlgoEntry] = {}
 
 
 def register_model(name: str, supported_algos: Optional[Iterable[str]] = None):
-    """ """
+    """_summary_
+
+    Args:
+        name (str): _description_
+        supported_algos (Optional[Iterable[str]], optional): _description_. Defaults to None.
+    """
 
     def decorator(builder_cls: Type[ModelBuilder]):
         builder_instance = builder_cls()
@@ -89,17 +95,20 @@ def register_model(name: str, supported_algos: Optional[Iterable[str]] = None):
     return decorator
 
 
-def register_algo(
-    name: str,
-    agent_cls: Type[Any],
-    default_model_name: str,
-    # allowed_models: Optional[Iterable[str]] = None,
-):
+def register_algo(name: str, algo_cls: Type[Any], default_model_name: str):
+    """_summary_
+
+    Args:
+        name (str): _description_
+        algo_cls (Type[Any]): _description_
+        default_model_name (str): _description_
+    """
+
     def decorator(param_builder: Type[SpecBuilder]):
         algo_name = name.lower()
         ALGOS_REGISTRY[algo_name] = AlgoEntry(
             name=algo_name,
-            agent_cls=agent_cls,
+            algo_cls=algo_cls,
             param_builder=param_builder(),
             default_model_name=default_model_name,
         )
@@ -203,7 +212,7 @@ class AgentFactory:
             models = self._model_cache[cache_key]
         agent_kwargs = algo_entry.param_builder.build(env, cfg, algo_cfg, extra_info)
         agent_kwargs.update(models | {"device": device})
-        AgentClass = algo_entry.agent_cls
+        AgentClass = algo_entry.algo_cls
         agent = AgentClass(**agent_kwargs)
         return AgentPack(agent=agent, models=models)
 
@@ -294,7 +303,7 @@ class AttentionModelFactory:
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
         a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (3, 3), (2, 2))
-        enc = AttentionBeliefPerception(actor_obs_dim, 256, 256, a_conv_head)
+        enc = AttentionBelief(actor_obs_dim, 256, 256, a_conv_head)
         dec = ConsistentGaussian(256, action_dim, [256])
         actor = GeneralActor(DimAdaptRMlp(enc), dec)
         orthogonal_modules_(actor, critic)
@@ -657,7 +666,7 @@ def setup_x_ppo(
         )
         state_encoder = DimAdaptRMlp(nn.LSTM(97, 256, 1))
         state_decoder = LinearBlock(256, 185, [192])
-        action_decoder = ConsistentGaussian(256, 18, [192, 128])
+        action_decoder = ConsistentGaussian(256, 18, shape=[192, 128])
         actor = DecActor(state_encoder, state_decoder, action_decoder)
         critic = algo.GeneralVNet(DimAdaptRMlp(critic_kernel))
         orthogonal_modules_(actor, critic)
@@ -689,6 +698,4 @@ def setup_sac(env, cfg: dict, algo_cfg: dict, device, info: dict):
         critic = Agent.Critic.make(arch_cfg["critic"], env.ob_dim, env.action_dim)
         info["actor"], info["critic"] = actor, critic
 
-    return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)
-    return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)
     return Agent(actor, critic, num_envs=env.num_envs, device=device, **algo_cfg)

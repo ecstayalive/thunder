@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.compile(mode="max-autotune")
 def selective_scan(
     x: torch.Tensor,
     delta: torch.Tensor,

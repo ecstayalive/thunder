@@ -2,7 +2,6 @@ from typing import Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from thunder.nn.functional import position_embedding_2d
 from thunder.nn.modules import LinearBlock, MultiHeadAttention, _ConvNdBlock
 
@@ -52,7 +51,7 @@ class Perception(nn.Module):
         rnn_num_layers: int = 1,
         rnn_dropout: float = 0.0,
         rnn_proj_size: int = 0,
-        activation: str = "softsign",
+        activation: str = "mish",
         activate_output: bool = False,
         device=None,
         dtype=None,
@@ -183,7 +182,7 @@ class BeliefPerception(nn.Module):
         return output, rnn_hidden
 
 
-class AttentionBeliefPerception(nn.Module):
+class AttentionBelief(nn.Module):
     """_summary_
     Args:
     """
@@ -253,5 +252,4 @@ class AttentionBeliefPerception(nn.Module):
         rnn_output, rnn_hidden = self.rnn(torch.cat([query, values], dim=-1), hx)
         gated = self.gate_project(rnn_output[..., -self.gate_dim :])
         output = self.mlp(rnn_output[..., : -self.gate_dim] + self.project(values * gated))
-        return output, rnn_hidden
         return output, rnn_hidden

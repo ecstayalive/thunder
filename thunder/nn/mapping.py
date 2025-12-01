@@ -6,6 +6,7 @@ ACTIVATION_CLS_NAME = {
     "softsign": "Softsign",
     "sigmoid": "Sigmoid",
     "silu": "SiLU",
+    "mish": "Mish",
     "tanh": "Tanh",
     "hard_tanh": "Hardtanh",
     "hardtanh": "Hardtanh",

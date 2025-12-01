@@ -153,3 +153,4 @@ class SirenBlock(nn.Module):
 
     def extra_repr(self) -> str:
         return f"(siren_head): Linear(in_features={self.arch[0]}, out_features={self.arch[1]}, bias=True)"
+        return f"(siren_head): Linear(in_features={self.arch[0]}, out_features={self.arch[1]}, bias=True)"

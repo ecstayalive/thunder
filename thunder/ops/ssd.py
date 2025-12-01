@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.compile(mode="max-autotune")
 def _segsum(x: torch.Tensor) -> torch.Tensor:
     """
     Naive segment sum
@@ -21,6 +22,7 @@ def _segsum(x: torch.Tensor) -> torch.Tensor:
     return x_segsum
 
 
+@torch.compile(mode="max-autotune")
 def ssd_minimal(
     X: torch.Tensor,
     A: torch.Tensor,

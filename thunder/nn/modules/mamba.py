@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 import thunder.ops as ops
 from thunder.nn.mapping import ACTIVATION_CLS_NAME
@@ -85,26 +86,83 @@ class MambaBlock(nn.Module):
         self.D._no_weight_decay = True
 
     def forward(
-        self, input: torch.Tensor, state: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        self, input: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             input: the input tensor, time series data
                 :shape: `[B, L, D]`
+            state: conv_state and ssm_state
         ED: The abbreviation "ED" stands for Expanded Dimension
         """
-
-        _, seq_len, _ = input.shape
+        if state is None:
+            conv_state, ssm_state = None, None
+        else:
+            conv_state, ssm_state = state
+        # _, _, _ = input.shape
         xz = self.in_proj(input)  # (B, L, 2*ED)
         x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
         x = x.transpose(1, 2)  # (B, ED, L)
-        x = self.conv1d(x)[..., :seq_len]  # causal convolution
+        x, last_conv_state = self._conv_forward(x, conv_state)
         x = x.transpose(1, 2)  # (B, L, ED)
         x = self.activate_layer(x)
-
-        y, state = self.ssm(x, z, state)
+        y, last_ssm_state = self.ssm(x, z, ssm_state)
         output = self.out_proj(y)
-        return output, state
+        return output, (last_conv_state, last_ssm_state)
+
+    def step(
+        self,
+        input_t: torch.Tensor,  # (B, D) or (B, 1, D)
+        state: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Process a single time step (or a length-1 segment).
+        Returns:
+            output_t: (B, D)
+            new_state: (ssm_state, conv_state)
+        """
+        if input_t.dim() == 2:
+            input_t = input_t.unsqueeze(1)  # (B, 1, D)
+        out, last_state = self.forward(input_t, state)  # (B, 1, D)
+        return out[:, -1, :], last_state
+
+    def _conv_forward(
+        self, x: torch.Tensor, conv_state: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply depthwise causal conv with correct streaming semantics.
+        Returns:
+            y: (B, ED, L)  - conv output for the *new* L tokens
+            new_conv_state: (B, ED, k-1)
+        """
+        B, ED, L = x.shape
+        k = self.d_conv
+        if k <= 1:
+            y = self.conv1d(x)[..., :L]
+            new_state = x.new_zeros(B, ED, 0)
+            return y, new_state
+        weight = self.conv1d.weight
+        bias = self.conv1d.bias
+        if conv_state is None:
+            y_full = self.conv1d(x)  # (B, ED, L + k - 1)
+            y = y_full[..., :L]  # causal outputs for this chunk
+            if L >= k - 1:
+                last_conv_state = x[..., -(k - 1) :]
+            else:
+                pad_len = (k - 1) - L
+                zero_pad = x.new_zeros(B, ED, pad_len)
+                last_conv_state = torch.cat([zero_pad, x], dim=-1)
+        else:
+            # x_full: (B, ED, k-1 + L)
+            x_full = torch.cat([conv_state, x], dim=-1)
+            # Conv with padding=0: output length is (k-1+L) - k + 1 = L
+            y = F.conv1d(
+                x_full, weight=weight, bias=bias, stride=1, padding=0, groups=self.d_inner
+            )  # (B, ED, L)
+            # update conv_state to last k-1 pre-conv inputs
+            last_conv_state = x_full[..., -(k - 1) :]
+
+        return y, last_conv_state
 
     def ssm(
         self, x: torch.Tensor, z: torch.Tensor, state: Optional[torch.Tensor] = None
@@ -155,13 +213,14 @@ class Mamba2Block(nn.Module):
         dt_init_floor: float = 1e-4,
         bias: bool = False,
         conv_bias: bool = True,
+        official_ops: bool = False,
         activation: str = "silu",
         device=None,
         dtype=None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-
+        self.official_ops = official_ops
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -218,27 +277,72 @@ class Mamba2Block(nn.Module):
         self.activate_layer = act_cls()
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
-    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, input: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             input: [B, L, D]
             return: [B, L, D]
         """
-        Bsz, L, _ = input.shape
+        if state is None:
+            conv_state, ssm_state = None, None
+        else:
+            conv_state, ssm_state = state
+        # _, L, _ = input.shape
         xz = self.in_proj(input)  # (B, L, 2*ED)
         x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
         x = x.transpose(1, 2)  # (B, ED, L)
-        x = self.conv1d(x)[..., :L]  # (B, ED, L)
+        x, last_conv_state = self._conv_forward(x, conv_state)
         x = x.transpose(1, 2)  # (B, L, ED)
         x = self.activate_layer(x)  # (B, L, ED)
 
-        y, last_state = self._ssm_mamba2(x, state)  # (B, L, ED)
+        y, last_ssm_state = self._ssm_mamba2(x, ssm_state)  # (B, L, ED)
 
         # sigmoid gating
         y = y * torch.sigmoid(z)
 
         out = self.out_proj(y)  # (B, L, D)
-        return out, last_state
+        return out, (last_conv_state, last_ssm_state)
+
+    def _conv_forward(
+        self, x: torch.Tensor, conv_state: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply depthwise causal conv with correct streaming semantics.
+        Returns:
+            y: (B, ED, L)  - conv output for the *new* L tokens
+            new_conv_state: (B, ED, k-1)
+        """
+        B, ED, L = x.shape
+        k = self.d_conv
+        if k <= 1:
+            y = self.conv1d(x)[..., :L]
+            new_state = x.new_zeros(B, ED, 0)
+            return y, new_state
+        weight = self.conv1d.weight
+        bias = self.conv1d.bias
+        if conv_state is None:
+            y_full = self.conv1d(x)  # (B, ED, L + k - 1)
+            y = y_full[..., :L]  # causal outputs for this chunk
+            if L >= k - 1:
+                last_conv_state = x[..., -(k - 1) :]
+            else:
+                pad_len = (k - 1) - L
+                zero_pad = x.new_zeros(B, ED, pad_len)
+                last_conv_state = torch.cat([zero_pad, x], dim=-1)
+        else:
+            # x_full: (B, ED, k-1 + L)
+            x_full = torch.cat([conv_state, x], dim=-1)
+            # Conv with padding=0: output length is (k-1+L) - k + 1 = L
+            y = F.conv1d(
+                x_full, weight=weight, bias=bias, stride=1, padding=0, groups=self.d_inner
+            )  # (B, ED, L)
+
+            # update conv_state to last k-1 pre-conv inputs
+            last_conv_state = x_full[..., -(k - 1) :]
+
+        return y, last_conv_state
 
     def _ssm_mamba2(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -265,16 +369,37 @@ class Mamba2Block(nn.Module):
         X_disc = X * dt.unsqueeze(-1)  # (B, L, H, P)
         A_disc = A_t  # (B, L, H)
         # SSD + initial_states
-        Y_heads, last_state = ops.ssd_minimal(
-            X_disc,
-            A_disc,
-            B_mat,
-            C_mat,
-            self.block_len,
-            initial_states=state,  # (B, H, P, N) or None
-        )  # Y_heads: (B, L, H, P)
+        if self.official_ops:
+            Y_heads, last_state = mamba_chunk_scan_combined(
+                X_disc, dt, A_cont, B_mat, C_mat, self.block_len, return_final_states=True
+            )
+        else:
+            Y_heads, last_state = ops.ssd_minimal(
+                X_disc,
+                A_disc,
+                B_mat,
+                C_mat,
+                self.block_len,
+                initial_states=state,  # (B, H, P, N) or None
+            )  # Y_heads: (B, L, H, P)
         # final_state: (B, H, P, N)
         # 5) D skip
         Y_heads = Y_heads + self.D.view(1, 1, H, 1) * X
         y = Y_heads.reshape(Bsz, L, ED)  # (B, L, ED)
         return y, last_state
+
+    def step(
+        self,
+        input_t: torch.Tensor,  # (B, D) or (B, 1, D)
+        state: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Single-timestep / step-wise inference.
+        Returns:
+            output_t: (B, D)
+            new_state: (ssm_state, conv_state)
+        """
+        if input_t.dim() == 2:
+            input_t = input_t.unsqueeze(1)  # (B, 1, D)
+        out, last_state = self.forward(input_t, state)  # (B, 1, D)
+        return out[:, -1, :], last_state

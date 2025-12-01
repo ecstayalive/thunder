@@ -16,8 +16,11 @@ class MultiHeadAttention(nn.Module):
         dropout: float = 0.0,
         is_causal: bool = False,
         bias: bool = False,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
         if embed_dim % num_heads != 0:
             raise ValueError(
                 f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
@@ -33,10 +36,10 @@ class MultiHeadAttention(nn.Module):
         self.v_dim = v_dim if v_dim else embed_dim
         self.dropout = dropout
 
-        self.q_proj = nn.Linear(self.q_dim, embed_dim, bias=bias)
-        self.k_proj = nn.Linear(self.k_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(self.v_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(self.q_dim, embed_dim, bias=bias, **factory_kwargs)
+        self.k_proj = nn.Linear(self.k_dim, embed_dim, bias=bias, **factory_kwargs)
+        self.v_proj = nn.Linear(self.v_dim, embed_dim, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
     def forward(
         self,
@@ -83,3 +86,60 @@ class MultiHeadAttention(nn.Module):
         if len(q_shape) > 1:
             return output.view(*q_shape[:-1], self.embed_dim)
         return output
+
+
+class SpatialSoftmax(nn.Module):
+    """ """
+
+    def __init__(self, temperature: float = 1.0):
+        """
+        Args:
+        """
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, -1)
+        x_flat = x_flat / self.temperature
+        prob_flat = F.softmax(x_flat, dim=-1)
+        prob = prob_flat.view(B, C, H, W)
+        return prob
+
+
+class ExpectSpatialSoftmax(nn.Module):
+    """ """
+
+    def __init__(self, height: int, width: int, temperature: float = 1.0):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.temperature = temperature
+        xs = torch.linspace(-1.0, 1.0, width)
+        ys = torch.linspace(-1.0, 1.0, height)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [H, W]
+        coord = torch.stack([xx, yy], dim=-1)
+        self.register_buffer("coord", coord)  # [H, W, 2]
+        self.coord: torch.Tensor
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, C, H, W]
+
+        Returns:
+            keypoints: [B, C, 2]
+        """
+        B, C, H, W = x.shape
+        assert (
+            H == self.height and W == self.width
+        ), f"got ({H}, {W}), expected ({self.height}, {self.width})"
+
+        x_flat = x.view(B, C, -1)  # [B, C, H*W]
+        x_flat = x_flat / self.temperature
+        prob_flat = F.softmax(x_flat, dim=-1)  # [B, C, H*W]
+        # coord: [H, W, 2] -> [H*W, 2]
+        coord = self.coord.view(-1, 2)  # [H*W, 2]
+        # (B, C, H*W) @ (H*W, 2) -> (B, C, 2)
+        keypoints = prob_flat @ coord  # [B, C, 2]
+        return keypoints
