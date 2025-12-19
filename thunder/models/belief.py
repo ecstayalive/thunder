@@ -3,7 +3,8 @@ from typing import Iterator, Optional, Tuple
 import torch
 import torch.nn as nn
 from thunder.nn.functional import position_embedding_2d
-from thunder.nn.modules import LinearBlock, MultiHeadAttention, _ConvNdBlock
+from thunder.nn.modules import LinearBlock, _ConvNdBlock
+from thunder.nn.modules.attention import *
 
 
 class Perception(nn.Module):
@@ -90,6 +91,76 @@ class Perception(nn.Module):
         )
         rnn_output, rnn_hidden = self.rnn(torch.cat([input1, conv_output], dim=-1), hx)
         output = self.mlp(rnn_output + self.project(conv_output))
+        return output, rnn_hidden
+
+
+class LinearMhaPerception(nn.Module):
+    """_summary_
+    Args:
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rnn_hidden_size: int,
+        conv_head: _ConvNdBlock,
+        mlp_shape: Iterator[int] = None,
+        embed_dim: int = 32,
+        num_heads: int = 2,
+        rnn_num_layers: int = 1,
+        rnn_dropout: float = 0.0,
+        activation: str = "mish",
+        activate_output: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.conv_head = conv_head
+        c_out, h_out, w_out = self.conv_head.out_shape
+        self.q_dim = in_features - self.conv_head.in_features
+        self.embed_dim = embed_dim
+        self.mha = MultiHeadLinearCrossAttention(
+            embed_dim, num_heads, q_dim=self.q_dim, kv_dim=c_out
+        )
+        self.register_buffer("pos_embedding", position_embedding_2d(c_out, h_out, w_out))
+        self.pos_embedding: torch.Tensor
+        self.rnn = nn.LSTM(
+            self.q_dim + self.embed_dim,
+            rnn_hidden_size,
+            rnn_num_layers,
+            dropout=rnn_dropout,
+            **factory_kwargs,
+        )
+        self.mlp = LinearBlock(
+            rnn_hidden_size,
+            out_features,
+            mlp_shape,
+            activation,
+            activate_output,
+            **factory_kwargs,
+        )
+        self.v_norm = nn.LayerNorm(c_out)
+        self.project = nn.Linear(self.embed_dim, rnn_hidden_size)
+        self.reset_parameters()
+
+    def reset_parameters(self, gain: float = 2.0) -> None:
+        nn.init.orthogonal_(self.project.weight, math.sqrt(gain))
+
+    def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        L, B, _ = input.shape
+        query: torch.Tensor = input[..., : self.q_dim]
+        conv_input: torch.Tensor = (
+            input[..., self.q_dim :].unflatten(-1, self.conv_head.in_shape).flatten(end_dim=1)
+        )
+        # [T*B, C, L, W] => [T*B, L*W, C]
+        conv_output: torch.Tensor = self.conv_head(conv_input)
+        conv_output = conv_output + self.pos_embedding
+        kv = self.v_norm(conv_output.flatten(2).transpose(1, 2))
+        values = self.mha(query.view(-1, 1, self.q_dim), kv).view(L, B, self.embed_dim)
+        rnn_output, rnn_hidden = self.rnn(torch.cat([query, values], dim=-1), hx)
+        output = self.mlp(rnn_output + self.project(values))
         return output, rnn_hidden
 
 
@@ -182,7 +253,7 @@ class BeliefPerception(nn.Module):
         return output, rnn_hidden
 
 
-class AttentionBelief(nn.Module):
+class MhaBelief(nn.Module):
     """_summary_
     Args:
     """
@@ -210,8 +281,8 @@ class AttentionBelief(nn.Module):
         c_out, h_out, w_out = self.conv_head.out_shape
         self.q_dim = in_features - self.conv_head.in_features
         self.embed_dim = embed_dim
-        self.mha = MultiHeadAttention(
-            embed_dim, num_heads, q_dim=self.q_dim, k_dim=c_out, v_dim=c_out
+        self.mha = MultiHeadLinearCrossAttention(
+            embed_dim, num_heads, q_dim=self.q_dim, kv_dim=c_out
         )
         self.register_buffer("pos_embedding", position_embedding_2d(c_out, h_out, w_out))
         self.pos_embedding: torch.Tensor
@@ -235,9 +306,16 @@ class AttentionBelief(nn.Module):
         self.v_norm = nn.LayerNorm(c_out)
         self.gate_project = nn.Sequential(nn.Linear(self.gate_dim, self.embed_dim), nn.Sigmoid())
         self.project = nn.Linear(self.embed_dim, self.mlp_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self, gain: float = 2.0) -> None:
+        for module in self.gate_project.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, math.sqrt(gain))
+        nn.init.orthogonal_(self.project.weight, math.sqrt(gain))
 
     def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        seq_len, batch_size, _ = input.shape
+        L, B, _ = input.shape
         query: torch.Tensor = input[..., : self.q_dim]
         conv_input: torch.Tensor = (
             input[..., self.q_dim :].unflatten(-1, self.conv_head.in_shape).flatten(end_dim=1)
@@ -246,10 +324,72 @@ class AttentionBelief(nn.Module):
         conv_output: torch.Tensor = self.conv_head(conv_input)
         conv_output = conv_output + self.pos_embedding
         kv = self.v_norm(conv_output.flatten(2).transpose(1, 2))
-        values = self.mha(query.view(-1, 1, self.q_dim), kv, kv).view(
-            seq_len, batch_size, self.embed_dim
-        )
+        values = self.mha(query.view(-1, 1, self.q_dim), kv).view(L, B, self.embed_dim)
         rnn_output, rnn_hidden = self.rnn(torch.cat([query, values], dim=-1), hx)
         gated = self.gate_project(rnn_output[..., -self.gate_dim :])
         output = self.mlp(rnn_output[..., : -self.gate_dim] + self.project(values * gated))
+        return output, rnn_hidden
+
+
+class SpatialBelief(nn.Module):
+    """_summary_
+    Args:
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rnn_hidden_size: int,
+        conv_head: _ConvNdBlock,
+        mlp_shape: Iterator[int] = None,
+        gate_hidden_ratio: float = 0.2,
+        rnn_num_layers: int = 1,
+        rnn_dropout: float = 0.0,
+        activation: str = "softsign",
+        activate_output: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.conv_head = conv_head
+        c_out, h_out, w_out = self.conv_head.out_shape
+        self.rnn = nn.LSTM(
+            in_features - self.conv_head.in_features + 4 * c_out,
+            rnn_hidden_size,
+            rnn_num_layers,
+            dropout=rnn_dropout,
+            **factory_kwargs,
+        )
+        self.gate_dim = int(gate_hidden_ratio * rnn_hidden_size)
+        self.mlp_dim = rnn_hidden_size - self.gate_dim
+        self.mlp = LinearBlock(
+            self.mlp_dim,
+            out_features,
+            mlp_shape,
+            activation,
+            activate_output,
+            **factory_kwargs,
+        )
+        self.spatial_attention = SpatialArgSoftmaxUncertainty(h_out, w_out)
+        self.gate_project = nn.Sequential(nn.Linear(self.gate_dim, 2 * c_out), nn.Sigmoid())
+        self.project = nn.Linear(2 * c_out, self.mlp_dim)
+
+    def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        L, B, _ = input.shape
+        conv_input: torch.Tensor = (
+            input[..., -self.conv_head.in_features :]
+            .unflatten(-1, self.conv_head.in_shape)
+            .flatten(end_dim=1)
+        )
+        conv_output: torch.Tensor = self.conv_head(conv_input)  # [T*B, C, H, W]
+        key_points, var_xy, peak = self.spatial_attention(conv_output)  # [T*B, C, 2]
+        key_points = key_points.view(L, B, -1)  # [T, B, 2C]
+        var_xy = var_xy.view(L, B, -1)  # [T, B, 2C]
+        peak = peak.view(L, B, -1)  # [T, B, C]
+        rnn_input1: torch.Tensor = input[..., : -self.conv_head.in_features]  # [T, B, C]
+        rnn_output, rnn_hidden = self.rnn(torch.cat([rnn_input1, key_points, var_xy], dim=-1), hx)
+        gated = self.gate_project(rnn_output[..., -self.gate_dim :])
+        output = self.mlp(rnn_output[..., : -self.gate_dim] + self.project(key_points * gated))
         return output, rnn_hidden

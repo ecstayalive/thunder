@@ -5,7 +5,8 @@ import torch
 import torch as th
 from torch import nn
 
-from thunder.rl import GeneralActor, MultiQNet, create_target, soft_update
+from thunder.nn import clone_net
+from thunder.rl import GeneralActor, MultiQNet, soft_update
 
 from .buffer import ReplayBuffer
 
@@ -54,7 +55,7 @@ class SAC:
         self.device = th.device(device)
         self.actor = actor.to(device)
         self.critic = critic.to(device)
-        self.critic_target = create_target(critic)
+        self.critic_target = clone_net(critic, False)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=learning_rate)
 
@@ -270,4 +271,5 @@ class SAC:
             self.log_ent_coef = state_dict["log_ent_coef"]
             self.ent_coef_optimizer.load_state_dict(state_dict["ent_coef_optimizer"])
         elif "log_ent_coef" in state_dict:
+            raise ValueError("Loading a model with different entropy setting")
             raise ValueError("Loading a model with different entropy setting")

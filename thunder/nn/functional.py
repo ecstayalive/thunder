@@ -1,10 +1,8 @@
 import torch
 from torch import Tensor
 
-__all__ = ["squash"]
 
-
-@torch.jit.script
+@torch.compile(mode="max-autotune", fullgraph=True)
 def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     r"""Non-Linear activation function used in Capsule Network
 
@@ -28,7 +26,7 @@ def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     return scale * input
 
 
-@torch.jit.script
+@torch.compile
 def position_embedding_2d(channels: int, height: int, width: int, temperature: int = 10000):
     """This is position embedding for spatial attention.
     For spatial attention, d_model can be considered as the channel dimension.

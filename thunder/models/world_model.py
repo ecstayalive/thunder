@@ -24,6 +24,12 @@ class RepresentationModel(nn.Module):
 
 
 class TransitionModel(nn.Module):
+    """_summary_
+
+    Args:
+        nn (_type_): _description_
+    """
+
     def __init__(self, state_size: int, dtype=None, device=None):
         super().__init__()
         self.factory_kwargs = {"device": device, "dtype": dtype}

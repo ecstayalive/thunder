@@ -5,10 +5,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Type
 
 import numpy as np
+import thunder.algorithms as algo
 import torch
 import torch.nn as nn
-
-import thunder.algorithms as algo
 from thunder.models import *
 from thunder.nn import *
 from thunder.rl import DecActor, GeneralActor, GeneralVNet, NetFactory, RoaActor
@@ -152,7 +151,7 @@ class AgentFactory:
     """ """
 
     def __init__(self):
-        self._model_cache: Dict[str, AgentPack] = {}
+        self._model_cache: Dict[str, ModelPack] = {}
 
     def create(
         self,
@@ -197,7 +196,7 @@ class AgentFactory:
                 f"Model factory '{model_factory_name}' not found for algo '{algo_name}'."
             )
         cache_key = f"{algo_name}_{model_factory_name}"
-        if algo_name not in self._model_cache:
+        if cache_key not in self._model_cache:
             models = model_builder.build(
                 env,
                 cfg,
@@ -263,7 +262,8 @@ class PerceptionModelFactory:
         action_dim = env.action_dim
         heightmap_shape = env.getLocalHeightMapShape()
         foot_heightmap_shape = env.getLocalFootHeightMapShape()
-        c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        # c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
         critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
@@ -280,8 +280,8 @@ class PerceptionModelFactory:
         return ModelPack(actor=actor, critic=critic)
 
 
-@register_model("test_attention", ("ppo", "sac"))
-class AttentionModelFactory:
+@register_model("test_mha", ("ppo", "sac"))
+class MhaModelFactory:
     def build(
         self,
         env: Any,
@@ -298,12 +298,49 @@ class AttentionModelFactory:
         action_dim = env.action_dim
         heightmap_shape = env.getLocalHeightMapShape()
         foot_heightmap_shape = env.getLocalFootHeightMapShape()
-        c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        # c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
         critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
         a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (3, 3), (2, 2))
-        enc = AttentionBelief(actor_obs_dim, 256, 256, a_conv_head)
+        enc = MhaBelief(actor_obs_dim, 256, 256, a_conv_head, num_heads=2)
+        dec = ConsistentGaussian(256, action_dim, [256])
+        actor = GeneralActor(DimAdaptRMlp(enc), dec)
+        orthogonal_modules_(actor, critic)
+        if pretrained_model_path is not None:
+            actor.restore(pretrained_model_path)
+        if optimize_model:
+            actor = torch.compile(actor, mode="max-autotune")
+            critic = torch.compile(critic)
+        return ModelPack(actor=actor, critic=critic)
+
+
+@register_model("test_spatial", ("ppo", "sac"))
+class SpatialAttentionModelFactory:
+    def build(
+        self,
+        env: Any,
+        cfg: Dict[str, Any],
+        algo: Dict[str, Any],
+        device: torch.device,
+        optimize_model: bool = True,
+        pretrained_model_path: Optional[str] = None,
+        extra_info: Optional[Dict[str, Any]] = None,
+    ) -> ModelPack:
+        arch_cfg = cfg["architecture"]
+        actor_obs_dim = env.getObDim(extra_info.get("actor_obs_id", 0))
+        critic_obs_dim = env.getObDim(extra_info.get("critic_obs_id", 0))
+        action_dim = env.action_dim
+        heightmap_shape = env.getLocalHeightMapShape()
+        foot_heightmap_shape = env.getLocalFootHeightMapShape()
+        # c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
+        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
+        critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
+        # Actor Network
+        a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (3, 3), (2, 2))
+        enc = SpatialBelief(actor_obs_dim, 256, 256, a_conv_head)
         dec = ConsistentGaussian(256, action_dim, [256])
         actor = GeneralActor(DimAdaptRMlp(enc), dec)
         orthogonal_modules_(actor, critic)
