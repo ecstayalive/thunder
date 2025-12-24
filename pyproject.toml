@@ -11,8 +11,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = [
-    "torch",
-    "mamba-ssm",
     "numpy",
     "gymnasium",
     "wandb",
@@ -20,13 +18,18 @@ dependencies = [
     "rich",
     "rich_argparse",
     "pytest",
+    "tyro",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest", "black"]
 
 [project.urls]
 "Homepage" = "https://github.com/ecstayalive/thunder"
 "Bug Tracker" = "https://github.com/ecstayalive/thunder/issues"
 
 [project.scripts]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0.0", "mamba-ssm"]
+jax = ["jax>=0.4.0", "jaxlib>=0.4.0", "flax>=0.7.0", "optax>=0.1.7"]
+warp = ["warp-lang"]
+all = ["thunder[torch,jax]"]
