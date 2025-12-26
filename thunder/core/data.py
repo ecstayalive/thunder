@@ -1,15 +1,35 @@
 from __future__ import annotations
 
 import os
+from collections import namedtuple
 from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
 
 if TYPE_CHECKING:
-    from .executor.executor import ExecutorProtocol
+    from .executor.interface import ExecutorProtocol
 
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
 TBatch = TypeVar("TBatch", bound="Batch")
+
+
+class ModelPack:
+    """ """
+
+    def __new__(cls, **kwargs):
+        from .module import ThunderModule
+
+        wrapped_kwargs = {}
+        for k, v in kwargs.items():
+            if not isinstance(v, ThunderModule):
+                v = ThunderModule(v, k)
+            else:
+                if hasattr(v, "_name") and v._name != k:
+                    v = v.replace(_name=k) if hasattr(v, "replace") else setattr(v, "_name", k) or v
+            wrapped_kwargs[k] = v
+        fields = sorted(wrapped_kwargs.keys())
+        Pack = namedtuple("ModelPack", fields)
+        return Pack(**wrapped_kwargs)
 
 
 @dataclass(slots=True)
@@ -57,9 +77,9 @@ class Batch:
             changes["extra"] = {k: fn(v) for k, v in self.extra.items()}
         return replace(self, **changes)
 
-    def to(self: TBatch, device_handler: ExecutorProtocol) -> TBatch:
+    def to(self: TBatch, executor: ExecutorProtocol) -> TBatch:
         """ """
-        return self.map(device_handler.to_device)
+        return self.map(executor.to_device)
 
     @property
     def batch_size(self) -> int:
@@ -108,7 +128,6 @@ if _BACKEND == "jax":
         extra_vals = children[n_core:]
         init_kwargs = dict(zip(core_names, core_vals))
         extra_dict = dict(zip(extra_keys, extra_vals))
-
         return Batch(extra=extra_dict, **init_kwargs)
 
     jax.tree_util.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)

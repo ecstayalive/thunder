@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
-    from .data import Batch
+    from .data import Batch, ModelPack
     from .module import ThunderModule
 
 
@@ -44,21 +44,17 @@ class Objective(Operation):
 
     """
 
-    def __init__(self, name: str, weight: float = 1.0, params_key: str = "default"):
+    def __init__(self, name: str, weight: float = 1.0):
         super().__init__(name=name, interval=1)
         self.weight = weight
-        self.params_key = params_key
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         if ctx.step % self.interval != 0:
             return ctx, {}
-        params = ctx.params.get(self.params_key)
-        _, metrics = self.forward(ctx.batch, ctx.model, params)
+        _, metrics = self.forward(ctx.batch, ctx.models, ctx.params)
         return ctx, metrics
 
-    def forward(
-        self, batch: Batch, model: ThunderModule, params: Any
-    ) -> Tuple[Any, Dict[str, Any]]:
+    def forward(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
         loss, metrics = self.compute(batch, model, params)
         weighted_loss = self.weight * loss
         metrics = {
@@ -69,9 +65,7 @@ class Objective(Operation):
         return weighted_loss, metrics
 
     @abstractmethod
-    def compute(
-        self, batch: Batch, model: ThunderModule, params: Any
-    ) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
         pass
 
 

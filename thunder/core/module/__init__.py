@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     elif _BACKEND == "warp":
         from ._warp_impl import WarpModule as ThunderModule
     else:
-        from .module import ModuleProtocol as ThunderModule
+        from .interface import ModuleProtocol as ThunderModule
 else:
     if _BACKEND not in _REGISTRY:
         raise ValueError(

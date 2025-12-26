@@ -32,4 +32,4 @@ dependencies = [
 torch = ["torch>=2.0.0", "mamba-ssm"]
 jax = ["jax>=0.4.0", "jaxlib>=0.4.0", "flax>=0.7.0", "optax>=0.1.7"]
 warp = ["warp-lang"]
-all = ["thunder[torch,jax]"]
+all = ["thunder[torch,jax,warp]"]

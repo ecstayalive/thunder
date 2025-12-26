@@ -40,7 +40,7 @@ class WarpExecutor:
 
         params_list = ctx.params.get(target)
         optimizer = ctx.opt_states[opt]
-        model = ctx.model
+        model = ctx.models
         batch = ctx.batch
 
         tape = wp.Tape()
@@ -53,9 +53,8 @@ class WarpExecutor:
                 pass
             pass
         tape.backward(loss=total_loss)
-        # optimizer.step(grad_ptr_list, param_ptr_list)
         pass
         return metrics, None, None
 
-    def init_state(model: WarpModule, batch: Batch, optim_config: Dict[str, Any]):
+    def init(model: WarpModule, batch: Batch, optim_config: Dict[str, Any]):
         pass

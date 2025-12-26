@@ -8,9 +8,10 @@ class ModuleProtocol(Protocol):
     """ """
 
     _module: Any
+    _name: str
     _backend: str
 
-    def __init__(self, module: Any, backend: str = ...) -> None: ...
+    def __init__(self, module: Any, name: str, backend: str = ...) -> None: ...
 
     def __call__(self, x: Any, state: Any = None, carry: Any = None, **kwargs: Any) -> Any: ...
 

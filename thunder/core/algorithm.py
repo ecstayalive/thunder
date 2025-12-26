@@ -6,31 +6,26 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from .context import ExecutionContext
 
 if TYPE_CHECKING:
-    from .data import Batch
-    from .executor.executor import ExecutorProtocol
+    from .data import Batch, ModelPack
+    from .executor.interface import ExecutorProtocol
     from .module import ThunderModule
     from .operation import Operation
 
 
 class GraphAlgorithm(ABC):
-    def __init__(self, model: ThunderModule, executor: ExecutorProtocol, pipeline: List[Operation]):
-        self.model = model
+    def __init__(self, models: ModelPack, executor: ExecutorProtocol, pipeline: List[Operation]):
+        self.models = models
         self.executor = executor
         self.ctx: Optional[ExecutionContext] = None
         self.pipeline = pipeline
 
     def build(self, sample_batch: Batch, optim_config: Dict[str, Any]) -> None:
-        params, opt_states, meta = self.executor.init_state(
-            model=self.model, batch=sample_batch, optim_config=optim_config
-        )
-        self.ctx = ExecutionContext.create(executor=self.executor, model=self.model, batch=None)
-        self.ctx = self.ctx.replace(params=params, opt_states=opt_states)
-        self.ctx.update_meta(**meta)
+        self.ctx = self.executor.init(self.models, sample_batch, optim_config)
+        self.models = self.ctx.models
 
     def step(self, batch: Batch) -> Dict[str, Any]:
         if self.ctx is None:
             raise RuntimeError("Algorithm not built. Please call .build() first.")
-        # Load data
         metrics = {}
         self.ctx = self.ctx.replace(batch=batch)
         for op in self.pipeline:

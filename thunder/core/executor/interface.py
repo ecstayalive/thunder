@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Protocol, Tuple, runtime_checkable
 
 if TYPE_CHECKING:
     from ..context import ExecutionContext
-    from ..data import Batch
+    from ..data import Batch, ModelPack
     from ..module import ThunderModule
     from ..operation import Objective
 
@@ -12,6 +13,11 @@ if TYPE_CHECKING:
 @runtime_checkable
 class ExecutorProtocol(Protocol):
     """ """
+
+    @abstractmethod
+    def call(self, model: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """ """
+        ...
 
     def optimize(
         self,
@@ -24,13 +30,10 @@ class ExecutorProtocol(Protocol):
         """ """
         ...
 
-    def init_state(
+    def init(
         self, model: ThunderModule, batch: Batch, optim_config: Dict[str, Any]
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-        """
-        Returns:
-            (params, opt_states, meta)
-        """
+    ) -> ExecutionContext:
+        """ """
         ...
 
     def to_device(self, data: Any) -> Any: ...

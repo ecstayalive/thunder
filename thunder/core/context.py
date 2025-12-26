@@ -4,21 +4,30 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
-    from .data import Batch
-    from .executor.executor import ExecutorProtocol
+    from .data import Batch, ModelPack
+    from .executor.interface import ExecutorProtocol
     from .module import ThunderModule
 
 
-@dataclass
+@dataclass(slots=True)
 class ExecutionContext:
-    """ """
+    """
+    Args:
+        step:
+        batch:
+        params:
+        opt_states:
+        executor:
+        model:
+        meta:
+    """
 
     step: int
     batch: Optional[Batch]
     params: Dict[str, Any]
     opt_states: Dict[str, Any]
     executor: ExecutorProtocol
-    model: ThunderModule
+    models: ModelPack
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:
@@ -62,11 +71,22 @@ class ExecutionContext:
 
     def get_param(self, key: str) -> Any:
         """ """
-        if key not in self.params:
+        try:
+            return self.params[key]
+        except KeyError:
             raise ValueError(
                 f"Parameter group '{key}' not found in Context. Available: {list(self.params.keys())}"
             )
-        return self.params[key]
+
+    def get_model(self, key: str) -> ThunderModule:
+        """ """
+        try:
+            return getattr(self.models, key)
+        except KeyError:
+            raise ValueError(
+                f"Model '{key}' not found in Context. "
+                f"Available models: {list(self.models.keys())}"
+            )
 
     def update_meta(self, **kwargs) -> None:
         """ """
@@ -74,9 +94,9 @@ class ExecutionContext:
 
     @classmethod
     def create(
-        cls, executor: ExecutorProtocol, model: ThunderModule, batch: Optional[Batch] = None
+        cls, executor: ExecutorProtocol, models: ModelPack, batch: Optional[Batch] = None
     ) -> ExecutionContext:
         """ """
         return cls(
-            step=0, batch=batch, params={}, opt_states={}, executor=executor, model=model, meta={}
+            step=0, batch=batch, params={}, opt_states={}, executor=executor, models=models, meta={}
         )

@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 import thunder.algorithms as algo
-from thunder.models import *
 from thunder.nn import *
+from thunder.nn.models import *
 from thunder.rl import *
 from thunder.rl.distributions import ConsistentGaussian
 
