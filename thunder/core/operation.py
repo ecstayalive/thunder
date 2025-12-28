@@ -12,9 +12,10 @@ if TYPE_CHECKING:
 class Operation(ABC):
     """ """
 
-    def __init__(self, name: str = "op", interval: int = 1):
+    def __init__(self, name: str = "op", interval: int = 1, **kwargs):
         self.name = name
         self.interval = interval
+        self.kwargs = kwargs
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         if ctx.step % self.interval != 0:
@@ -44,8 +45,8 @@ class Objective(Operation):
 
     """
 
-    def __init__(self, name: str, weight: float = 1.0):
-        super().__init__(name=name, interval=1)
+    def __init__(self, name: str, weight: float = 1.0, **kwargs):
+        super().__init__(name=name, interval=1, **kwargs)
         self.weight = weight
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
@@ -93,15 +94,15 @@ class OptimizeOp(Operation):
             max_grad_norm=self.max_grad_norm,
         )
         new_ctx = ctx.apply_gradients(
-            opt=self.opt, new_params=new_params, new_opt_state=new_opt_state
+            opt=self.opt, new_params_subset=new_params, new_opt_state=new_opt_state
         )
         return new_ctx, metrics
 
 
 class CallbackOp(Operation):
-    def __init__(self, fn: Callable, name="callback", interval=1):
-        super().__init__(name, interval)
+    def __init__(self, fn: Callable, name="callback", interval=1, **kwargs):
+        super().__init__(name, interval, **kwargs)
         self.fn = fn
 
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        return self.fn(ctx)
+        return self.fn(ctx, **self.kwargs)

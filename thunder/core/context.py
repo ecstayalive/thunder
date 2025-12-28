@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .data import Batch, ModelPack
     from .executor.interface import ExecutorProtocol
     from .module import ThunderModule
+
+
+@dataclass(slots=True)
+class OptimGroup:
+    """
+    Args:
+        name:
+        targets:
+        params:
+        opt_state:
+        tx: `optax.GradientTransformation` for jax, None for torch
+    """
+
+    name: str
+    targets: Tuple[str, ...]
+    params: Dict[str, Any]
+    opt_state: Any
+    tx: Optional[Any] = None
 
 
 @dataclass(slots=True)
@@ -16,7 +34,7 @@ class ExecutionContext:
         step:
         batch:
         params:
-        opt_states:
+        opt_groups:
         executor:
         model:
         meta:
@@ -24,10 +42,10 @@ class ExecutionContext:
 
     step: int
     batch: Optional[Batch]
-    params: Dict[str, Any]
-    opt_states: Dict[str, Any]
-    executor: ExecutorProtocol
     models: ModelPack
+    params: Dict[str, Any]
+    opt_groups: Dict[str, OptimGroup]
+    executor: ExecutorProtocol
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:
@@ -44,7 +62,7 @@ class ExecutionContext:
             )
 
     def apply_gradients(
-        self, opt: str, new_params: Optional[Any], new_opt_state: Optional[Any]
+        self, opt: str, new_params_subset: Optional[Any], new_opt_state: Optional[Any]
     ) -> ExecutionContext:
         """
         Unified handling of gradient back propagation logic.
@@ -61,18 +79,16 @@ class ExecutionContext:
                 - Torch: Returns self (reference unchanged)
                 - JAX: Returns a new Context instance (parameters replaced)
         """
-        if new_params is None and new_opt_state is None:
+        if new_params_subset is None:
             return self
-        changes = {}
-        if new_params is not None:
-            params = self.params.copy()
-            params.update(new_params)
-            changes["params"] = params
-        if new_opt_state is not None:
-            updated_opt_states = self.opt_states.copy()
-            updated_opt_states[opt] = new_opt_state
-            changes["opt_states"] = updated_opt_states
-        return self.replace(**changes)
+        new_full_params = self.params.copy()
+        new_full_params.update(new_params_subset)
+        target_group = self.opt_groups[opt]
+        new_group = replace(target_group, params=new_params_subset, opt_state=new_opt_state)
+        new_groups_dict = self.opt_groups.copy()
+        new_groups_dict[opt] = new_group
+
+        return self.replace(params=new_full_params, opt_groups=new_groups_dict)
 
     def set_param(self, key: str, value: Any) -> None:
         """In-place update params."""
@@ -107,5 +123,11 @@ class ExecutionContext:
     ) -> ExecutionContext:
         """ """
         return cls(
-            step=0, batch=batch, params={}, opt_states={}, executor=executor, models=models, meta={}
+            step=0,
+            batch=batch,
+            models=models,
+            params={},
+            opt_groups=None,
+            executor=executor,
+            meta={},
         )

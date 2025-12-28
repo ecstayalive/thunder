@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from thunder.core.context import ExecutionContext
+from thunder.core.context import ExecutionContext, OptimGroup
 
 if TYPE_CHECKING:
     from ..data import Batch, ModelPack
@@ -76,7 +76,8 @@ class TorchExecutor:
         objectives: Tuple[Objective],
         max_grad_norm: float = 1.0,
     ) -> Tuple[dict, Any, Any]:
-        optimizer: torch.optim.Optimizer = ctx.opt_states[opt]
+        optim_group: OptimGroup = ctx.opt_groups[opt]
+        optimizer: torch.optim.Optimizer = optim_group.opt_state
         if self._compile_enabled and self._compiled_forward is None:
             self._compiled_forward = torch.compile(self._forward, mode=self._compile_mode)
         forward_fn = self._compiled_forward if self._compile_enabled else self._forward
@@ -99,8 +100,6 @@ class TorchExecutor:
         """ """
         new_wrappers_dict = {}
         params_map = {}
-        opt_states = {}
-        meta_info = {}
         for name in models._fields:
             module: TorchModule = getattr(models, name)
             module = module.to(self.device)
@@ -114,20 +113,32 @@ class TorchExecutor:
             new_wrappers_dict[name] = module
             params_map[name] = module
         new_models_pack = type(models)(**new_wrappers_dict)
+
+        opt_groups = {}
         for opt_key, cfg in optim_config.items():
             cfg = cfg.copy()
-            target_name = cfg.pop("target", None)
-            if isinstance(target_name, str):
-                target_name = [target_name]
-            all_params = []
-            for t_name in target_name:
+            target_names = cfg.pop("targets", cfg.pop("targets"))
+            if isinstance(target_names, str):
+                target_names = [target_names]
+            target_names = tuple(target_names)
+            all_optimize_params = []
+            params_subset = {}
+            for t_name in target_names:
                 if t_name not in params_map:
-                    raise ValueError(f"Optimizer '{opt_key}' targets unknown module '{t_name}'.")
+                    raise ValueError(f"Optimizer target '{opt_key}' not found in models.")
                 target_module = params_map[t_name]
-                all_params.append({"params": target_module.parameters()})
-            OptimCls = getattr(torch.optim, cfg.pop("class", "Adam"))
-            opt_states[opt_key] = OptimCls(all_params, **cfg)
-            meta_info[f"{opt_key}_targets"] = target_name
+                params_subset[t_name] = target_module
+                all_optimize_params.append({"params": target_module.parameters()})
+            cls_name = cfg.pop("class", "Adam")
+            OptimCls = getattr(torch.optim, cls_name)
+            optimizer = OptimCls(all_optimize_params, **cfg)
+            opt_groups[opt_key] = OptimGroup(
+                name=opt_key,
+                targets=target_names,
+                params=params_subset,
+                opt_state=optimizer,
+                tx=None,
+            )
         ctx = ExecutionContext.create(executor=self, models=new_models_pack, batch=batch)
-        ctx = ctx.replace(params=params_map, opt_states=opt_states, meta=meta_info)
+        ctx = ctx.replace(params=params_map, opt_groups=opt_groups)
         return ctx
