@@ -129,7 +129,7 @@ def test_executor_optimization_with_sequence(device, tensor_batch_3d):
     ctx = executor.init(model, tensor_batch_3d, optim_config)
     objective = MSEObjective("test_mse")
     another_objective = MSEObjective("test_another_mse")
-    op = op_mod.OptimizeOp("net", "opt", (objective, another_objective))
+    op = op_mod.OptimizeOp("opt", (objective, another_objective))
     ctx, metrics = op(ctx)
     expected_loss = 2.2
     # print(f"\nCalculated Torch Loss: {metrics['grad_op/test_mse/loss']}")
@@ -143,7 +143,7 @@ def test_pipeline_integration(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = data_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(device=device)
-    op = op_mod.OptimizeOp("net", "opt", [MSEObjective("mse")])
+    op = op_mod.OptimizeOp("opt", [MSEObjective("mse")])
     algo = algo_mod.GraphAlgorithm(model, executor, (op,))
     algo.build(tensor_batch_3d, {"opt": {"target": "net", "class": "SGD", "lr": 0.1}})
     metrics = algo.step(tensor_batch_3d)

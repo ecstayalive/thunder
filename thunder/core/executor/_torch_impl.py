@@ -59,12 +59,12 @@ class TorchExecutor:
         return data
 
     def _forward(
-        self, objectives: Tuple[Objective], batch: Batch, models: ModelPack, target_params_ref: Any
+        self, objectives: Tuple[Objective], batch: Batch, models: ModelPack, params: Any
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         total_loss = torch.tensor(0.0, device=self.device)
         metrics = {}
         for obj in objectives:
-            loss, m = obj.forward(batch, models, target_params_ref)
+            loss, m = obj.forward(batch, models, params)
             total_loss += loss
             metrics.update(m)
         return total_loss, metrics
@@ -72,26 +72,22 @@ class TorchExecutor:
     def optimize(
         self,
         ctx: ExecutionContext,
-        target: str,
         opt: str,
-        objectives: list[Objective],
+        objectives: Tuple[Objective],
         max_grad_norm: float = 1.0,
     ) -> Tuple[dict, Any, Any]:
-        target_obj = ctx.params.get(target)
         optimizer: torch.optim.Optimizer = ctx.opt_states[opt]
         if self._compile_enabled and self._compiled_forward is None:
             self._compiled_forward = torch.compile(self._forward, mode=self._compile_mode)
         forward_fn = self._compiled_forward if self._compile_enabled else self._forward
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=self.device.type, enabled=self.mixed_precision):
-            loss, metrics = forward_fn(objectives, ctx.batch, ctx.models, target_obj)
+            loss, metrics = forward_fn(objectives, ctx.batch, ctx.models, ctx.params)
         metrics["loss_total"] = loss
         self.scaler.scale(loss).backward()
         if max_grad_norm > 0:
             self.scaler.unscale_(optimizer)
-            params_to_clip = (
-                target_obj.parameters() if isinstance(target_obj, nn.Module) else target_obj
-            )
+            params_to_clip = [p for group in optimizer.param_groups for p in group["params"]]
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
         self.scaler.step(optimizer)
         self.scaler.update()
@@ -104,6 +100,7 @@ class TorchExecutor:
         new_wrappers_dict = {}
         params_map = {}
         opt_states = {}
+        meta_info = {}
         for name in models._fields:
             module: TorchModule = getattr(models, name)
             module = module.to(self.device)
@@ -120,11 +117,17 @@ class TorchExecutor:
         for opt_key, cfg in optim_config.items():
             cfg = cfg.copy()
             target_name = cfg.pop("target", None)
-            if target_name not in params_map:
-                raise ValueError(f"Optimizer target '{target_name}' not found.")
-            target_obj = params_map[target_name]
+            if isinstance(target_name, str):
+                target_name = [target_name]
+            all_params = []
+            for t_name in target_name:
+                if t_name not in params_map:
+                    raise ValueError(f"Optimizer '{opt_key}' targets unknown module '{t_name}'.")
+                target_module = params_map[t_name]
+                all_params.append({"params": target_module.parameters()})
             OptimCls = getattr(torch.optim, cfg.pop("class", "Adam"))
-            opt_states[opt_key] = OptimCls(target_obj.parameters(), **cfg)
+            opt_states[opt_key] = OptimCls(all_params, **cfg)
+            meta_info[f"{opt_key}_targets"] = target_name
         ctx = ExecutionContext.create(executor=self, models=new_models_pack, batch=batch)
-        ctx = ctx.replace(params=params_map, opt_states=opt_states)
+        ctx = ctx.replace(params=params_map, opt_states=opt_states, meta=meta_info)
         return ctx

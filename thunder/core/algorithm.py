@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from .context import ExecutionContext
 
 if TYPE_CHECKING:
     from .data import Batch, ModelPack
     from .executor.interface import ExecutorProtocol
-    from .module import ThunderModule
     from .operation import Operation
 
 
 class GraphAlgorithm(ABC):
-    def __init__(self, models: ModelPack, executor: ExecutorProtocol, pipeline: List[Operation]):
+    def __init__(
+        self, models: ModelPack, executor: ExecutorProtocol, pipeline: Iterable[Operation]
+    ):
         self.models = models
         self.executor = executor
         self.ctx: Optional[ExecutionContext] = None
@@ -24,6 +25,14 @@ class GraphAlgorithm(ABC):
         self.models = self.ctx.models
 
     def step(self, batch: Batch) -> Dict[str, Any]:
+        """_summary_
+        Args:
+            batch (Batch):
+        Raises:
+            RuntimeError:
+        Returns:
+            Dict[str, Any]:
+        """
         if self.ctx is None:
             raise RuntimeError("Algorithm not built. Please call .build() first.")
         metrics = {}
@@ -33,3 +42,11 @@ class GraphAlgorithm(ABC):
             metrics.update(m)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
         return metrics
+
+
+class Agent(GraphAlgorithm):
+    def __init__(self, models, executor, pipeline):
+        super().__init__(models, executor, pipeline)
+
+    def act(self, obs: Dict[str, Any]): ...
+    def explore(self, obs: Dict[str, Any]): ...

@@ -154,7 +154,7 @@ def test_jax_executor_immutability_and_update(jax_batch_3d):
     old_kernel_ref = ctx.params["net"]["Dense_0"]["kernel"]
     assert jnp.all(old_kernel_ref == 0.0)
     obj = JaxMSEObjective("test")
-    op = op_mod.OptimizeOp("net", "opt", [obj])
+    op = op_mod.OptimizeOp("opt", [obj])
     new_ctx, metrics = op(ctx)
     new_kernel_ref = new_ctx.params["net"]["Dense_0"]["kernel"]
     assert jnp.any(new_kernel_ref != 0.0)
@@ -174,7 +174,7 @@ def test_jax_pipeline_complex_flow(jax_batch_3d):
 
     pipeline = [
         op_mod.CallbackOp(meta_hook, name="my_hook"),
-        op_mod.OptimizeOp("net", "opt", [JaxMSEObjective("mse")]),
+        op_mod.OptimizeOp("opt", [JaxMSEObjective("mse")]),
     ]
 
     algo = algo_mod.GraphAlgorithm(model, executor, pipeline)
@@ -192,7 +192,9 @@ def test_jax_multiple_optimizer_targets(jax_batch_3d):
     model = data_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device="gpu")
     wrong_config = {"opt": {"target": "non_existent_part", "class": "sgd"}}
-    with pytest.raises(ValueError, match="Optimizer target 'non_existent_part' not found."):
+    with pytest.raises(
+        ValueError, match="Optimizer target 'non_existent_part' not found in models."
+    ):
         executor.init(model, jax_batch_3d, wrong_config)
 
 

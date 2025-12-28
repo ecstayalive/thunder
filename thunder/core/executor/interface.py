@@ -22,7 +22,6 @@ class ExecutorProtocol(Protocol):
     def optimize(
         self,
         ctx: ExecutionContext,
-        target: str,
         opt: str,
         objectives: list[Objective],
         max_grad_norm: float = 1.0,

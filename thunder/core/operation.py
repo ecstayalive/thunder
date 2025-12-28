@@ -74,7 +74,6 @@ class OptimizeOp(Operation):
 
     def __init__(
         self,
-        target: str,
         opt: str,
         objectives: List[Objective],
         max_grad_norm: float = 1.0,
@@ -82,7 +81,6 @@ class OptimizeOp(Operation):
         interval: int = 1,
     ):
         super().__init__(name=name, interval=interval)
-        self.target = target
         self.opt = opt
         self.objectives = objectives
         self.max_grad_norm = max_grad_norm
@@ -90,13 +88,12 @@ class OptimizeOp(Operation):
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         metrics, new_params, new_opt_state = ctx.executor.optimize(
             ctx=ctx,
-            target=self.target,
             opt=self.opt,
             objectives=self.objectives,
             max_grad_norm=self.max_grad_norm,
         )
         new_ctx = ctx.apply_gradients(
-            target=self.target, opt=self.opt, new_params=new_params, new_opt_state=new_opt_state
+            opt=self.opt, new_params=new_params, new_opt_state=new_opt_state
         )
         return new_ctx, metrics
 

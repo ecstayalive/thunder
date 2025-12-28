@@ -33,13 +33,22 @@ class ExecutionContext:
     def replace(self, **changes) -> ExecutionContext:
         return replace(self, **changes)
 
+    def get_optim_subset(self, opt_name: str) -> Dict[str, Any]:
+        """ """
+        try:
+            target_names = self.meta.get(f"{opt_name}_targets", ["default"])
+            return {name: self.params[name] for name in target_names}
+        except:
+            raise ValueError(
+                f"Unknown optimizer {opt_name}. Support optimizer {self.opt_states.keys()}"
+            )
+
     def apply_gradients(
-        self, target: str, opt: str, new_params: Optional[Any], new_opt_state: Optional[Any]
+        self, opt: str, new_params: Optional[Any], new_opt_state: Optional[Any]
     ) -> ExecutionContext:
         """
         Unified handling of gradient back propagation logic.
         Args:
-            target: Name of the target parameter group to update (e.g. “actor”)
             opt: Corresponding optimizer name (e.g. “actor_opt”)
             new_params:
                 - Torch: Typically None (as Torch Optimizer modifies references in-place)
@@ -56,9 +65,9 @@ class ExecutionContext:
             return self
         changes = {}
         if new_params is not None:
-            updated_params = self.params.copy()
-            updated_params[target] = new_params
-            changes["params"] = updated_params
+            params = self.params.copy()
+            params.update(new_params)
+            changes["params"] = params
         if new_opt_state is not None:
             updated_opt_states = self.opt_states.copy()
             updated_opt_states[opt] = new_opt_state
