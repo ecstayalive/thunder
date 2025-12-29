@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 from .context import ExecutionContext
 
 if TYPE_CHECKING:
-    from .data import Batch, ModelPack
+    from .data import Batch
     from .executor.interface import ExecutorProtocol
+    from .module import ModelPack
     from .operation import Operation
 
 
@@ -17,12 +18,11 @@ class GraphAlgorithm(ABC):
         models: ModelPack,
         executor: ExecutorProtocol,
         pipeline: Optional[Iterable[Operation]] = None,
-        ctx: Optional[ExecutionContext] = None,
     ):
         self.models = models
         self.executor = executor
-        self.ctx: Optional[ExecutionContext] = ctx
         self.pipeline: Operation[Iterable[Operation]] = pipeline
+        self.ctx: Optional[ExecutionContext] = None
 
     def build(self, sample_batch: Batch, optim_config: Dict[str, Any]) -> None:
         """Build the algorithm by initializing the execution context.
@@ -68,4 +68,5 @@ class Agent(GraphAlgorithm):
         super().__init__(models, executor, pipeline)
 
     def act(self, obs: Dict[str, Any]): ...
+
     def explore(self, obs: Dict[str, Any]): ...

@@ -17,7 +17,8 @@ class OptimGroup:
         targets:
         params:
         opt_state:
-        tx: `optax.GradientTransformation` for jax, None for torch
+        tx: `optax.GradientTransformation` for `jax,` None for `torch`
+        scheduler: learning rate scheduler, None for `jax`
     """
 
     name: str
@@ -25,6 +26,7 @@ class OptimGroup:
     params: Dict[str, Any]
     opt_state: Any
     tx: Optional[Any] = None
+    scheduler: Optional[Any] = None
 
 
 @dataclass(slots=True)
@@ -50,16 +52,6 @@ class ExecutionContext:
 
     def replace(self, **changes) -> ExecutionContext:
         return replace(self, **changes)
-
-    def get_optim_subset(self, opt_name: str) -> Dict[str, Any]:
-        """ """
-        try:
-            target_names = self.meta.get(f"{opt_name}_targets", ["default"])
-            return {name: self.params[name] for name in target_names}
-        except:
-            raise ValueError(
-                f"Unknown optimizer {opt_name}. Support optimizer {self.opt_states.keys()}"
-            )
 
     def apply_gradients(
         self, opt: str, new_params_subset: Optional[Any], new_opt_state: Optional[Any]
