@@ -13,16 +13,33 @@ if TYPE_CHECKING:
 
 class GraphAlgorithm(ABC):
     def __init__(
-        self, models: ModelPack, executor: ExecutorProtocol, pipeline: Iterable[Operation]
+        self,
+        models: ModelPack,
+        executor: ExecutorProtocol,
+        pipeline: Optional[Iterable[Operation]] = None,
+        ctx: Optional[ExecutionContext] = None,
     ):
         self.models = models
         self.executor = executor
-        self.ctx: Optional[ExecutionContext] = None
-        self.pipeline = pipeline
+        self.ctx: Optional[ExecutionContext] = ctx
+        self.pipeline: Operation[Iterable[Operation]] = pipeline
 
     def build(self, sample_batch: Batch, optim_config: Dict[str, Any]) -> None:
+        """Build the algorithm by initializing the execution context.
+        Args:
+            sample_batch (Batch): _description_
+            optim_config (Dict[str, Any]): _description_
+        """
         self.ctx = self.executor.init(self.models, sample_batch, optim_config)
         self.models = self.ctx.models
+
+    def setup_pipeline(self, pipeline: Iterable[Operation]) -> None:
+        """_summary_
+
+        Args:
+            pipeline (Iterable[Operation]): _description_
+        """
+        self.pipeline = pipeline
 
     def step(self, batch: Batch) -> Dict[str, Any]:
         """_summary_
@@ -35,6 +52,8 @@ class GraphAlgorithm(ABC):
         """
         if self.ctx is None:
             raise RuntimeError("Algorithm not built. Please call .build() first.")
+        if self.pipeline is None:
+            raise RuntimeError("No pipeline defined for the algorithm.")
         metrics = {}
         self.ctx = self.ctx.replace(batch=batch)
         for op in self.pipeline:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from collections import namedtuple
 from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
 
@@ -11,25 +10,6 @@ if TYPE_CHECKING:
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
 TBatch = TypeVar("TBatch", bound="Batch")
-
-
-class ModelPack:
-    """ """
-
-    def __new__(cls, **kwargs):
-        from .module import ThunderModule
-
-        wrapped_kwargs = {}
-        for k, v in kwargs.items():
-            if not isinstance(v, ThunderModule):
-                v = ThunderModule(v, k)
-            else:
-                if hasattr(v, "_name") and v._name != k:
-                    v = v.replace(_name=k) if hasattr(v, "replace") else setattr(v, "_name", k) or v
-            wrapped_kwargs[k] = v
-        fields = sorted(wrapped_kwargs.keys())
-        Pack = namedtuple("ModelPack", fields)
-        return Pack(**wrapped_kwargs)
 
 
 @dataclass(slots=True)

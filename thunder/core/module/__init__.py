@@ -1,5 +1,6 @@
 import importlib
 import os
+from collections import namedtuple
 from typing import TYPE_CHECKING
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
@@ -37,5 +38,24 @@ else:
             f"Current backend is set to '{_BACKEND}', but required libraries are missing.\n"
             f"Please install {_libs.get(_BACKEND, _BACKEND)} or run: pip install thunder[{_BACKEND}]"
         ) from e
+
+
+class ModelPack:
+    """ """
+
+    def __new__(cls, **kwargs):
+
+        wrapped_kwargs = {}
+        for k, v in kwargs.items():
+            if not isinstance(v, ThunderModule):
+                v = ThunderModule(v, k)
+            else:
+                if hasattr(v, "_name") and v._name != k:
+                    v = v.replace(_name=k) if hasattr(v, "replace") else setattr(v, "_name", k) or v
+            wrapped_kwargs[k] = v
+        fields = sorted(wrapped_kwargs.keys())
+        Pack = namedtuple("ModelPack", fields)
+        return Pack(**wrapped_kwargs)
+
 
 __all__ = ["ThunderModule"]

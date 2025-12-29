@@ -4,9 +4,9 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
-    from .data import Batch, ModelPack
+    from .data import Batch
     from .executor.interface import ExecutorProtocol
-    from .module import ThunderModule
+    from .module import ModelPack, ThunderModule
 
 
 @dataclass(slots=True)

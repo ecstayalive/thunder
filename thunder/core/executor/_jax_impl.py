@@ -12,7 +12,8 @@ from thunder.core.context import ExecutionContext, OptimGroup
 
 if TYPE_CHECKING:
     from ..context import ExecutionContext
-    from ..data import Batch, ModelPack
+    from ..data import Batch
+    from ..module import ModelPack
     from ..module._jax_impl import JaxModule
     from ..operation import Objective
 

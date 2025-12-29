@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Protocol, Tuple, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from ..context import ExecutionContext
-    from ..data import Batch, ModelPack
-    from ..module import ThunderModule
+    from ..data import Batch
+    from ..module import ModelPack, ThunderModule
     from ..operation import Objective
 
 

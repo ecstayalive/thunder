@@ -131,7 +131,7 @@ def test_jax_pytree_registration(jax_batch_3d):
 
 def test_jax_executor_optimization_flow(jax_batch_3d):
     net = Simple3DFlaxNet()
-    model = data_mod.ModelPack(net=net)
+    model = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device="gpu", donate=False)
     optim_config = {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
     ctx = executor.init(model, jax_batch_3d, optim_config)
@@ -148,7 +148,7 @@ def test_jax_executor_optimization_flow(jax_batch_3d):
 
 
 def test_jax_multi_net_joint_update(jax_batch_3d):
-    model = data_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "sgd", "lr": 0.1}}
     ctx = executor.init(model, jax_batch_3d, optim_config)
@@ -161,7 +161,7 @@ def test_jax_multi_net_joint_update(jax_batch_3d):
 
 
 def test_jax_pipeline_scheduling(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     interval_op = JaxCounterOp(interval=3)
     pipeline = [interval_op]
@@ -178,7 +178,7 @@ def test_jax_pipeline_scheduling(jax_batch_3d):
 
 
 def test_jax_objective_standalone(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     obj = JaxMSEObjective("eval")
     algo = algo_mod.GraphAlgorithm(model, executor, [obj])
@@ -190,7 +190,7 @@ def test_jax_objective_standalone(jax_batch_3d):
 
 
 def test_jax_apply_gradients_logic(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     ctx = executor.init(model, jax_batch_3d, {"opt": {"targets": ["net"], "class": "sgd"}})
 
@@ -204,7 +204,7 @@ def test_jax_apply_gradients_logic(jax_batch_3d):
 
 
 def test_jax_initialization_error(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     with pytest.raises(ValueError, match="Optimizer target 'bad_net' not found in models."):
         executor.init(model, jax_batch_3d, {"opt": {"targets": ["bad_net"]}})
@@ -219,7 +219,7 @@ def test_jax_method_proxy_call(jax_batch_3d):
         def get_custom_value(self, x):
             return jnp.sum(x, axis=-1, keepdims=True)
 
-    model = data_mod.ModelPack(net=CustomMethodNet())
+    model = module_mod.ModelPack(net=CustomMethodNet())
     executor = exec_mod.Executor(device="gpu")
     ctx = executor.init(model, jax_batch_3d, {})
 
@@ -230,7 +230,7 @@ def test_jax_method_proxy_call(jax_batch_3d):
 
 def test_jax_gradient_clipping(jax_batch_3d):
     net = Simple3DFlaxNet()
-    model = data_mod.ModelPack(net=net)
+    model = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device="gpu")
 
     optim_config = {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
@@ -256,7 +256,7 @@ def test_jax_gradient_clipping(jax_batch_3d):
 
 
 def test_jax_multiple_optimizer_subsets(jax_batch_3d):
-    model = data_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "sgd", "lr": 1.0}}
     ctx = executor.init(model, jax_batch_3d, optim_config)
@@ -279,26 +279,25 @@ def test_jax_multiple_optimizer_subsets(jax_batch_3d):
 
 
 def test_jax_callback_side_effects(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
+    algo = algo_mod.GraphAlgorithm(model, executor)
 
     def change_batch_hook(ctx: ctx_mod.ExecutionContext):
         new_obs = ctx.batch.obs + 10.0
         new_batch = data_mod.replace(ctx.batch, obs=new_obs)
         return ctx.replace(batch=new_batch), {"modified": True}
 
-    pipeline = [op_mod.CallbackOp(change_batch_hook, name="mod"), JaxMSEObjective("eval")]
-
-    algo = algo_mod.GraphAlgorithm(model, executor, pipeline)
+    pipeline = [op_mod.CallableOp(change_batch_hook, name="mod"), JaxMSEObjective("eval")]
     algo.build(jax_batch_3d, {})
-
+    algo.setup_pipeline(pipeline=pipeline)
     metrics = algo.step(jax_batch_3d)
     assert jnp.all(algo.ctx.batch.obs >= 10.0)
     assert metrics["mod/modified"] is True
 
 
 def test_jax_multiple_objectives_summation(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
 
     obj1 = JaxMSEObjective("mse1", weight=1.0)
@@ -319,7 +318,7 @@ def test_jax_multiple_objectives_summation(jax_batch_3d):
 
 
 def test_jax_distributed_metadata_injection(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     # Simulate distributed flag
     executor = exec_mod.Executor(device="gpu")
     executor.distributed = True
@@ -336,7 +335,7 @@ def test_jax_empty_metrics_handling(jax_batch_3d):
         def forward(self, ctx):
             return ctx, {}
 
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     pipeline = [NoMetricOp(name="silent")]
     algo = algo_mod.GraphAlgorithm(model, executor, pipeline)
@@ -347,7 +346,7 @@ def test_jax_empty_metrics_handling(jax_batch_3d):
 
 
 def test_jax_params_unpacking_correctness(jax_batch_3d):
-    model = data_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     ctx = executor.init(
         model,
@@ -368,7 +367,7 @@ def test_jax_params_unpacking_correctness(jax_batch_3d):
 
 
 def test_jax_rnn_carry_flow(jax_batch_3d):
-    model = data_mod.ModelPack(rnn=SimpleRNN())
+    model = module_mod.ModelPack(rnn=SimpleRNN())
     executor = exec_mod.Executor(device="gpu")
     ctx = executor.init(model, jax_batch_3d, {})
     assert "ih" in ctx.params["rnn"]
@@ -386,7 +385,7 @@ def test_jax_rnn_carry_flow(jax_batch_3d):
 
 def test_jax_rnn_sequence_training(jax_batch_3d):
     """ """
-    model = data_mod.ModelPack(rnn=SimpleRNN(features=2))
+    model = module_mod.ModelPack(rnn=SimpleRNN(features=2))
     executor = exec_mod.Executor("gpu")
     ctx = executor.init(model, jax_batch_3d, {})
     out_seq, _ = ctx.models.rnn(jax_batch_3d.obs, state=ctx.params["rnn"])
@@ -394,7 +393,7 @@ def test_jax_rnn_sequence_training(jax_batch_3d):
 
 
 def test_jax_objective_weight_scaling(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
 
     obj_w1 = JaxMSEObjective("mse", weight=1.0)
@@ -414,7 +413,7 @@ def test_jax_objective_weight_scaling(jax_batch_3d):
 
 
 def test_jax_optimizer_param_group_logic(jax_batch_3d):
-    model = data_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     algo = algo_mod.GraphAlgorithm(
         model, executor, [op_mod.OptimizeOp("joint", [MultiNetObjective("m")])]
@@ -448,7 +447,7 @@ def test_jax_batch_utility_methods(jax_batch_3d):
 def test_jax_model_pack_attribute_access():
     m1 = module_mod.ThunderModule(Simple3DFlaxNet(), "actor")
     m2 = module_mod.ThunderModule(Simple3DFlaxNet(), "critic")
-    pack = data_mod.ModelPack(actor=m1, critic=m2)
+    pack = module_mod.ModelPack(actor=m1, critic=m2)
 
     assert pack.actor is m1
     assert pack.critic is m2
@@ -456,7 +455,7 @@ def test_jax_model_pack_attribute_access():
 
 
 def test_jax_apply_gradients_multiple_opts(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     ctx = executor.init(
         model,
@@ -476,7 +475,7 @@ def test_jax_apply_gradients_multiple_opts(jax_batch_3d):
 
 
 def test_jax_executor_jit_cache_behavior(jax_batch_3d):
-    model = data_mod.ModelPack(net=Simple3DFlaxNet())
+    model = module_mod.ModelPack(net=Simple3DFlaxNet())
     executor = exec_mod.Executor(device="gpu")
     obj = JaxMSEObjective("mse")
 

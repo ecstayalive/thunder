@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
     from .data import Batch, ModelPack
-    from .module import ThunderModule
 
 
 class Operation(ABC):
@@ -99,10 +98,29 @@ class OptimizeOp(Operation):
         return new_ctx, metrics
 
 
-class CallbackOp(Operation):
-    def __init__(self, fn: Callable, name="callback", interval=1, **kwargs):
+class CallableOp(Operation):
+    """
+    Args:
+        fn: fn(ctx: ExecutionContext, **kwargs) -> Tuple[ExecutionContext, Dict[str, Any]]
+    """
+
+    def __init__(self, fn: Callable, name="callable", interval=1, **kwargs):
         super().__init__(name, interval, **kwargs)
         self.fn = fn
 
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         return self.fn(ctx, **self.kwargs)
+
+
+class CallableObjective(Objective):
+    """
+    Args:
+        fn: fn(batch: Batch, model: ModelPack, params: Any, **kwargs) -> Tuple[Loss, Dict[str, Any]]
+    """
+
+    def __init__(self, fn: Callable, name="callable_objective", weight=1.0, **kwargs):
+        super().__init__(name, weight, **kwargs)
+        self.fn = fn
+
+    def compute(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
+        return self.fn(batch, model, params, **self.kwargs)

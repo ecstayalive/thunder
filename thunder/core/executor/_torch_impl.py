@@ -9,7 +9,8 @@ import torch.nn as nn
 from thunder.core.context import ExecutionContext, OptimGroup
 
 if TYPE_CHECKING:
-    from ..data import Batch, ModelPack
+    from ..data import Batch
+    from ..module import ModelPack
     from ..module._torch_impl import TorchModule
     from ..operation import Objective
 
