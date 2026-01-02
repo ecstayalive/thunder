@@ -1,14 +1,16 @@
 import argparse
+import copy
+import enum
 import re
 from dataclasses import dataclass
 from textwrap import dedent
 from typing import (
     Any,
+    Dict,
     List,
     Literal,
     Optional,
     Union,
-    _GenericAlias,
     get_args,
     get_origin,
     get_type_hints,
@@ -128,96 +130,96 @@ class ArgParseMeta(type):
     def __new__(cls, name: str, bases: tuple, namespace: dict):
         new_cls = super().__new__(cls, name, bases, namespace)
         argparse_configs = {}
+        for base in reversed(bases):
+            if hasattr(base, "_argparse_configs"):
+                argparse_configs.update(copy.deepcopy(base._argparse_configs))
         try:
             type_hints = get_type_hints(new_cls)
-        except Exception as e:
+        except Exception:
             type_hints = getattr(new_cls, "__annotations__", {})
         attr_docs = cls._parse_attr_docs(namespace.get("__doc__", ""))
 
         for attr_name, type_hint in type_hints.items():
             if attr_name.startswith("_") or callable(namespace.get(attr_name)):
                 continue
-            assigned_value = namespace.get(attr_name, ...)
-            arg_opt: Optional[ArgsOpt] = None
-            explicit_help = None
-            short_alias = None
-            has_explicit_default = assigned_value is not ...
-            if isinstance(assigned_value, ArgsOpt):
-                arg_opt = assigned_value
-                explicit_help = arg_opt.help
-                short_alias = arg_opt.short
+            assigned_value = getattr(new_cls, attr_name, ...)
+            arg_opt = assigned_value if isinstance(assigned_value, ArgsOpt) else None
+            has_explicit_default = False
+            default_val = ...
+            if arg_opt:
                 if arg_opt.default is not _ARGS_OPT_DEFAULT_SENTINEL:
                     has_explicit_default = True
-                    assigned_value = arg_opt.default
-                else:
-                    has_explicit_default = False
-                    assigned_value = ...
-            help_text = explicit_help or attr_docs.get(attr_name) or f"Value for {attr_name}"
-
+                    default_val = arg_opt.default
+            elif assigned_value is not ...:
+                has_explicit_default = True
+                default_val = assigned_value
+            help_text = (
+                (arg_opt.help if arg_opt else None)
+                or attr_docs.get(attr_name)
+                or f"Value for {attr_name}"
+            )
             origin = get_origin(type_hint)
-            is_optional_syntax = origin is Union and type(None) in get_args(type_hint)
+            is_optional = origin is Union and type(None) in get_args(type_hint)
             actual_type = type_hint
-            if is_optional_syntax:
+            if is_optional:
                 actual_type = next(
                     (t for t in get_args(type_hint) if t is not type(None)), type_hint
                 )
-
             long_name = f"--{attr_name.replace('_', '-')}"
-            arg_names = [alias for alias in [short_alias, long_name] if alias]
+            arg_names = [
+                alias for alias in [arg_opt.short if arg_opt else None, long_name] if alias
+            ]
             kwargs = {"dest": attr_name}
-            type_name = ""
-
             actual_origin = get_origin(actual_type)
-            is_list_syntax = actual_origin is list or actual_origin is List
-
             if actual_origin is Literal:
                 choices = get_args(actual_type)
-                if not choices:
-                    # print(f"Warning: Empty Literal for {attr_name}. Skipping.")
-                    continue
-                kwargs["choices"] = choices
-                kwargs["type"] = type(choices[0])
-                type_name = f"{{{', '.join(map(str, choices))}}}"
+                kwargs.update({"choices": choices, "type": type(choices[0])})
+            elif isinstance(actual_type, type) and issubclass(actual_type, enum.Enum):
+                choices = [e.value for e in actual_type]
+                kwargs.update(
+                    {
+                        "choices": choices,
+                        "type": type(choices[0]),
+                    }
+                )
+                if has_explicit_default:
+                    kwargs["default"] = default_val.value
+                type_str = f"Enum[{actual_type.__name__}]"
             elif actual_type is bool:
-                if not (has_explicit_default and assigned_value is True):
-                    kwargs["action"] = "store_true"
-                else:
-                    kwargs["action"] = "store_false"
-                type_name = "bool"
-            elif is_list_syntax:
-                list_item_type = get_args(actual_type)[0] if get_args(actual_type) else str
-                kwargs["type"] = list_item_type
-                is_required_list = not has_explicit_default and not is_optional_syntax
-                kwargs["nargs"] = "+" if is_required_list else "*"
-                type_name = str(actual_type).replace("typing.", "")
+                kwargs["action"] = (
+                    "store_false"
+                    if (has_explicit_default and default_val is True)
+                    else "store_true"
+                )
+            elif actual_origin in (list, List):
+                item_type = get_args(actual_type)[0] if get_args(actual_type) else str
+                kwargs.update(
+                    {
+                        "type": item_type,
+                        "nargs": "+" if not has_explicit_default and not is_optional else "*",
+                    }
+                )
             elif actual_type in [int, float, str]:
                 kwargs["type"] = actual_type
-                type_name = actual_type.__name__
             else:
-                print(f"Warning: Unsupported type: {actual_type} for {attr_name}")
                 continue
-            is_required = not has_explicit_default and not is_optional_syntax
-            final_default = None
+            is_required = not has_explicit_default and not is_optional
             if is_required:
                 kwargs["required"] = True
             else:
-                if has_explicit_default:
-                    final_default = assigned_value
-                elif is_list_syntax:
-                    final_default = []
-                # else: final_default is None for Optional[T]
-                kwargs["default"] = final_default
-
+                kwargs["default"] = (
+                    default_val
+                    if has_explicit_default
+                    else ([] if actual_origin in (list, List) else None)
+                )
             help_parts = [help_text]
             if "action" not in kwargs:
-                help_parts.append(f"[dim](type: {type_name})[/dim]")
-
-            if final_default is not None and final_default != []:
-                help_parts.append(f"[dim](default: {final_default!r})[/dim]")
-
+                type_str = getattr(actual_type, "__name__", str(actual_type))
+                help_parts.append(f"[dim]({type_str})[/dim]")
+            if has_explicit_default and default_val is not None:
+                help_parts.append(f"[dim](default: {default_val!r})[/dim]")
             kwargs["help"] = " ".join(help_parts)
             argparse_configs[attr_name] = (arg_names, kwargs)
-
         new_cls._argparse_configs = argparse_configs
         return new_cls
 
@@ -262,73 +264,64 @@ class ArgParseMeta(type):
 
 class ArgBase(metaclass=ArgParseMeta):
     def __init__(self, **kwargs):
-        # Initialize attributes based on parsed values or defaults held by argparse
-        config_keys = getattr(self.__class__, "_argparse_configs", {}).keys()
-        type_hints = {}
-        try:  # Add try-except for robustness, especially with forward refs
-            type_hints = get_type_hints(self.__class__)
-        except NameError:
-            pass
-        # Prioritize values from kwargs (parsed args)
+        configs = getattr(self.__class__, "_argparse_configs", {})
+        processed = set()
         for attr_name, value in kwargs.items():
-            # Ensure we only set attributes that are expected (part of type hints or class vars)
-            if hasattr(self.__class__, attr_name):  # A simple check
-                setattr(self, attr_name, value)
-        for attr_name in type_hints:
-            if not hasattr(self, attr_name):  # If not set by kwargs
-                if hasattr(self.__class__, attr_name):
-                    class_val = getattr(self.__class__, attr_name)
-                    if not callable(class_val) and not isinstance(class_val, ArgsOpt):
-                        setattr(self, attr_name, class_val)
-                # Handle Optional[T] without default assigned -> should be None
-                elif get_origin(type_hints[attr_name]) is Union and type(None) in get_args(
-                    type_hints[attr_name]
-                ):
-                    setattr(self, attr_name, None)
+            if attr_name in configs:
+                setattr(self, attr_name, copy.deepcopy(value))
+                processed.add(attr_name)
+        for attr_name, (_, argparse_kwargs) in configs.items():
+            if attr_name not in processed:
+                default = argparse_kwargs.get("default")
+                if default is ...:
+                    raise ValueError(f"Missing required argument: {attr_name}")
+                val = copy.deepcopy(default) if default is not None else None
+                setattr(self, attr_name, val)
 
     @classmethod
     def add_args_to_parser(cls, parser: argparse.ArgumentParser):
-        if not hasattr(cls, "_argparse_configs"):
-            return
+        configs = getattr(cls, "_argparse_configs", {})
+        req_group = next(
+            (g for g in parser._action_groups if g.title == "Required arguments"), None
+        )
+        if req_group is None:
+            req_group = parser.add_argument_group("Required arguments")
 
-        required_args = []
-        optional_args = []
+        opt_group = next(
+            (g for g in parser._action_groups if g.title == "Optional arguments"), None
+        )
+        if opt_group is None:
+            opt_group = parser.add_argument_group("Optional arguments")
 
-        for _, (arg_names, kwargs) in cls._argparse_configs.items():
-            if kwargs.get("required", False):
-                required_args.append((arg_names, kwargs))
-            else:
-                optional_args.append((arg_names, kwargs))
+        for _, (arg_names, kwargs) in configs.items():
+            target = req_group if kwargs.get("required") else opt_group
+            target.add_argument(*arg_names, **kwargs)
 
-        if required_args:
-            required_group = parser.add_argument_group("Required arguments")
-            for arg_names, kwargs in required_args:
-                required_group.add_argument(*arg_names, **kwargs)
-
-        if optional_args:
-            optional_group = parser.add_argument_group("Optional arguments")
-            for arg_names, kwargs in optional_args:
-                optional_group.add_argument(*arg_names, **kwargs)
+    @classmethod
+    def parser(cls) -> argparse.ArgumentParser:
+        doc = cls.__doc__ or ""
+        match = re.split(r"\n\s*(?:Attributes|Args|Parameters):", doc, flags=re.IGNORECASE)[0]
+        desc = match[0].strip() if match else f"Arguments for {cls.__name__}"
+        parser = argparse.ArgumentParser(
+            description=desc, formatter_class=TyroStyleHelpFormatter, add_help=True
+        )
+        cls.add_args_to_parser(parser)
+        return parser
 
     @classmethod
     def parse(cls, args_list: Optional[List[str]] = None) -> "ArgBase":
-        docstring = cls.__doc__ or ""
-        parts = re.split(
-            r"\n\s*(?:Attributes|Args|Parameters):", docstring, maxsplit=1, flags=re.IGNORECASE
-        )
-        description = parts[0].strip() if parts else f"Arguments for {cls.__name__}"
-        parser = argparse.ArgumentParser(
-            description=description,
-            formatter_class=TyroStyleHelpFormatter,
-            add_help=False,
-        )
-        cls.add_args_to_parser(parser)
-        parser._action_groups[1].add_argument(
-            "-h",
-            "--help",
-            action="help",
-            default=argparse.SUPPRESS,
-            help="Show this help message and exit.",
-        )
+        parser = cls.parser()
         args_ns = parser.parse_args(args_list)
         return cls(**vars(args_ns))
+
+    def to_dict(self, recurse: bool = True) -> Dict[str, Any]:
+        configs = getattr(self.__class__, "_argparse_configs", {})
+        res = {}
+        for k in configs.keys():
+            if hasattr(self, k):
+                val = getattr(self, k)
+                if recurse and isinstance(val, ArgBase):
+                    res[k] = val.to_dict()
+                else:
+                    res[k] = val
+        return res

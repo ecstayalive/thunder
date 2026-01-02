@@ -1,53 +1,57 @@
-from functools import lru_cache, partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Iterator, Set, Tuple
 
-import flax.linen as nn
-from flax import struct
+from flax import nnx
 
 
-@struct.dataclass
-class JaxModule:
+class JaxModelPack(nnx.Module):
     """ """
 
-    _module: Any = struct.field(pytree_node=False)
-    _name: str = struct.field(pytree_node=False)
-    _backend: str = struct.field(pytree_node=False, default="jax")
+    def __init__(self, **kwargs):
+        for name, module in kwargs.items():
+            setattr(self, name, module)
 
-    def init(self, key, *args, **kwargs):
-        return self._module.init(key, *args, **kwargs)
+        self._keys = tuple(kwargs.keys())
 
-    def _prepare_params(self, state: Any) -> Dict[str, Any]:
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def keys(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def items(self) -> Iterator[Tuple[str, Any]]:
+        for k in self._keys:
+            yield k, getattr(self, k)
+
+    @property
+    def _fields(self):
+        return self._keys
+
+
+class JaxModule(nnx.Module):
+    """ """
+
+    def __init__(self, module: nnx.Module, _backend: str = "jax"):
+        self._module = module
+        self._backend = _backend
+
+        self._base_methods: Set[str] = set(dir(nnx.Module()))
+        self._bind_methods()
+
+    def __call__(self, *args, **kwargs) -> Any:
         """ """
-        if isinstance(state, dict) and self._name in state:
-            p = state[self._name]
-        else:
-            p = state.params if hasattr(state, "params") else state
+        return self._module(*args, **kwargs)
 
-        return {"params": p}
-
-    def __call__(self, x: Any, state: Any, carry: Any = None, **kwargs: Any) -> Any:
-        params = self._prepare_params(state)
-        if carry is None:
-            return self._module.apply(params, x, **kwargs)
-        else:
-            return self._module.apply(params, x, carry, **kwargs)
-
-    @lru_cache(maxsize=None)
-    def __getattr__(self, name: str):
+    def _bind_methods(self):
         """ """
-        if not hasattr(self._module, name):
-            raise AttributeError(f"Flax module has no attribute '{name}'")
-        method_fn = getattr(self._module, name)
+        for name in dir(self._module):
+            if not name.startswith("_") and name not in self._base_methods and name != "forward":
+                attr = getattr(self._module, name)
+                if callable(attr):
+                    setattr(self, name, attr)
 
-        def wrapper(*args, state: Any, carry: Any = None, **kwargs: Any):
-            params = self._prepare_params(state)
-            if carry is None:
-                return self._module.apply(params, *args, method=method_fn, **kwargs)
-            else:
-                return self._module.apply(params, *args, carry, method=method_fn, **kwargs)
-
-        return wrapper
-
-    def get_params(self):
+    def __getattr__(self, name: str) -> Any:
         """ """
-        return None
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return getattr(self._module, name)

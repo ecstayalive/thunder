@@ -1,36 +1,28 @@
-from __future__ import annotations
+from typing import Any, Callable, Dict, List, Optional, Type
 
-import importlib
-from typing import TYPE, Dict, Optional
+from .interface import EnvSpec, EnvWrapper
 
-from .interface import EnvWrapper
-
-_LOADER_REGISTRY: Dict[str, str] = {
-    "isaaclab": "thunder.env.isaaclab.isaaclab_loader",
-    "dm_control": "thunder.env.dmc.dmc_loader",
-    "gym": "thunder.env.gym.gym_loader",
-}
+_LOADER_REGISTRY: Dict[str, Callable[[Any], EnvWrapper]] = {}
 
 
-def make_env(
-    framework: str, task: str, wrapper: Optional[TYPE[EnvWrapper]] = None, **kwargs
-) -> EnvWrapper:
-    """Create an environment based on the specified framework and task.
+def register_loader(framework: str):
+    def decorator(func: Callable):
+        _LOADER_REGISTRY[framework] = func
+        return func
 
-    Args:
-        framework (str): The environment framework to use (e.g., 'isaaclab', 'gym', 'dm_control').
-        task (str): The specific task or environment name.
-        wrapper (Optional[TYPE[EnvWrapper]]): An optional wrapper class to wrap the environment.
+    return decorator
 
-    Returns:
-        An instance of the created environment, possibly wrapped.
-    """
-    if framework not in _LOADER_REGISTRY:
-        raise ValueError(f"Unsupported environment framework: {framework}")
-    module_path, loader_name = _LOADER_REGISTRY[framework].rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    loader = getattr(module, loader_name)
-    env = loader(task, **kwargs)
-    if wrapper is not None:
-        env = wrapper(env)
+
+def make_env(spec: EnvSpec, wrappers: Optional[List[Type[EnvWrapper]]] = None) -> EnvWrapper:
+    """ """
+    if spec.framework not in _LOADER_REGISTRY:
+        import importlib
+
+        importlib.import_module(f"thunder.env.{spec.framework}")
+
+    env = _LOADER_REGISTRY[spec.framework](spec)
+    if wrappers:
+        for wrapper_cls in wrappers:
+            env = wrapper_cls(env)
+
     return env

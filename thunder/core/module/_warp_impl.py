@@ -9,11 +9,9 @@ class WarpModule:
         self._module = module
         self.get_params = getattr(module, "parameters", lambda: [])
 
-    def __call__(self, x, state: Optional[Any] = None, **kwargs):
+    def __call__(self, *args, **kwargs):
         """ """
-        if state is not None:
-            return self._module.forward(x, state, **kwargs)
-        return self._module.forward(x, **kwargs)
+        return self._module.forward(*args, **kwargs)
 
     def to(self, device):
         if hasattr(self._module, "to"):

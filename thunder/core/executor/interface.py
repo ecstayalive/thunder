@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Dict, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from ..context import ExecutionContext
@@ -25,15 +25,15 @@ class ExecutorProtocol(Protocol):
         opt: str,
         objectives: list[Objective],
         max_grad_norm: float = 1.0,
-    ) -> tuple[dict[str, Any], Any, Any]:
+    ) -> Dict[str, Any]:
         """ """
         ...
 
-    def init(
-        self, model: ThunderModule, batch: Batch, optim_config: Dict[str, Any]
-    ) -> ExecutionContext:
+    def init(self, model: ThunderModule, optim_config: Dict[str, Any]) -> ExecutionContext:
         """ """
         ...
+
+    def jit(self, fn: Callable): ...
 
     def to_device(self, data: Any) -> Any: ...
 

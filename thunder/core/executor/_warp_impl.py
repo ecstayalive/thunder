@@ -32,13 +32,11 @@ class WarpExecutor:
     def optimize(
         self,
         ctx: ExecutionContext,
-        target: str,
         opt: str,
         objectives: list,
         max_grad_norm: float = 1.0,
     ) -> tuple[dict, Any, Any]:
 
-        params_list = ctx.params.get(target)
         optimizer = ctx.opt_states[opt]
         model = ctx.models
         batch = ctx.batch
@@ -49,12 +47,12 @@ class WarpExecutor:
         with tape:
             total_loss = wp.zeros(1, dtype=wp.float32, device=self.device, requires_grad=True)
             for obj in objectives:
-                l, m = obj.forward(batch, model, params_list)
+                l, m = obj.forward(batch, model)
                 pass
             pass
         tape.backward(loss=total_loss)
         pass
-        return metrics, None, None
+        return metrics
 
     def init(model: WarpModule, batch: Batch, optim_config: Dict[str, Any]):
         pass

@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
-    from .data import Batch, ModelPack
+    from .data import Batch
+    from .module import ModelPack
 
 
 class Operation(ABC):
@@ -51,11 +52,11 @@ class Objective(Operation):
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         if ctx.step % self.interval != 0:
             return ctx, {}
-        _, metrics = self.forward(ctx.batch, ctx.models, ctx.params)
+        _, metrics = self.forward(ctx.batch, ctx.models)
         return ctx, metrics
 
-    def forward(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
-        loss, metrics = self.compute(batch, model, params)
+    def forward(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
+        loss, metrics = self.compute(batch, model)
         weighted_loss = self.weight * loss
         metrics = {
             f"{self.name}/loss": loss,
@@ -65,7 +66,7 @@ class Objective(Operation):
         return weighted_loss, metrics
 
     @abstractmethod
-    def compute(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
         pass
 
 
@@ -86,16 +87,10 @@ class OptimizeOp(Operation):
         self.max_grad_norm = max_grad_norm
 
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        metrics, new_params, new_opt_state = ctx.executor.optimize(
-            ctx=ctx,
-            opt=self.opt,
-            objectives=self.objectives,
-            max_grad_norm=self.max_grad_norm,
+        metrics = ctx.executor.optimize(
+            ctx=ctx, opt=self.opt, objectives=self.objectives, max_grad_norm=self.max_grad_norm
         )
-        new_ctx = ctx.apply_gradients(
-            opt=self.opt, new_params_subset=new_params, new_opt_state=new_opt_state
-        )
-        return new_ctx, metrics
+        return ctx, metrics
 
 
 class CallableOp(Operation):

@@ -24,13 +24,13 @@ class GraphAlgorithm(ABC):
         self.pipeline: Operation[Iterable[Operation]] = pipeline
         self.ctx: Optional[ExecutionContext] = None
 
-    def build(self, sample_batch: Batch, optim_config: Dict[str, Any]) -> None:
+    def build(self, optim_config: Dict[str, Any]) -> None:
         """Build the algorithm by initializing the execution context.
         Args:
             sample_batch (Batch): _description_
             optim_config (Dict[str, Any]): _description_
         """
-        self.ctx = self.executor.init(self.models, sample_batch, optim_config)
+        self.ctx = self.executor.init(self.models, optim_config)
         self.models = self.ctx.models
 
     def setup_pipeline(self, pipeline: Iterable[Operation]) -> None:

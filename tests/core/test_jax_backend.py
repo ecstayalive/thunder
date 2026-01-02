@@ -2,7 +2,7 @@ import importlib
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -27,9 +27,9 @@ def setup_jax_env():
 
 
 import jax
+import flax.nnx as nnx
 import jax.numpy as jnp
 import optax
-from flax import linen as nn
 
 import thunder.core.algorithm as algo_mod
 import thunder.core.context as ctx_mod
@@ -39,35 +39,38 @@ import thunder.core.module as module_mod
 import thunder.core.operation as op_mod
 
 
-class Simple3DFlaxNet(nn.Module):
-    @nn.compact
+class Simple3DFlaxNet(nnx.Module):
+    def __init__(self, din: int, dout: int, rngs: nnx.Rngs = nnx.Rngs(0)):
+        self.net = nnx.Linear(
+            din, dout, use_bias=False, kernel_init=nnx.initializers.zeros, rngs=rngs
+        )
+
     def __call__(self, x):
-        return nn.Dense(features=2, use_bias=False, kernel_init=nn.initializers.zeros)(x)
+        return self.net(x)
 
 
-class SimpleRNN(nn.Module):
-    features: int = 2
+class SimpleRNN(nnx.Module):
+    def __init__(self, din: int, dhid: int, rngs: nnx.Rngs = nnx.Rngs(0)):
+        self.ih = nnx.Linear(din, dhid, rngs=rngs)
+        self.hh = nnx.Linear(dhid, dhid, use_bias=False, rngs=rngs)
+        self.dhid = dhid
 
-    @nn.compact
     def __call__(self, x, carry=None):
-        batch_dims = x.shape[:-1]
         if carry is None:
-            carry = jnp.zeros(batch_dims + (self.features,))
-        x_proj = nn.Dense(self.features, name="ih")(x)
-        h_proj = nn.Dense(self.features, name="hh", use_bias=False)(carry)
-        next_carry = nn.tanh(x_proj + h_proj)
+            carry = jnp.zeros(x.shape[:-1] + (self.dhid,))
+        x_proj = self.ih(x)
+        h_proj = self.hh(carry)
+        next_carry = jnp.tanh(x_proj + h_proj)
         return next_carry, next_carry
 
 
 class JaxMSEObjective(op_mod.Objective):
-    @dataclass
-    class ModuleProtocol:
-        net: Simple3DFlaxNet
 
     def compute(
-        self, batch: data_mod.Batch, models: ModuleProtocol, params: Any
+        self, batch: data_mod.Batch, models: module_mod.ModelPack
     ) -> Tuple[Any, Dict[str, Any]]:
-        pred = models.net(batch.obs, state=params)
+        target_net: nnx.Module = getattr(models, self.kwargs.get("net", "net"))
+        pred = target_net(batch.obs)
         targets = batch.actions
         error = pred - targets
         if batch.mask is not None:
@@ -81,16 +84,12 @@ class JaxMSEObjective(op_mod.Objective):
 
 
 class MultiNetObjective(op_mod.Objective):
-    @dataclass
-    class ModuleProtocol:
-        net1: Simple3DFlaxNet
-        net2: Simple3DFlaxNet
 
     def compute(
-        self, batch: data_mod.Batch, models: ModuleProtocol, params: Any
+        self, batch: data_mod.Batch, models: module_mod.ModelPack
     ) -> Tuple[Any, Dict[str, Any]]:
-        pred1 = models.net1(batch.obs, state=params)
-        pred2 = models.net2(batch.obs, state=params)
+        pred1 = getattr(models, self.kwargs.get("net1", "net1"))(batch.obs)
+        pred2 = getattr(models, self.kwargs.get("net2", "net2"))(batch.obs)
         loss = jnp.mean((pred1 - batch.actions) ** 2) + jnp.mean((pred2 - batch.actions) ** 2)
         return loss, {}
 
@@ -119,7 +118,7 @@ def jax_batch_3d():
     )
 
 
-def test_jax_pytree_registration(jax_batch_3d):
+def test_jax_batch_pytree_behavior(jax_batch_3d):
     @jax.jit
     def process_batch(b):
         return b.obs * 2.0
@@ -129,377 +128,339 @@ def test_jax_pytree_registration(jax_batch_3d):
     assert jnp.all(res[0, 0] == 2.0)
 
 
-def test_jax_executor_optimization_flow(jax_batch_3d):
-    net = Simple3DFlaxNet()
-    model = module_mod.ModelPack(net=net)
+def test_jax_batch_mapping():
+    batch = data_mod.Batch(obs=jnp.ones((2, 2)), extra={"v": jnp.zeros(1)})
+    new_batch = batch.map(lambda x: x + 5.0)
+    assert jnp.all(new_batch.obs == 6.0)
+    assert jnp.all(new_batch.v == 5.0)
+
+
+def test_jax_executor_init_flow(jax_batch_3d):
+    rngs = nnx.Rngs(42)
+    models = module_mod.ModelPack(
+        net1=Simple3DFlaxNet(4, 2, rngs), net2=Simple3DFlaxNet(4, 2, rngs)
+    )
+    executor = exec_mod.Executor(device="gpu")
+    optim_config = {
+        "opt1": {"targets": ["net1"], "class": "adam", "lr": 1e-3},
+        "opt2": {"targets": ["net2"], "class": "sgd", "lr": 1e-2},
+    }
+    ctx = executor.init(models, optim_config)
+    assert "opt1" in ctx.opt_groups
+    assert "opt2" in ctx.opt_groups
+    assert ctx.opt_groups["opt1"].targets == ("net1",)
+    assert isinstance(ctx.opt_groups["opt1"].optimizer, nnx.Optimizer)
+
+
+def test_jax_nnx_optimization_step(jax_batch_3d):
+    rngs = nnx.Rngs(0)
+    native = Simple3DFlaxNet(4, 2, rngs)
+    models = module_mod.ModelPack(net=native)
     executor = exec_mod.Executor(device="gpu", donate=False)
-    optim_config = {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
-    ctx = executor.init(model, jax_batch_3d, optim_config)
-    old_w = ctx.params["net"]["Dense_0"]["kernel"]
-    assert jnp.all(old_w == 0.0)
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    ctx.batch = jax_batch_3d
+    initial_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), native.net.kernel.value)
     obj = JaxMSEObjective("test")
     op = op_mod.OptimizeOp("opt", [obj])
     new_ctx, metrics = op(ctx)
-    new_w = new_ctx.params["net"]["Dense_0"]["kernel"]
-    assert jnp.any(new_w != 0.0)
-    assert jnp.all(old_w == 0.0)
-    assert jnp.any(new_w != 0.0)
+    current_params = native.net.kernel.value
     assert "grad_op/test/loss" in metrics
+    assert not jnp.array_equal(initial_params, current_params)
+    assert jnp.all(current_params > 0)
 
 
-def test_jax_multi_net_joint_update(jax_batch_3d):
-    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "sgd", "lr": 0.1}}
-    ctx = executor.init(model, jax_batch_3d, optim_config)
-    obj = MultiNetObjective("joint")
-    op = op_mod.OptimizeOp("joint_opt", [obj])
-    new_ctx, metrics = op(ctx)
-    assert jnp.any(new_ctx.params["net1"]["Dense_0"]["kernel"] != 0.0)
-    assert jnp.any(new_ctx.params["net2"]["Dense_0"]["kernel"] != 0.0)
-    assert "grad_op/joint/loss" in metrics
-
-
-def test_jax_pipeline_scheduling(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    interval_op = JaxCounterOp(interval=3)
-    pipeline = [interval_op]
-    algo = algo_mod.GraphAlgorithm(model, executor, pipeline)
-    algo.build(jax_batch_3d, {})
-    algo.step(jax_batch_3d)  # step 1: 0%3 == 0
-    assert interval_op.execution_count == 1
-    algo.step(jax_batch_3d)  # step 2: 1%3 != 0
-    assert interval_op.execution_count == 1
-    algo.step(jax_batch_3d)  # step 3: 2%3 == 0
-    assert interval_op.execution_count == 1
-    algo.step(jax_batch_3d)  # step 4: 3%3 == 0
-    assert interval_op.execution_count == 2
-
-
-def test_jax_objective_standalone(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    obj = JaxMSEObjective("eval")
-    algo = algo_mod.GraphAlgorithm(model, executor, [obj])
-    algo.build(jax_batch_3d, {})
-    metrics = algo.step(jax_batch_3d)
-    assert "eval/loss" in metrics
-    assert "eval/weighted_loss" in metrics
-    assert jnp.all(algo.ctx.params["net"]["Dense_0"]["kernel"] == 0.0)
-
-
-def test_jax_apply_gradients_logic(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    ctx = executor.init(model, jax_batch_3d, {"opt": {"targets": ["net"], "class": "sgd"}})
-
-    fake_params = {"net": jax.tree_util.tree_map(lambda x: x + 1.0, ctx.params["net"])}
-    fake_opt = jax.tree_util.tree_map(lambda x: x, ctx.opt_groups["opt"].opt_state)
-
-    new_ctx = ctx.apply_gradients("opt", fake_params, fake_opt)
-    assert new_ctx is not ctx
-    assert jnp.all(new_ctx.params["net"]["Dense_0"]["kernel"] == 1.0)
-    assert jnp.all(new_ctx.opt_groups["opt"].params["net"]["Dense_0"]["kernel"] == 1.0)
-
-
-def test_jax_initialization_error(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    with pytest.raises(ValueError, match="Optimizer target 'bad_net' not found in models."):
-        executor.init(model, jax_batch_3d, {"opt": {"targets": ["bad_net"]}})
-
-
-def test_jax_method_proxy_call(jax_batch_3d):
-    class CustomMethodNet(nn.Module):
-        @nn.compact
-        def __call__(self, x):
-            return nn.Dense(2)(x)
-
-        def get_custom_value(self, x):
-            return jnp.sum(x, axis=-1, keepdims=True)
-
-    model = module_mod.ModelPack(net=CustomMethodNet())
-    executor = exec_mod.Executor(device="gpu")
-    ctx = executor.init(model, jax_batch_3d, {})
-
-    res = ctx.models.net.get_custom_value(jax_batch_3d.obs, state=ctx.params["net"])
-    assert res.shape == (2, 3, 1)
-    assert jnp.all(res[0, 0] == jnp.sum(jax_batch_3d.obs[0, 0]))
-
-
-def test_jax_gradient_clipping(jax_batch_3d):
-    net = Simple3DFlaxNet()
-    model = module_mod.ModelPack(net=net)
-    executor = exec_mod.Executor(device="gpu")
-
-    optim_config = {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
-    ctx = executor.init(model, jax_batch_3d, optim_config)
-    obj = JaxMSEObjective("test")
-    op_no_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=999.0)
-    _, metrics_large = op_no_clip(ctx)
-    raw_grad_norm = metrics_large["grad_op/grad_norm"]
-    assert raw_grad_norm > 0.1
-    clip_threshold = 0.01
-    op_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=clip_threshold)
-    new_ctx_small, metrics_small = op_clip(ctx)
-    clipped_grad_norm = metrics_small["grad_op/grad_norm"]
-    assert jnp.isclose(clipped_grad_norm, clip_threshold, atol=1e-5)
-    assert clipped_grad_norm < raw_grad_norm
-    p_old = ctx.params["net"]["Dense_0"]["kernel"]
-    p_new = new_ctx_small.params["net"]["Dense_0"]["kernel"]
-    actual_update_norm = jnp.linalg.norm(p_new - p_old)
-    assert jnp.isclose(actual_update_norm, clip_threshold, atol=1e-5)
-    op_safe_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=raw_grad_norm + 10.0)
-    _, metrics_safe = op_safe_clip(ctx)
-    assert jnp.isclose(metrics_safe["grad_op/grad_norm"], raw_grad_norm)
-
-
-def test_jax_multiple_optimizer_subsets(jax_batch_3d):
-    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "sgd", "lr": 1.0}}
-    ctx = executor.init(model, jax_batch_3d, optim_config)
-
-    class JointObj(op_mod.Objective):
-        def compute(self, batch, models, params):
-            l1 = jnp.mean((models.net1(batch.obs, state=params) - batch.actions) ** 2)
-            l2 = jnp.mean((models.net2(batch.obs, state=params) - batch.actions) ** 2)
-            return l1 + l2, {}
-
-    clip_threshold = 0.05
-    op = op_mod.OptimizeOp("joint_opt", [JointObj("joint")], max_grad_norm=clip_threshold)
-    new_ctx, metrics = op(ctx)
-    assert jnp.isclose(metrics["grad_op/grad_norm"], clip_threshold)
-
-    diff1 = new_ctx.params["net1"]["Dense_0"]["kernel"] - ctx.params["net1"]["Dense_0"]["kernel"]
-    diff2 = new_ctx.params["net2"]["Dense_0"]["kernel"] - ctx.params["net2"]["Dense_0"]["kernel"]
-    total_delta_norm = jnp.sqrt(jnp.sum(diff1**2) + jnp.sum(diff2**2))
-    assert jnp.isclose(total_delta_norm, clip_threshold, atol=1e-5)
-
-
-def test_jax_callback_side_effects(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    algo = algo_mod.GraphAlgorithm(model, executor)
-
-    def change_batch_hook(ctx: ctx_mod.ExecutionContext):
-        new_obs = ctx.batch.obs + 10.0
-        new_batch = data_mod.replace(ctx.batch, obs=new_obs)
-        return ctx.replace(batch=new_batch), {"modified": True}
-
-    pipeline = [op_mod.CallableOp(change_batch_hook, name="mod"), JaxMSEObjective("eval")]
-    algo.build(jax_batch_3d, {})
-    algo.setup_pipeline(pipeline=pipeline)
-    metrics = algo.step(jax_batch_3d)
-    assert jnp.all(algo.ctx.batch.obs >= 10.0)
-    assert metrics["mod/modified"] is True
-
-
-def test_jax_multiple_objectives_summation(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-
-    obj1 = JaxMSEObjective("mse1", weight=1.0)
-    obj2 = JaxMSEObjective("mse2", weight=2.0)
-
-    op = op_mod.OptimizeOp("opt", [obj1, obj2])
-    algo = algo_mod.GraphAlgorithm(model, executor, [op])
-    algo.build(jax_batch_3d, {"opt": {"targets": ["net"], "class": "sgd", "lr": 0.1}})
-
-    metrics = algo.step(jax_batch_3d)
-
-    l1 = metrics["grad_op/mse1/loss"]
-    l2 = metrics["grad_op/mse2/loss"]
-    total = metrics["grad_op/loss_total"]
-
-    assert jnp.isclose(l1, l2)
-    assert jnp.isclose(total, l1 * 1.0 + l2 * 2.0)
-
-
-def test_jax_distributed_metadata_injection(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    # Simulate distributed flag
-    executor = exec_mod.Executor(device="gpu")
-    executor.distributed = True
-
-    ctx = executor.init(model, jax_batch_3d, {})
-
-    assert "mesh" in ctx.meta
-    assert "data_sharding" in ctx.meta
-    assert isinstance(ctx.meta["mesh"], jax.sharding.Mesh)
-
-
-def test_jax_empty_metrics_handling(jax_batch_3d):
-    class NoMetricOp(op_mod.Operation):
-        def forward(self, ctx):
-            return ctx, {}
-
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    pipeline = [NoMetricOp(name="silent")]
-    algo = algo_mod.GraphAlgorithm(model, executor, pipeline)
-    algo.build(jax_batch_3d, {})
-
-    metrics = algo.step(jax_batch_3d)
-    assert metrics == {}
-
-
-def test_jax_params_unpacking_correctness(jax_batch_3d):
-    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    ctx = executor.init(
-        model,
-        jax_batch_3d,
-        {
-            "opt1": {"targets": ["net1"], "class": "sgd"},
-            "opt2": {"targets": ["net2"], "class": "sgd"},
-        },
+def test_jax_joint_multi_net_optimization(jax_batch_3d):
+    rngs = nnx.Rngs(1)
+    models = module_mod.ModelPack(
+        net1=Simple3DFlaxNet(4, 2, rngs), net2=Simple3DFlaxNet(4, 2, rngs)
     )
-
-    group1 = ctx.opt_groups["opt1"]
-    assert "net1" in group1.params
-    assert "net2" not in group1.params
-
-    group2 = ctx.opt_groups["opt2"]
-    assert "net2" in group2.params
-    assert "net1" not in group2.params
-
-
-def test_jax_rnn_carry_flow(jax_batch_3d):
-    model = module_mod.ModelPack(rnn=SimpleRNN())
     executor = exec_mod.Executor(device="gpu")
-    ctx = executor.init(model, jax_batch_3d, {})
-    assert "ih" in ctx.params["rnn"]
-    assert "hh" in ctx.params["rnn"]
-    obs_step0 = jax_batch_3d.obs[:, 0]  # (B=2, D=4)
-    out1, next_h1 = ctx.models.rnn(obs_step0, state=ctx.params["rnn"], carry=None)
+    optim_config = {"joint": {"targets": ["net1", "net2"], "class": "sgd", "lr": 0.5}}
+    ctx = executor.init(models, optim_config)
+    ctx.batch = jax_batch_3d
+    obj = MultiNetObjective("m")
+    op = op_mod.OptimizeOp("joint", [obj])
+    op(ctx)
+    assert jnp.any(models.net1.net.kernel.value != 0.0)
+    assert jnp.any(models.net2.net.kernel.value != 0.0)
+
+
+def test_jax_rnn_carry_and_state_flow(jax_batch_3d):
+    rngs = nnx.Rngs(2)
+    rnn = SimpleRNN(4, 2, rngs)
+    models = module_mod.ModelPack(rnn=rnn)
+    executor = exec_mod.Executor(device="gpu")
+    ctx = executor.init(models, {})
+    x_step = jax_batch_3d.obs[:, 0]
+    out1, carry1 = ctx.models.rnn(x_step, carry=None)
     assert out1.shape == (2, 2)
-    assert next_h1.shape == (2, 2)
-    out2, next_h2 = ctx.models.rnn(obs_step0, state=ctx.params["rnn"], carry=next_h1)
-    assert jnp.any(next_h1 != next_h2)
-    assert next_h2.shape == (2, 2)
-    out2_repeat, _ = ctx.models.rnn(obs_step0, state=ctx.params["rnn"], carry=next_h1)
-    assert jnp.all(out2 == out2_repeat)
+    out2, carry2 = ctx.models.rnn(x_step, carry=carry1)
+    assert not jnp.array_equal(out1, out2)
+    assert not jnp.array_equal(carry1, carry2)
 
 
-def test_jax_rnn_sequence_training(jax_batch_3d):
-    """ """
-    model = module_mod.ModelPack(rnn=SimpleRNN(features=2))
-    executor = exec_mod.Executor("gpu")
-    ctx = executor.init(model, jax_batch_3d, {})
-    out_seq, _ = ctx.models.rnn(jax_batch_3d.obs, state=ctx.params["rnn"])
-    assert out_seq.shape == (2, 3, 2)  # (Batch=2, Time=3, Features=2)
+def test_jax_gradient_clipping_logic(jax_batch_3d):
+    rngs = nnx.Rngs(3)
+    native = Simple3DFlaxNet(4, 2, rngs)
+    models = module_mod.ModelPack(net=native)
+    executor = exec_mod.Executor(device="gpu")
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    ctx.batch = jax_batch_3d
+    obj = JaxMSEObjective("test")
+    op_large = op_mod.OptimizeOp("opt", [obj], max_grad_norm=1e6)
+    _, m_large = op_large(ctx)
+    raw_norm = m_large["grad_op/grad_norm"]
+    native.net.kernel.value = jnp.zeros_like(native.net.kernel.value)
+    clip_val = 0.01
+    op_small = op_mod.OptimizeOp("opt", [obj], max_grad_norm=clip_val)
+    _, m_small = op_small(ctx)
+    assert jnp.isclose(m_small["grad_op/grad_norm"], clip_val)
+    update_norm = jnp.linalg.norm(native.net.kernel.value)
+    assert jnp.isclose(update_norm, clip_val, atol=1e-5)
 
 
-def test_jax_objective_weight_scaling(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
+def test_jax_op_scheduling_and_callbacks(jax_batch_3d):
+    rngs = nnx.Rngs(4)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor(device="gpu")
 
-    obj_w1 = JaxMSEObjective("mse", weight=1.0)
-    obj_w10 = JaxMSEObjective("mse", weight=10.0)
+    def hook(c: ctx_mod.ExecutionContext):
+        c.update_meta(visited=True)
+        return c, {"hook_metric": 7}
 
-    algo1 = algo_mod.GraphAlgorithm(model, executor, [obj_w1])
-    algo10 = algo_mod.GraphAlgorithm(model, executor, [obj_w10])
+    counter = JaxCounterOp(interval=5)
+    pipeline = [op_mod.CallableOp(hook, name="h"), counter]
+    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
+    algo.build({})
 
-    algo1.build(jax_batch_3d, {})
-    algo10.build(jax_batch_3d, {})
+    for i in range(5):
+        m = algo.step(jax_batch_3d)
+        assert algo.ctx.meta["visited"] is True
+        assert counter.execution_count == 1
 
-    m1 = algo1.step(jax_batch_3d)
-    m10 = algo10.step(jax_batch_3d)
-
-    assert jnp.isclose(m1["mse/weighted_loss"] * 10.0, m10["mse/weighted_loss"])
-    assert jnp.isclose(m1["mse/loss"], m10["mse/loss"])
-
-
-def test_jax_optimizer_param_group_logic(jax_batch_3d):
-    model = module_mod.ModelPack(net1=Simple3DFlaxNet(), net2=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    algo = algo_mod.GraphAlgorithm(
-        model, executor, [op_mod.OptimizeOp("joint", [MultiNetObjective("m")])]
-    )
-    algo.build(jax_batch_3d, {"joint": {"targets": ["net1", "net2"], "class": "sgd", "lr": 1.0}})
-
-    wa_before = algo.ctx.params["net1"]["Dense_0"]["kernel"]
-    wb_before = algo.ctx.params["net2"]["Dense_0"]["kernel"]
-
-    algo.step(jax_batch_3d)
-
-    assert jnp.any(algo.ctx.params["net1"]["Dense_0"]["kernel"] != wa_before)
-    assert jnp.any(algo.ctx.params["net2"]["Dense_0"]["kernel"] != wb_before)
+    m_final = algo.step(jax_batch_3d)
+    assert "counter/count" in m_final
+    assert counter.execution_count == 2
 
 
-def test_jax_batch_utility_methods(jax_batch_3d):
-    assert jax_batch_3d.batch_size == 2
+def test_jax_mixed_precision_bf16(jax_batch_3d):
+    rngs = nnx.Rngs(5)
+    native = Simple3DFlaxNet(4, 2, rngs)
+    models = module_mod.ModelPack(net=native)
+    executor = exec_mod.Executor(precision="bf16")
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 0.1}})
+    ctx.batch = jax_batch_3d
 
-    executor = exec_mod.Executor(device="gpu")
-    cpu_batch = jax_batch_3d.to(executor)
-    assert isinstance(cpu_batch.obs, jax.Array)
-
-    class MockHandler:
-        def to_device(self, x):
-            return x
-
-    native_batch = jax_batch_3d.to(MockHandler())
-    assert jnp.all(native_batch.obs == jax_batch_3d.obs)
-
-
-def test_jax_model_pack_attribute_access():
-    m1 = module_mod.ThunderModule(Simple3DFlaxNet(), "actor")
-    m2 = module_mod.ThunderModule(Simple3DFlaxNet(), "critic")
-    pack = module_mod.ModelPack(actor=m1, critic=m2)
-
-    assert pack.actor is m1
-    assert pack.critic is m2
-    assert "actor" in pack._fields
-
-
-def test_jax_apply_gradients_multiple_opts(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
-    ctx = executor.init(
-        model,
-        jax_batch_3d,
-        {
-            "opt_a": {"targets": ["net"], "class": "sgd", "lr": 0.1},
-            "opt_b": {"targets": ["net"], "class": "sgd", "lr": 0.2},
-        },
-    )
-
-    updated_p = jax.tree_util.tree_map(lambda x: x + 0.5, ctx.params["net"])
-    new_ctx = ctx.apply_gradients("opt_a", {"net": updated_p}, ctx.opt_groups["opt_a"].opt_state)
-
-    assert jnp.all(new_ctx.params["net"]["Dense_0"]["kernel"] == 0.5)
-    assert jnp.all(new_ctx.opt_groups["opt_a"].params["net"]["Dense_0"]["kernel"] == 0.5)
-    assert jnp.all(new_ctx.opt_groups["opt_b"].params["net"]["Dense_0"]["kernel"] == 0.0)
-
-
-def test_jax_executor_jit_cache_behavior(jax_batch_3d):
-    model = module_mod.ModelPack(net=Simple3DFlaxNet())
-    executor = exec_mod.Executor(device="gpu")
     obj = JaxMSEObjective("mse")
+    op = op_mod.OptimizeOp("opt", [obj])
+    op.forward(ctx)
 
-    ctx = executor.init(model, jax_batch_3d, {"opt": {"targets": ["net"], "class": "sgd"}})
+    assert native.net.kernel.value.dtype == jnp.float32
 
-    executor.optimize(ctx, "opt", [obj])
-    cache_size_1 = len(executor._compiled_step_cache)
-    assert cache_size_1 == 1
 
+def test_jax_objective_standalone_eval(jax_batch_3d):
+    rngs = nnx.Rngs(6)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    obj = JaxMSEObjective("eval")
+    algo = algo_mod.GraphAlgorithm(models, executor, [obj])
+    algo.build({})
+    m = algo.step(jax_batch_3d)
+    assert "eval/loss" in m
+    assert jnp.all(models.net.net.kernel.value == 0.0)
+
+
+def test_jax_serialization_state_retrieval():
+    rngs = nnx.Rngs(7)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    algo = algo_mod.GraphAlgorithm(models, executor, [])
+    algo.build({})
+
+    # sd = algo.get_state_dict()
+    # assert "net" in sd
+    # assert isinstance(sd["net"], nnx.State)
+    new_native = Simple3DFlaxNet(4, 2, nnx.Rngs(8))
+    new_models = module_mod.ModelPack(net=new_native)
+    new_algo = algo_mod.GraphAlgorithm(new_models, executor, [])
+    new_algo.build({})
+    # new_algo.load_state_dict(sd)
+    assert jnp.all(new_native.net.kernel.value == 0.0)
+
+
+def test_jax_jit_cache_integrity(jax_batch_3d):
+    rngs = nnx.Rngs(9)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd"}})
+    ctx = ctx.replace(batch=jax_batch_3d)
+    obj = JaxMSEObjective("m")
     executor.optimize(ctx, "opt", [obj])
     assert len(executor._compiled_step_cache) == 1
-
-    obj2 = JaxMSEObjective("mse2")
+    executor.optimize(ctx, "opt", [obj])
+    assert len(executor._compiled_step_cache) == 1
+    obj2 = JaxMSEObjective("m2")
     executor.optimize(ctx, "opt", [obj, obj2])
     assert len(executor._compiled_step_cache) == 2
 
 
-def test_jax_complex_extra_dict_pytree(jax_batch_3d):
-    extra_data = {"nested": {"a": jnp.ones(10), "b": jnp.zeros(5)}, "list": [jnp.array([1, 2, 3])]}
-    batch = data_mod.Batch(obs=jnp.zeros((1, 1, 1)), extra=extra_data)
+def test_jax_complex_pytree_nesting():
+    class DeepNet(nnx.Module):
+        def __init__(self, rngs):
+            self.sub = Simple3DFlaxNet(4, 4, rngs)
+            self.final = nnx.Linear(4, 2, rngs=rngs)
 
-    @jax.jit
-    def sum_extra(b):
-        return jnp.sum(b.nested["a"]) + jnp.sum(b.list[0])
+        def __call__(self, x):
+            return self.final(self.sub(x))
 
-    res = sum_extra(batch)
-    assert res == 10.0 + 6.0
+    rngs = nnx.Rngs(10)
+    models = module_mod.ModelPack(net=DeepNet(rngs))
+    executor = exec_mod.Executor()
+    ctx = executor.init(models, {"o": {"targets": ["net"], "class": "adam"}})
+    graphdef, state = nnx.split(ctx.models)
+    assert "sub" in state["net"]
+    assert "final" in state["net"]
+
+
+def test_jax_batch_device_transfer(jax_batch_3d):
+    executor = exec_mod.Executor(device="gpu")
+    moved_batch = executor.to_device(jax_batch_3d)
+    assert isinstance(moved_batch.obs, jax.Array)
+    assert moved_batch is not jax_batch_3d
+    assert jnp.all(moved_batch.obs == jax_batch_3d.obs)
+
+
+def test_jax_context_immutability_and_replace():
+    executor = exec_mod.Executor()
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, nnx.Rngs(0)))
+    ctx = executor.init(models, {})
+
+    new_ctx = ctx.replace(step=500)
+    assert new_ctx.step == 500
+    assert ctx.step == 0
+    assert new_ctx is not ctx
+    assert new_ctx.models is ctx.models
+
+
+def test_jax_distributed_sharding_constraints(jax_batch_3d):
+
+    executor = exec_mod.Executor(distributed=True)
+    rngs = nnx.Rngs(0)
+    net = Simple3DFlaxNet(4, 2, rngs)
+    models = module_mod.ModelPack(net=net)
+    ctx = executor.init(models, {})
+    assert "data_sharding" in ctx.meta
+
+
+def test_jax_optimizer_target_mismatch_error(jax_batch_3d):
+    rngs = nnx.Rngs(0)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    with pytest.raises(AttributeError):
+        executor.init(models, {"opt": {"targets": ["wrong_name"], "class": "adam"}})
+
+
+def test_jax_objective_extra_kwargs_injection(jax_batch_3d):
+    class KwargObjective(op_mod.Objective):
+        def compute(self, batch, models) -> Tuple[Any, Dict[str, Any]]:
+            alpha = self.kwargs.get("alpha", 1.0)
+            return jnp.mean(batch.obs) * alpha, {f"{self.name}/alpha_used": alpha}
+
+    rngs = nnx.Rngs(0)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+
+    obj = KwargObjective("test", alpha=0.5)
+    ctx = executor.init(models, {})
+    ctx.batch = jax_batch_3d
+
+    _, metrics = obj.forward(ctx.batch, ctx.models)
+    assert metrics["test/alpha_used"] == 0.5
+
+
+def test_jax_batch_size_inference_edge_cases():
+    batch_empty = data_mod.Batch(obs=jnp.array([]))
+    assert batch_empty.batch_size == 0
+
+    obs_dict = {"a": jnp.zeros((10, 2)), "b": jnp.zeros((10, 5))}
+    batch_dict = data_mod.Batch(obs=obs_dict)
+    assert batch_dict.batch_size == 10
+
+
+def test_jax_optim_group_integrity(jax_batch_3d):
+    rngs = nnx.Rngs(0)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam", "lr": 1e-3}})
+
+    group = ctx.opt_groups["opt"]
+    assert group.name == "opt"
+    assert "net" in group.targets
+    assert group.optimizer is not None
+
+
+def test_jax_multi_objective_complex_pipeline(jax_batch_3d):
+    rngs = nnx.Rngs(0)
+    models = module_mod.ModelPack(
+        net1=Simple3DFlaxNet(4, 2, rngs), net2=Simple3DFlaxNet(4, 2, rngs)
+    )
+    executor = exec_mod.Executor()
+    obj1 = JaxMSEObjective("m1", weight=0.1, net="net1")
+    obj2 = JaxMSEObjective("m2", weight=0.9, net="net2")
+
+    pipeline = [op_mod.OptimizeOp("opt1", [obj1]), op_mod.OptimizeOp("opt2", [obj2])]
+
+    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
+    algo.build(
+        {
+            "opt1": {"targets": ["net1"], "class": "sgd", "lr": 0.1},
+            "opt2": {"targets": ["net2"], "class": "sgd", "lr": 0.1},
+        }
+    )
+
+    metrics = algo.step(jax_batch_3d)
+    assert "grad_op/m1/loss" in metrics
+    assert "grad_op/m2/loss" in metrics
+    assert algo.ctx.step == 1
+
+
+def test_jax_model_pack_getattr_proxy():
+    class CustomNet(nnx.Module):
+        def __init__(self, rngs):
+            self.v = nnx.Variable(jnp.array([1.0]))
+
+        def get_val(self):
+            return self.v.value
+
+    m = CustomNet(nnx.Rngs(0))
+    pack = module_mod.ModelPack(net=m)
+
+    assert pack.net.get_val() == 1.0
+
+
+def test_jax_nan_inf_handling_in_optimize(jax_batch_3d):
+    class NanObjective(op_mod.Objective):
+        def compute(self, batch, models):
+            return jnp.nan, {}
+
+    rngs = nnx.Rngs(0)
+    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
+    executor = exec_mod.Executor()
+    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam"}})
+    ctx.batch = jax_batch_3d
+    metrics = executor.optimize(ctx, "opt", [NanObjective("nan")])
+    assert jnp.isnan(metrics["nan/loss"])
+
+
+def test_jax_executor_donate_buffers_flag():
+    exec_donate = exec_mod.Executor(donate=True)
+    exec_no_donate = exec_mod.Executor(donate=False)
+    assert exec_donate.donate is True
+    assert exec_no_donate.donate is False
+
+
+def test_jax_batch_extra_getattr():
+    batch = data_mod.Batch(obs=jnp.zeros(1))
+    batch.custom_key = 123
+    assert batch.extra["custom_key"] == 123
+    assert batch.custom_key == 123

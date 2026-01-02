@@ -1,39 +1,71 @@
-from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Iterator, Tuple
 
+import torch
 import torch.nn as nn
 
 
+class TorchModelPack(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        for name, module in kwargs.items():
+            self.add_module(name, module)
+
+        self._keys = list(kwargs.keys())
+
+    def __getitem__(self, key: str) -> nn.Module:
+        """ """
+        return getattr(self, key)
+
+    def keys(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def items(self) -> Iterator[Tuple[str, nn.Module]]:
+        for k in self._keys:
+            yield k, getattr(self, k)
+
+    @property
+    def _fields(self):
+        return self._keys
+
+
 class TorchModule(nn.Module):
-    def __init__(self, module: nn.Module, name: str, backend: str = "torch"):
+    """ """
+
+    def __init__(self, module: nn.Module, _backend: str = "torch"):
         super().__init__()
         self.add_module("_module", module)
         self._module: nn.Module
-        self._name = name
-        self._backend = backend
-        self._bind_methods(module)
+        self._backend = _backend
+        self._base_methods = set(dir(nn.Module()))
+        self._bind_methods()
 
-    def _bind_methods(self, module: nn.Module):
+    def _bind_methods(self):
         """ """
-        base_methods = set(dir(nn.Module()))
-        for name in dir(module):
-            if not name.startswith("_") and name not in base_methods and name != "forward":
-                method = getattr(module, name)
+        for name in dir(self._module):
+            if not name.startswith("_") and name not in self._base_methods and name != "forward":
+                method = getattr(self._module, name)
                 if callable(method):
-                    setattr(self, name, self._wrap_ignoring_state(method))
+                    setattr(self, name, method)
 
-    @staticmethod
-    def _wrap_ignoring_state(fn: Callable):
+    def forward(self, *args, **kwargs):
         """ """
+        return self.raw(*args, **kwargs)
 
-        @wraps(fn)
-        def wrapper(*args, state=None, **kwargs):
-            return fn(*args, **kwargs)
-
-        return wrapper
-
-    def forward(self, x, state=None, carry=None, **kwargs):
+    def __getattr__(self, name: str) -> Any:
         """ """
-        if carry is not None:
-            return self._module(x, carry, **kwargs)
-        return self._module(x, **kwargs)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._module, name)
+
+    def to_ddp(self, **kwargs) -> nn.Module:
+        """ """
+        device_ids = kwargs.pop("device_ids", None)
+        if device_ids is None and next(self.parameters()).is_cuda:
+            device_ids = [next(self.parameters()).device.index]
+
+        return torch.nn.parallel.DistributedDataParallel(self, device_ids=device_ids, **kwargs)
+
+    def compile(self, **kwargs):
+        """ """
+        return torch.compile(self, **kwargs)
