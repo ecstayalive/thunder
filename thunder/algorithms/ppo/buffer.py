@@ -3,7 +3,7 @@ from typing import Any, Callable, Generator, Optional, Tuple
 
 import torch
 
-from thunder.rl import Buffer
+from thunder.rl.buffer import Buffer
 from thunder.rl.utils import (
     get_hidden_mask,
     get_trajectory_lengths,

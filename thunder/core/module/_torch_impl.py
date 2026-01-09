@@ -49,7 +49,7 @@ class TorchModule(nn.Module):
 
     def forward(self, *args, **kwargs):
         """ """
-        return self.raw(*args, **kwargs)
+        return self._module(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """ """

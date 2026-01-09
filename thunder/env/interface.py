@@ -11,10 +11,13 @@ class EnvSpec(ArgBase):
     framework: str = ...
     task: str = ...
     num_envs: int = 1
-    headless: bool = False
+    num_agents: int = 1
+    seed: int = 0
 
 
 class EnvWrapper:
+    """ """
+
     def __init__(self, env: gymnasium.Env):
         self.env = env
 
@@ -23,6 +26,8 @@ class EnvWrapper:
 
     def step(self, action: Any) -> Tuple[Any, Any, Any, Any, Dict]:
         return self.env.step(action)
+
+    def render(self): ...
 
     @property
     def unwrapped(self) -> Any:

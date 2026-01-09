@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+from thunder.core.context import _ContextRef
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
@@ -10,24 +13,31 @@ if TYPE_CHECKING:
 
 
 class Operation(ABC):
-    """ """
+    """Operation is stateless"""
 
-    def __init__(self, name: str = "op", interval: int = 1, **kwargs):
+    def __init__(
+        self,
+        name: str = "op",
+        interval: int = 1,
+        condition: Optional[Callable[[ExecutionContext], bool]] = None,
+        **kwargs,
+    ):
         self.name = name
         self.interval = interval
+        self.condition = condition or (lambda ctx: True)
         self.kwargs = kwargs
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        if ctx.step % self.interval != 0:
-            return ctx, {}
-        new_ctx, raw_metrics = self.forward(ctx)
-        if raw_metrics:
-            prefix = f"{self.name}/"
-            metrics = {f"{prefix}{k}": v for k, v in raw_metrics.items()}
-        else:
-            metrics = {}
+        """ """
+        should_run = (ctx.step % self.interval == 0) & self.condition(ctx)
 
-        return new_ctx, metrics
+        def _run_branch(ctx: ExecutionContext):
+            new_ctx, raw_m = self.forward(ctx)
+            prefix = f"{self.name}/"
+            m = {f"{prefix}{k}": v for k, v in raw_m.items()}
+            return new_ctx, m
+
+        return ctx.executor.cond(predicate=should_run, fn=_run_branch, operand=ctx)
 
     @abstractmethod
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
@@ -50,10 +60,13 @@ class Objective(Operation):
         self.weight = weight
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        if ctx.step % self.interval != 0:
-            return ctx, {}
-        _, metrics = self.forward(ctx.batch, ctx.models)
-        return ctx, metrics
+        should_run = (ctx.step % self.interval == 0) & self.condition(ctx)
+
+        def _run_branch(ctx: ExecutionContext):
+            loss, metrics = self.forward(ctx.batch, ctx.models)
+            return ctx, metrics
+
+        return ctx.executor.cond(predicate=should_run, fn=_run_branch, operand=ctx)
 
     def forward(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
         loss, metrics = self.compute(batch, model)
@@ -67,6 +80,15 @@ class Objective(Operation):
 
     @abstractmethod
     def compute(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
+        """_summary_
+
+        Args:
+            batch (Batch): _description_
+            model (ModelPack): _description_
+
+        Returns:
+            Tuple[Any, Dict[str, Any]]: _description_
+        """
         pass
 
 
@@ -94,28 +116,93 @@ class OptimizeOp(Operation):
 
 
 class CallableOp(Operation):
-    """
-    Args:
-        fn: fn(ctx: ExecutionContext, **kwargs) -> Tuple[ExecutionContext, Dict[str, Any]]
-    """
+    __slots__ = ("_fn",)
 
-    def __init__(self, fn: Callable, name="callable", interval=1, **kwargs):
-        super().__init__(name, interval, **kwargs)
-        self.fn = fn
+    def __init__(self, fn: Callable, name="callable_op", returns=None, **bindings):
+        super().__init__(name=name)
+        self._fn = self._jit_compile(fn, bindings, returns)
 
-    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        return self.fn(ctx, **self.kwargs)
+    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict]:
+        return self._fn(ctx)
+
+    def _jit_compile(self, fn, bindings, returns):
+        closure_vars = {"_fn": fn, "replace": dataclasses.replace}
+        args_code = []
+        for name, value in bindings.items():
+            var_name = f"_var_{name}"
+            closure_vars[var_name] = value
+            if hasattr(value, "path") or callable(value):
+                args_code.append(f"{name}={var_name}(ctx)")
+            else:
+                args_code.append(f"{name}={var_name}")
+        arg_str = ", ".join(args_code)
+        body = f"res = _fn({arg_str})"
+        if returns is None:
+            body += "; return ctx, (res if isinstance(res, dict) else {})"
+        else:
+            target_path = returns._path
+            update_code = self._build_replace_chain("ctx", target_path, "res")
+            body += f"; new_ctx = {update_code}; return new_ctx, {{}}"
+        factory_args = ", ".join(closure_vars.keys())
+        fn_name = f"_jit_{self.name}"
+        lines = [
+            f"def factory({factory_args}):",  # Outer Factory
+            f"    def {fn_name}(ctx):",  # Inner JIT Function
+            f"        {body}",  # The Logic
+            f"    return {fn_name}",  # Return the inner function
+        ]
+
+        full_source = "\n".join(lines)
+        local_scope = {}
+        exec(full_source, globals(), local_scope)
+        factory = local_scope["factory"]
+        return factory(**closure_vars)
+
+    def _build_replace_chain(self, root_var, path, value_var):
+        """ """
+        if len(path) == 0:
+            return value_var
+        op, key = path[0]
+        if len(path) == 1:
+            return f"replace({root_var}, {key}={value_var})"
+        else:
+            child_accessor = f"{root_var}.{key}" if op == 0 else f"{root_var}[{repr(key)}]"
+            inner_update = self._build_replace_chain(child_accessor, path[1:], value_var)
+            return f"replace({root_var}, {key}={inner_update})"
 
 
 class CallableObjective(Objective):
     """
-    Args:
-        fn: fn(batch: Batch, model: ModelPack, params: Any, **kwargs) -> Tuple[Loss, Dict[str, Any]]
+    Adapts any function into a `Thunder` Objective.
+    The 'fn' can have ANY signature. You use 'bindings' to map
+    Thunder's data (ctx.batch, ctx.models) to the function's arguments.
     """
 
-    def __init__(self, fn: Callable, name="callable_objective", weight=1.0, **kwargs):
-        super().__init__(name, weight, **kwargs)
-        self.fn = fn
+    __slots__ = ("_compute_fn",)
 
-    def compute(self, batch: Batch, model: ModelPack, params: Any) -> Tuple[Any, Dict[str, Any]]:
-        return self.fn(batch, model, params, **self.kwargs)
+    def __init__(self, fn: Callable, name="callable_objective", weight=1.0, **bindings):
+        super().__init__(name, weight)
+        self._compute_fn = self._jit_compile(fn, bindings)
+
+    def compute(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
+        return self._compute_fn(batch, model)
+
+    def _jit_compile(self, fn, bindings):
+        closure_vars = {"_fn": fn}
+        from collections import namedtuple
+
+        closure_vars["_CtxSim"] = namedtuple("CtxSim", ["batch", "models"])
+        args_code = []
+        for name, value in bindings.items():
+            var_name = f"_var_{name}"
+            closure_vars[var_name] = value
+            if hasattr(value, "path") or callable(value):
+                args_code.append(f"{name}={var_name}(_CtxSim(batch, model))")
+            else:
+                args_code.append(f"{name}={var_name}")
+        arg_str = ", ".join(args_code)
+        code = f"lambda batch, model: _fn({arg_str})"
+
+        factory_args = ", ".join(closure_vars.keys())
+        full_code = f"lambda {factory_args}: {code}"
+        return eval(full_code)(**closure_vars)

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Protocol, runtime_checkab
 if TYPE_CHECKING:
     from ..context import ExecutionContext
     from ..data import Batch
-    from ..module import ModelPack, ThunderModule
+    from ..module import ModelPack
     from ..operation import Objective
 
 
@@ -14,7 +14,10 @@ if TYPE_CHECKING:
 class ExecutorProtocol(Protocol):
     """ """
 
-    @abstractmethod
+    def init(self, model: ModelPack, optim_config: Dict[str, Any]) -> ExecutionContext:
+        """ """
+        ...
+
     def call(self, model: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """ """
         ...
@@ -29,12 +32,11 @@ class ExecutorProtocol(Protocol):
         """ """
         ...
 
-    def init(self, model: ThunderModule, optim_config: Dict[str, Any]) -> ExecutionContext:
-        """ """
-        ...
-
-    def jit(self, fn: Callable): ...
+    def cond(self, predicate: Any, fn: Callable[[Any], Any], operand: Any) -> Any: ...
 
     def to_device(self, data: Any) -> Any: ...
 
     def to_numpy(self, data: Any) -> Any: ...
+
+    @staticmethod
+    def jit(fn: Callable): ...

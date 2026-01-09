@@ -129,6 +129,17 @@ class ArgsOpt:
 class ArgParseMeta(type):
     def __new__(cls, name: str, bases: tuple, namespace: dict):
         new_cls = super().__new__(cls, name, bases, namespace)
+        attr_docs = {}
+        for base in reversed(bases):
+            if hasattr(base, "__mro__"):
+                for ancestor in reversed(base.__mro__):
+                    if ancestor is object:
+                        continue
+                    doc = getattr(ancestor, "__doc__", "")
+                    attr_docs.update(cls._parse_attr_docs(doc))
+        current_doc = namespace.get("__doc__", "")
+        attr_docs.update(cls._parse_attr_docs(current_doc))
+
         argparse_configs = {}
         for base in reversed(bases):
             if hasattr(base, "_argparse_configs"):
@@ -137,13 +148,36 @@ class ArgParseMeta(type):
             type_hints = get_type_hints(new_cls)
         except Exception:
             type_hints = getattr(new_cls, "__annotations__", {})
-        attr_docs = cls._parse_attr_docs(namespace.get("__doc__", ""))
-
         for attr_name, type_hint in type_hints.items():
             if attr_name.startswith("_") or callable(namespace.get(attr_name)):
                 continue
             assigned_value = getattr(new_cls, attr_name, ...)
             arg_opt = assigned_value if isinstance(assigned_value, ArgsOpt) else None
+
+            origin = get_origin(type_hint)
+            is_optional = origin is Union and type(None) in get_args(type_hint)
+            actual_type = type_hint
+            if origin is Union:
+                actual_type = next(
+                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
+                )
+            if isinstance(actual_type, type) and issubclass(actual_type, ArgBase):
+                child_configs = getattr(actual_type, "_argparse_configs", {})
+                prefix = attr_name.replace("_", "-")
+                for child_dest, (child_flags, child_kwargs) in child_configs.items():
+                    new_dest = f"{attr_name}.{child_dest}"
+                    new_flags = []
+                    for flag in child_flags:
+                        if flag.startswith("--"):
+                            suffix = flag.lstrip("-")
+                            new_flags.append(f"--{prefix}.{suffix}")
+                    new_kwargs = copy.deepcopy(child_kwargs)
+                    new_kwargs["dest"] = new_dest
+                    if is_optional and new_kwargs.get("required"):
+                        del new_kwargs["required"]
+                    argparse_configs[new_dest] = (new_flags, new_kwargs)
+                continue
+
             has_explicit_default = False
             default_val = ...
             if arg_opt:
@@ -158,18 +192,12 @@ class ArgParseMeta(type):
                 or attr_docs.get(attr_name)
                 or f"Value for {attr_name}"
             )
-            origin = get_origin(type_hint)
-            is_optional = origin is Union and type(None) in get_args(type_hint)
-            actual_type = type_hint
-            if is_optional:
-                actual_type = next(
-                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
-                )
             long_name = f"--{attr_name.replace('_', '-')}"
             arg_names = [
                 alias for alias in [arg_opt.short if arg_opt else None, long_name] if alias
             ]
             kwargs = {"dest": attr_name}
+
             actual_origin = get_origin(actual_type)
             if actual_origin is Literal:
                 choices = get_args(actual_type)
@@ -203,6 +231,7 @@ class ArgParseMeta(type):
                 kwargs["type"] = actual_type
             else:
                 continue
+
             is_required = not has_explicit_default and not is_optional
             if is_required:
                 kwargs["required"] = True
@@ -263,20 +292,56 @@ class ArgParseMeta(type):
 
 
 class ArgBase(metaclass=ArgParseMeta):
+    _unknown_args: List[str] = []
+
     def __init__(self, **kwargs):
         configs = getattr(self.__class__, "_argparse_configs", {})
-        processed = set()
-        for attr_name, value in kwargs.items():
-            if attr_name in configs:
-                setattr(self, attr_name, copy.deepcopy(value))
-                processed.add(attr_name)
-        for attr_name, (_, argparse_kwargs) in configs.items():
-            if attr_name not in processed:
-                default = argparse_kwargs.get("default")
-                if default is ...:
-                    raise ValueError(f"Missing required argument: {attr_name}")
-                val = copy.deepcopy(default) if default is not None else None
-                setattr(self, attr_name, val)
+
+        nested_data = {}
+        for key, value in kwargs.items():
+            if "." in key:
+                parent, child = key.split(".", 1)
+                nested_data.setdefault(parent, {})[child] = value
+            else:
+                nested_data[key] = value
+
+        # Instantiate Attributes by iterating over Type Hints
+        try:
+            type_hints = get_type_hints(self.__class__)
+        except Exception:
+            type_hints = getattr(self.__class__, "__annotations__", {})
+
+        for attr_name, type_hint in type_hints.items():
+            if attr_name.startswith("_"):
+                continue
+            origin = get_origin(type_hint)
+            actual_type = type_hint
+            if origin is Union:
+                actual_type = next(
+                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
+                )
+            is_nested = isinstance(actual_type, type) and issubclass(actual_type, ArgBase)
+            if attr_name in nested_data:
+                val = nested_data[attr_name]
+                if is_nested and isinstance(val, dict):
+                    # Recursively instantiate the child class
+                    setattr(self, attr_name, actual_type(**val))
+                else:
+                    # Assign primitive directly
+                    setattr(self, attr_name, copy.deepcopy(val))
+            else:
+                if is_nested:
+                    if origin is Union and type(None) in get_args(type_hint):
+                        setattr(self, attr_name, None)
+                    else:
+                        setattr(self, attr_name, actual_type())
+                elif attr_name in configs:
+                    _, argparse_kwargs = configs[attr_name]
+                    default = argparse_kwargs.get("default")
+                    if default is ...:
+                        raise ValueError(f"Missing required argument: {attr_name}")
+                    val = copy.deepcopy(default) if default is not None else None
+                    setattr(self, attr_name, val)
 
     @classmethod
     def add_args_to_parser(cls, parser: argparse.ArgumentParser):
@@ -309,10 +374,24 @@ class ArgBase(metaclass=ArgParseMeta):
         return parser
 
     @classmethod
-    def parse(cls, args_list: Optional[List[str]] = None) -> "ArgBase":
-        parser = cls.parser()
-        args_ns = parser.parse_args(args_list)
-        return cls(**vars(args_ns))
+    def parse(
+        cls,
+        args_list: Optional[List[str]] = None,
+        *,
+        parser: Optional[argparse.ArgumentParser] = None,
+        final: bool = False,
+    ) -> "ArgBase":
+        if parser is None:
+            parser = cls.parser()
+
+        unknown = []
+        if final:
+            args_ns = parser.parse_args(args_list)
+        else:
+            args_ns, unknown = parser.parse_known_args(args_list)
+        instance = cls(**vars(args_ns))
+        instance._unknown_args = unknown
+        return instance
 
     def to_dict(self, recurse: bool = True) -> Dict[str, Any]:
         configs = getattr(self.__class__, "_argparse_configs", {})
@@ -325,3 +404,7 @@ class ArgBase(metaclass=ArgParseMeta):
                 else:
                     res[k] = val
         return res
+
+    def to_namespace(self) -> argparse.Namespace:
+        """ """
+        return argparse.Namespace(**self.to_dict(recurse=False))

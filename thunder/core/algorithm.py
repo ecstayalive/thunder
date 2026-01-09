@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from functools import partial
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple
 
 from .context import ExecutionContext
+from .executor import Executor
 
 if TYPE_CHECKING:
     from .data import Batch
@@ -21,7 +23,8 @@ class GraphAlgorithm(ABC):
     ):
         self.models = models
         self.executor = executor
-        self.pipeline: Operation[Iterable[Operation]] = pipeline
+        if pipeline:
+            self.setup_pipeline(pipeline)
         self.ctx: Optional[ExecutionContext] = None
 
     def build(self, optim_config: Dict[str, Any]) -> None:
@@ -40,8 +43,9 @@ class GraphAlgorithm(ABC):
             pipeline (Iterable[Operation]): _description_
         """
         self.pipeline = pipeline
+        self._jit_step: callable = Executor.jit(partial(self._step, pipeline=tuple(self.pipeline)))
 
-    def step(self, batch: Batch) -> Dict[str, Any]:
+    def step(self, batch: Batch, jit: bool = True) -> Dict[str, Any]:
         """_summary_
         Args:
             batch (Batch):
@@ -54,13 +58,22 @@ class GraphAlgorithm(ABC):
             raise RuntimeError("Algorithm not built. Please call .build() first.")
         if self.pipeline is None:
             raise RuntimeError("No pipeline defined for the algorithm.")
-        metrics = {}
+
         self.ctx = self.ctx.replace(batch=batch)
-        for op in self.pipeline:
-            self.ctx, m = op(self.ctx)
-            metrics.update(m)
+        if jit:
+            self.ctx, metrics = self._jit_step(self.ctx)
+        else:
+            self.ctx, metrics = self._step(self.ctx, tuple(self.pipeline))
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
         return metrics
+
+    @staticmethod
+    def _step(ctx: ExecutionContext, pipeline: Tuple[Operation, ...]):
+        metrics = {}
+        for op in pipeline:
+            ctx, m = op(ctx)
+            metrics.update(m)
+        return ctx, metrics
 
 
 class Agent(GraphAlgorithm):

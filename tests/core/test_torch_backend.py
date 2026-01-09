@@ -13,11 +13,11 @@ import pytest
 def setup_torch_env():
     os.environ["THUNDER_BACKEND"] = "torch"
     modules_to_reload = [
+        "thunder.core.context",
         "thunder.core.data",
         "thunder.core.module",
         "thunder.core.executor",
         "thunder.core.algorithm",
-        "thunder.core.context",
         "thunder.core.operation",
     ]
     for mod_name in modules_to_reload:
@@ -68,7 +68,7 @@ class SimpleRNN(nn.Module):
 class MSEObjective(op_mod.Objective):
     def compute(self, batch: data_mod.Batch, models: Any) -> Tuple[Any, Dict[str, Any]]:
         target_net = getattr(models, self.kwargs.get("compute_net", "net"))
-        pred = target_net(batch.obs)
+        pred = target_net(batch.obs["obs"])
         targets = batch.actions
         error = pred - targets
         if batch.mask is not None:
@@ -83,13 +83,14 @@ class MSEObjective(op_mod.Objective):
 
 class MultiNetObjective(op_mod.Objective):
     def compute(self, batch: data_mod.Batch, models: Any) -> Tuple[Any, Dict[str, Any]]:
-        pred1 = models.net1(batch.obs)
-        pred2 = models.net2(batch.obs)
+        pred1 = models.net1(batch.obs["obs"])
+        pred2 = models.net2(batch.obs["obs"])
         loss = torch.mean((pred1 - batch.actions) ** 2) + torch.mean((pred2 - batch.actions) ** 2)
         return loss, {}
 
 
 class TorchCounterOp(op_mod.Operation):
+
     def __init__(self, interval: int = 1):
         super().__init__(name="counter", interval=interval)
         self.execution_count = 0
@@ -109,9 +110,12 @@ def device():
 @pytest.fixture
 def tensor_batch_3d(device):
     return data_mod.Batch(
-        obs=torch.tensor(
-            [[[1.0] * 4, [1.0] * 4, [1.0] * 4], [[2.0] * 4, [2.0] * 4, [0.0] * 4]], device=device
-        ),
+        obs={
+            "obs": torch.tensor(
+                [[[1.0] * 4, [1.0] * 4, [1.0] * 4], [[2.0] * 4, [2.0] * 4, [0.0] * 4]],
+                device=device,
+            )
+        },
         actions=torch.tensor(
             [
                 [[1.0, 1.0] * 1, [1.0, 1.0] * 1, [1.0, 1.0] * 1],
@@ -125,11 +129,11 @@ def tensor_batch_3d(device):
 
 
 def test_batch_3d_structure(tensor_batch_3d):
-    assert tensor_batch_3d.obs.shape == (2, 3, 4)
+    assert tensor_batch_3d.obs["obs"].shape == (2, 3, 4)
     assert tensor_batch_3d.batch_size == 2
     new_b = tensor_batch_3d.map(lambda x: x * 2.0)
-    assert new_b.obs[0, 0, 0] == 2.0
-    assert new_b.obs.shape == (2, 3, 4)
+    assert new_b.obs["obs"][0, 0, 0] == 2.0
+    assert new_b.obs["obs"].shape == (2, 3, 4)
 
 
 def test_torch_executor_optimization_flow(device, tensor_batch_3d):
@@ -203,7 +207,7 @@ def test_torch_rnn_carry_flow(device, tensor_batch_3d):
     executor = exec_mod.Executor(device=device)
     ctx = executor.init(model, {})
 
-    obs_step = tensor_batch_3d.obs[:, 0]
+    obs_step = tensor_batch_3d.obs["obs"][:, 0]
     out1, next_h1 = ctx.models.rnn(obs_step, carry=None)
     assert out1.shape == (2, 2)
 
@@ -236,18 +240,19 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
     algo = algo_mod.GraphAlgorithm(model, executor)
 
     def modify_ctx_hook(ctx: ctx_mod.ExecutionContext):
-        ctx.update_meta(hook_called=True)
-        return ctx, {"hook": 1}
+        return {"hook": True}
 
+    algo.setup_pipeline(
+        [op_mod.CallableOp(modify_ctx_hook, ctx=ctx_mod.CtxRef), MSEObjective("mse")]
+    )
     algo.build({})
-    algo.setup_pipeline([op_mod.CallableOp(modify_ctx_hook), MSEObjective("mse")])
-    algo.step(tensor_batch_3d)
-    assert algo.ctx.meta.get("hook_called") is True
+    m = algo.step(tensor_batch_3d)
+    assert m["callable_op/hook"] is True
 
 
 def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(device=device)
     obj1 = MSEObjective("m1", weight=1.0)
     obj2 = MSEObjective("m2", weight=2.0)
 
@@ -260,6 +265,56 @@ def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     l2 = metrics["grad_op/m2/loss"]
     total = metrics["grad_op/total_loss"]
     assert torch.isclose(total, l1 * 1.0 + l2 * 2.0)
+
+
+def test_torch_jit_speedup(tensor_batch_3d):
+    import time
+
+    import torch
+
+    class TorchForwardOp(op_mod.Operation):
+        def forward(self, ctx: ctx_mod.ExecutionContext):
+            x = torch.randn(4096, 4096, device=ctx.executor.device)
+            _ = ctx.models.net(x)
+            return ctx, {}
+
+    class SimpleTorchNet(torch.nn.Module):
+        def __init__(self, din, dout):
+            super().__init__()
+            self.net = torch.nn.Linear(din, dout, bias=False)
+
+        def forward(self, x):
+            return self.net(x)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    net = SimpleTorchNet(4096, 4096).to(device)
+    models = module_mod.ModelPack(net=net)
+    executor = exec_mod.Executor(device=device)
+    pipeline = [TorchForwardOp(name="forward1"), TorchForwardOp(name="forward2")]
+    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
+    algo.build({})
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(50):
+        algo.step(tensor_batch_3d, jit=False)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    no_jit_duration = time.time() - start_time
+    print(f"No-JIT Time: {no_jit_duration:.4f}s")
+    algo.step(tensor_batch_3d, jit=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(50):
+        algo.step(tensor_batch_3d, jit=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    jit_duration = time.time() - start_time
+    print(f"JIT Time:    {jit_duration:.4f}s")
+    speedup = no_jit_duration / jit_duration
+    print(f"Speedup: {speedup:.2f}x")
+    assert jit_duration < no_jit_duration
 
 
 def test_torch_initialization_error(device, tensor_batch_3d):
@@ -420,8 +475,8 @@ def test_torch_model_pack_getattr_proxy(device, tensor_batch_3d):
     executor = exec_mod.Executor(device=device)
     ctx = executor.init(model, {})
     ctx = ctx.replace(batch=tensor_batch_3d)
-    res = ctx.models.net.custom_call(tensor_batch_3d.obs, value=2.0)
-    assert torch.allclose(res, tensor_batch_3d.obs + 2.0)
+    res = ctx.models.net.custom_call(tensor_batch_3d.obs["obs"], value=2.0)
+    assert torch.allclose(res, tensor_batch_3d.obs["obs"] + 2.0)
 
 
 def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
@@ -436,7 +491,9 @@ def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
 
     class HighLossObj(op_mod.Objective):
         def compute(self, batch, models):
-            return (models.net1(batch.obs).sum() + models.net2(batch.obs).sum()) * 100, {}
+            return (
+                models.net1(batch.obs["obs"]).sum() + models.net2(batch.obs["obs"]).sum()
+            ) * 100, {}
 
     clip_val = 0.01
     op = op_mod.OptimizeOp("joint", [HighLossObj("high")], max_grad_norm=clip_val)
@@ -628,11 +685,12 @@ def test_torch_batch_mask_broadcasting(device):
     obs = torch.randn(2, 3, 4, device=device)
     actions = torch.randn(2, 3, 2, device=device)
     mask = torch.ones(2, 3, device=device)
-    batch = data_mod.Batch(obs=obs, actions=actions, mask=mask)
+    batch = data_mod.Batch(obs={"obs": obs}, actions=actions, mask=mask)
 
     net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=net)
     obj = MSEObjective("test")
 
     loss, metrics = obj.compute(batch, model)
+    assert loss.shape == ()  # Scalar
     assert loss.shape == ()  # Scalar

@@ -130,6 +130,17 @@ class TorchExecutor:
             optim_group.scheduler.step()
         return metrics
 
+    def cond(self, predicate, fn, operand):
+        if predicate:
+            return fn(operand)
+        return operand, {}
+        # def _false_fn(operand):
+        #     return operand, {}
+
+        # if predicate:
+        #     return fn(operand)
+        # return torch.cond(predicate, fn, _false_fn, operand)
+
     def to_device(self, data: Any) -> Any:
         if isinstance(data, torch.Tensor):
             return data.to(self.device, non_blocking=True)
@@ -143,3 +154,15 @@ class TorchExecutor:
         if isinstance(data, torch.Tensor):
             return data.detach().cpu().numpy()
         return data
+
+    @staticmethod
+    def jit(fn: Callable, **kwargs):
+        compile_args = {"mode": "default"}
+        compile_args.update(kwargs)
+
+        def wrapper(f):
+            return torch.compile(f, **compile_args)
+
+        if fn is None:
+            return wrapper
+        return wrapper(fn)

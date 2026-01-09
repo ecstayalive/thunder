@@ -1,6 +1,6 @@
 # Thunder
 
-A library for robot learning, which can also be used as an extension library for [pytorch](https://pytorch.org/), [jax](https://docs.jax.dev/en/latest/), [flax](https://flax.readthedocs.io/en/latest/) and [warp](https://nvidia.github.io/warp/)
+A library for robot learning, which can also be used as an extension library for [pytorch](https://pytorch.org/), [jax](https://docs.jax.dev/en/latest/) and [flax](https://flax.readthedocs.io/en/latest/).
 
 ## Introduction
 

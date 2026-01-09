@@ -55,11 +55,14 @@ class IsaacLabAdapter(EnvWrapper):
 
 
 @register_loader("isaaclab")
-def load_isaaclab(spec: IsaacLabEnvSpec) -> EnvWrapper:
+def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> EnvWrapper:
     """ """
     from isaaclab.app import AppLauncher
 
-    app_launcher = AppLauncher(spec.to_dict())
+    parser = IsaacLabEnvSpec.parser()
+    parser.set_defaults(**spec.to_dict(recurse=False))
+    spec = IsaacLabEnvSpec.parse(spec._unknown_args, parser=parser, final=True)
+    app_launcher = AppLauncher(spec.to_namespace())
     import gymnasium
     import isaaclab_tasks
     from isaaclab.utils.timer import Timer

@@ -33,7 +33,7 @@ class DmcAdapter:
 
 
 @register_loader("dmc")
-def load_dmc(spec) -> DmcAdapter:
+def load_dmc(spec: DmcSpec | EnvSpec) -> DmcAdapter:
     """ """
     from dm_control import suite
 

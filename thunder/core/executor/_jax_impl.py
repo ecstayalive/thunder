@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class JaxExecutor:
     def __init__(
         self,
-        device: str = "cpu",
+        device: str = "gpu",
         precision: str = "fp32",
         distributed: bool = False,
         donate: bool = True,
@@ -161,11 +161,34 @@ class JaxExecutor:
         metrics["loss_total"] = loss
         return metrics
 
+    def cond(self, predicate, fn, operand):
+        out_structure = jax.eval_shape(fn, operand)
+
+        def _false_fn(operand):
+            _, metrics_struct = out_structure
+            dummy_metrics = jax.tree_util.tree_map(
+                lambda x: jnp.zeros(x.shape, x.dtype), metrics_struct
+            )
+            return operand, dummy_metrics
+
+        return jax.lax.cond(predicate, fn, _false_fn, operand)
+
     def to_device(self, data: Any):
         return jax.device_put(data, self.devices[0])
 
     def to_numpy(self, data: Any):
         return jax.device_get(data)
+
+    @staticmethod
+    def jit(fn: Optional[Callable] = None, **kwargs):
+        """ """
+        if fn is None:
+
+            def wrapper(func):
+                return jax.jit(func, **kwargs)
+
+            return wrapper
+        return jax.jit(fn, **kwargs)
 
 
 def fsdp_strategy(path, param):
