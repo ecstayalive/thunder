@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import numpy as np
 import torch
@@ -215,7 +215,7 @@ class Buffer:
         """
         if self.size < chunk_len:
             raise ValueError(f"Buffer size ({self.size}) < chunk length ({chunk_len})")
-        time_indices, env_indices = self._sample_raw_indices(batch_size, chunk_len)
+        time_indices, env_indices = self.sample_chunk_indices(batch_size, chunk_len)
         batch = self._recursive_get(
             {
                 "obs": self.obs,
@@ -239,7 +239,7 @@ class Buffer:
             extra=batch["extra"],
         )
 
-    def sample_chunks(self, num_batches: int, batch_size: int, chunk_len: int) -> Generator[Batch]:
+    def sample_chunks(self, num_batches: int, batch_size: int, chunk_len: int) -> Iterator[Batch]:
         """ """
         if self.size < chunk_len:
             raise ValueError(f"Buffer size ({self.size}) < chunk length ({chunk_len})")
@@ -285,57 +285,71 @@ class Buffer:
     def to_batch(self):
         return self.sample_chunk(self.num_envs, self.size)
 
-    def to_batches(self, num_batch: int) -> Generator[Batch]:
+    def to_batches(self, num_batch: int) -> Iterator[Batch]:
         return self.sample_chunks(num_batch, self.num_envs // num_batch, self.size)
+
+    def clear(self):
+        self.ptr = 0
+        self.size = 0
 
     def segment_batch(self, batch: Batch, fix_shape: bool = True, top: bool = True) -> Batch:
         """ """
         if batch.dones is None:
             raise ValueError("Batch must contain 'dones' to perform segmentation.")
-        dones_t = batch.dones.transpose(0, 1)
-        traj_lengths = get_trajectory_lengths(dones_t)
-        if not fix_shape:
 
-            def transform_variable(tensor: torch.Tensor) -> torch.Tensor:
-                t_transposed = tensor.transpose(0, 1)
-                split_data = split_trajectory(t_transposed, traj_lengths)
-                return split_data.transpose(0, 1)
+        traj_lengths: torch.Tensor = get_trajectory_lengths(batch.dones)
+        num_trajs = traj_lengths.shape[0]
+        max_len = int(traj_lengths.max().item())
+        row_indices = torch.arange(max_len, device=self.device).unsqueeze(0)
+        scatter_mask = traj_lengths.unsqueeze(1) > row_indices
+
+        def transform_tensor_core(
+            tensor: torch.Tensor, target_idxs: torch.Tensor = None
+        ) -> torch.Tensor:
+            """ """
+            flat_tensor = tensor.flatten(0, 1)
+            embedding_shape = flat_tensor.shape[1:]
+            # Allocate [Num_Trajs, Max_Len, ...]
+            pooled = torch.zeros(
+                (num_trajs, max_len, *embedding_shape), dtype=flat_tensor.dtype, device=self.device
+            )
+            pooled[scatter_mask] = flat_tensor
+            if target_idxs is not None:
+                # [Target_Batch, Max_Len, F]
+                return pooled[target_idxs]
+            return pooled
+
+        if not fix_shape:
 
             def map_fn_var(node: Any) -> Any:
                 if torch.is_tensor(node):
-                    return transform_variable(node)
+                    return transform_tensor_core(node, target_idxs=None)
                 return node
 
             segmented_batch = batch.map(map_fn_var)
-            mask_raw = get_trajectory_mask(traj_lengths)  # [Max_Time, Num_Trajs]
-            final_mask = mask_raw.transpose(0, 1)  # [Num_Trajs, Max_Time]
-            return segmented_batch.replace(mask=final_mask)
+            return segmented_batch.replace(mask=scatter_mask)
         target_batch_size = batch.dones.shape[0]
         chunk_len = batch.dones.shape[1]
-        pool_size = traj_lengths.shape[1]
+        pool_size = num_trajs
         if pool_size == target_batch_size:
-            # Just shuffle, no top-k needed
             idxs = torch.randperm(target_batch_size, device=self.device)
         else:
             if top:
-                _, idxs = torch.topk(traj_lengths.squeeze(0), k=target_batch_size, largest=True)
+                _, idxs = torch.topk(traj_lengths, k=target_batch_size, largest=True)
                 idxs = idxs[torch.randperm(target_batch_size, device=self.device)]
             else:
                 idxs = torch.randperm(pool_size, device=self.device)[:target_batch_size]
 
         def transform_fixed(tensor: torch.Tensor) -> torch.Tensor:
-            t_transposed = tensor.transpose(0, 1)
-            split_data = split_trajectory(t_transposed, traj_lengths)
-            selected = split_data[:, idxs]
-            curr_len = selected.shape[0]
+            selected = transform_tensor_core(tensor, target_idxs=idxs)
+            curr_len = selected.shape[1]  # Time dim is 1
             pad_size = chunk_len - curr_len
             if pad_size > 0:
-                shape = list(selected.shape)
-                shape[0] = pad_size
+                shape = selected.shape
+                shape[1] = pad_size
                 padding = torch.zeros(shape, dtype=selected.dtype, device=self.device)
-                selected = torch.cat([selected, padding], dim=0)
-
-            return selected.transpose(0, 1)
+                selected = torch.cat([selected, padding], dim=1)
+            return selected
 
         def map_fn_fixed(node: Any) -> Any:
             if torch.is_tensor(node):
@@ -343,18 +357,13 @@ class Buffer:
             return node
 
         segmented_batch = batch.map(map_fn_fixed)
-        selected_lens = traj_lengths[:, idxs]
-        mask_raw = get_trajectory_mask(selected_lens)
-        mask_pad = chunk_len - mask_raw.shape[0]
+        mask_subset = scatter_mask[idxs]
+        curr_mask_len = mask_subset.shape[1]
+        mask_pad = chunk_len - curr_mask_len
         if mask_pad > 0:
             padding = torch.zeros(
-                (mask_pad, target_batch_size), dtype=torch.bool, device=self.device
+                (target_batch_size, mask_pad), dtype=torch.bool, device=self.device
             )
-            mask_raw = torch.cat([mask_raw, padding], dim=0)
+            mask_subset = torch.cat([mask_subset, padding], dim=1)
 
-        final_mask = mask_raw.transpose(0, 1)
-        return segmented_batch.replace(mask=final_mask)
-
-    def clear(self):
-        self.ptr = 0
-        self.size = 0
+        return segmented_batch.replace(mask=mask_subset)

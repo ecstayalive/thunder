@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any
+from typing import Any, Tuple
 
 import torch
 
@@ -15,48 +15,53 @@ def get_trajectory_lengths(dones: torch.Tensor) -> torch.Tensor:
     Args:
         dones: The `dones` parameter is a tensor representing whether each
             step in a trajectory is a terminal step or not.
-            :shape: `[time_steps, num_envs(mini-batch_size), 1]`.
+            :shape: `[num_envs(mini-batch_size), time_steps , 1]`.
     Returns:
-        a tensor containing the lengths of trajectories. :shape: `[1, num_trajectories]`
+        a tensor containing the lengths of trajectories. :shape: `[num_trajectories, ]`
     """
     dones = dones.clone()
-    dones[-1] = 1
-    # Permute the buffers to have order (num_envs, sequence_length, ...), for correct reshaping
-    flat_dones = dones.transpose(1, 0).flatten()
-
+    dones[:, -1] = 1
+    flat_dones = dones.flatten()
     # Get length of trajectory by counting the number of successive not done elements
     done_indices = torch.cat(
         (
             torch.tensor([-1], dtype=torch.int64, device=dones.device),
-            flat_dones.nonzero().squeeze(),
+            flat_dones.nonzero().view(-1),
         )
     )
-
-    # done_indices = torch.nn.functional.pad(flat_dones.nonzero().squeeze(), (1, 0), value=-1)
     trajectory_lengths = done_indices[1:] - done_indices[:-1]
     return trajectory_lengths
 
 
 @torch.jit.script
-def split_trajectory(obs: torch.Tensor, traj_len: torch.Tensor) -> torch.Tensor:
+def split_trajectory(
+    obs: torch.Tensor, traj_len: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """The function observation data and a tensor of trajectory lengths,
     and returns a padded tensor of trajectories.
     Args:
         obs: a tensor representing the observations of a trajectory.
-            :shape: `[time_steps, num_envs(mini-batch_size), ob_dimension]`
+            :shape: `[num_envs(mini-batch_size), time_steps, ob_dimension]`
             :type: `torch.Tensor`
         traj_len: a tensor that represents the length of each trajectory.
-            :shape: `[1, num_trajectories]`
+            :shape: `[num_trajectories, ]`
             :type: `torch.Tensor`
     Returns:
-        the padded trajectories, :shape: `[max_time_steps, num_trajectories, ...]`
+        the padded trajectories, :shape: `[num_trajectories, max_time_steps, ...]`
+        mask: `[Num_Trajs, Max_Len]` (Boolean mask of valid steps)
     """
-    # Extract the individual trajectories
-    lengths_list: list[int] = traj_len.tolist()
-    trajectories: list[torch.Tensor] = torch.split(obs.transpose(1, 0).flatten(0, 1), lengths_list)
-    # padded_trajectories' shape = [max_time_steps, num_trajectories, ...]
-    padded_trajectories = torch.nn.utils.rnn.pad_sequence(trajectories)
-    return padded_trajectories
+    flat_obs = obs.flatten(0, 1)
+    num_trajs = traj_len.shape[0]
+    max_len = int(traj_len.max().item())
+    embedding_dim = flat_obs.shape[1]
+    row_indices = torch.arange(max_len, device=obs.device).unsqueeze(0)  # [1, MaxLen]
+    # [NumTrajs, 1] => [NumTrajs, MaxLen]
+    mask = traj_len.unsqueeze(1) > row_indices
+    padded_trajectories = torch.zeros(
+        (num_trajs, max_len, embedding_dim), dtype=flat_obs.dtype, device=flat_obs.device
+    )
+    padded_trajectories[mask] = flat_obs
+    return padded_trajectories, mask
 
 
 @torch.jit.script
@@ -67,16 +72,16 @@ def get_trajectory_mask(traj_len: torch.Tensor) -> torch.Tensor:
         traj_len: a tensor representing the length of each trajectory.
             It is used to create a mask that indicates which elements
             of each trajectory are valid
-            :shape: `[1, num_trajectories]`
+            :shape: `[num_trajectories, ]`
             :type: `torch.Tensor`
     Returns:
         a tensor of trajectory masks.
-        :shape: `[max_time_steps, num_trajectories]`
+        :shape: `[num_trajectories, max_time_steps]`
         :type: `torch.Tensor`,  where the element are `bool` type
     """
-    trajectory_masks = traj_len > torch.arange(
+    trajectory_masks = traj_len.unsqueeze(1) > torch.arange(
         0, traj_len.max(), device=traj_len.device
-    ).unsqueeze_(1)
+    ).unsqueeze_(0)
 
     return trajectory_masks
 
@@ -90,30 +95,25 @@ def unpad_trajectory(
     from a tensor of trajectories.
     Args:
         trajectories: a tensor representing the trajectories.
-            :shape: `[max_time_steps, num_trajectories, ...]`
+            :shape: `[num_trajectories, max_time_steps, ...]`
             :type: `torch.Tensor`
         masks: a tensor that marks which parts of the trajectory
             are padded and which ones are the original real trajectories.
-            :shape: `[max_time_steps, num_trajectories]`
+            :shape: `[num_trajectories, max_time_steps]`
             :type: `torch.Tensor`, where the elements are `torch.bool`
         sequence_len: which represents the true time step of the collecting data.
             :type: `int`
     Returns:
         a tensor represents the origin, not padded trajectory or output of the network.
-            :shape: `[sequence_len, num_envs(mini-batch_size), ...]`
+            :shape: `[num_envs(mini-batch_size), sequence_len, ...]`
             :type: `torch.Tensor`
     """
     # Need to transpose before to ensure its order
     # and after the masking need to transpose again to have proper reshaping
-    # [max_time_steps, num_trajectories, ...] ->
+    # [num_trajectories, max_time_steps, ...] ->
     # [true_time_step * num_envs(mini-batch_size), ...] ->
     # [num_envs(mini-batch_size), true_time_step, ...] ->
-    # [true_time_step, num_envs(mini-batch_size), ...]
-    return (
-        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
-        .reshape(-1, sequence_len, trajectories.shape[-1])
-        .transpose(1, 0)
-    )
+    return trajectories[masks].reshape(-1, sequence_len, trajectories.shape[-1])
 
 
 class SplitTrajOp(Operation):
