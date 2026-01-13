@@ -4,8 +4,6 @@ import dataclasses
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from thunder.core.context import _ContextRef
-
 if TYPE_CHECKING:
     from .context import ExecutionContext
     from .data import Batch
@@ -55,7 +53,7 @@ class Objective(Operation):
 
     """
 
-    def __init__(self, name: str, weight: float = 1.0, **kwargs):
+    def __init__(self, name: str = "objective", weight: float = 1.0, **kwargs):
         super().__init__(name=name, interval=1, **kwargs)
         self.weight = weight
 

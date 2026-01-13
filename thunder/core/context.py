@@ -121,7 +121,40 @@ class _ContextRef:
 CtxRef = _ContextRef()
 
 if _BACKEND == "torch":
-    ...
+    import torch.utils._pytree as pytree
+
+    def _optim_group_flatten(obj: OptimGroup):
+        children = [obj.optimizer]
+        aux_data = (obj.name, obj.targets, obj.scheduler)
+        return children, aux_data
+
+    def _optim_group_unflatten(aux_data, children):
+        return OptimGroup(
+            name=aux_data[0], targets=aux_data[1], optimizer=children[0], scheduler=aux_data[3]
+        )
+
+    pytree.register_pytree_node(OptimGroup, _optim_group_flatten, _optim_group_unflatten)
+
+    def _context_flatten(obj: ExecutionContext):
+        children = [obj.models, obj.opt_groups, obj.step, obj.batch, obj.meta]
+        aux_data = obj.executor
+
+        return children, aux_data
+
+    def _context_unflatten(aux_data, children):
+        executor = aux_data
+        models, opt_groups, step, batch, meta = children
+
+        return ExecutionContext(
+            step=step,
+            batch=batch,
+            models=models,
+            opt_groups=opt_groups,
+            executor=executor,
+            meta=meta,
+        )
+
+    pytree.register_pytree_node(ExecutionContext, _context_flatten, _context_unflatten)
 
 if _BACKEND == "jax":
     import flax.nnx as nnx
@@ -143,14 +176,14 @@ if _BACKEND == "jax":
         """ """
         nnx_containers = (obj.models, obj.opt_groups)
         graphdef, state = nnx.split(nnx_containers)
-        children = (obj.step, obj.batch, state)
-        aux_data = (obj.executor, obj.meta, graphdef)
+        children = (obj.step, obj.batch, state, obj.meta)
+        aux_data = (obj.executor, graphdef)
 
         return children, aux_data
 
     def _context_unflatten(aux_data, children):
-        executor, meta, graphdef = aux_data
-        step, batch, state = children
+        executor, graphdef = aux_data
+        step, batch, state, meta = children
         models, opt_groups = nnx.merge(graphdef, state)
         return ExecutionContext(
             step=step,

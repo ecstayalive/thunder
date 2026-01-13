@@ -1,9 +1,9 @@
-from typing import Iterator, Optional, Tuple, overload
+import dataclasses
+from typing import Any
 
 import torch
-import torch.nn as nn
 
-from thunder.nn import *
+from thunder.core import Batch, ExecutionContext, Operation
 
 
 @torch.jit.script
@@ -116,107 +116,19 @@ def unpad_trajectory(
     )
 
 
-@torch.jit.script
-def get_hidden_mask(dones: torch.Tensor) -> torch.Tensor:
-    """This function takes a tensor of boolean values indicating
-    whether each step is a terminal step, and returns a tensor
-    indicating whether the previous step was a terminal step.
-    Args:
-        dones: The `dones` parameter is a tensor representing
-            whether each step in a sequence is the last step of
-            an episode.
-            :shape: `[time_steps, num_envs(mini-batch_size), 1]`
-    Returns:
-        a bool tensor that represents a mask indicating whether the
-        previous time step was a "done" state, that is standing whether
-        the current time step was a beginning state.
-        :shape: `[mini-batch_size, time_steps]`
-    """
-    dones = dones.squeeze(-1)
-    last_was_done = torch.zeros_like(dones, dtype=torch.bool)
-    last_was_done[1:] = dones[:-1]
-    last_was_done[0] = True
-    return last_was_done.permute(1, 0)
+class SplitTrajOp(Operation):
+    def __init__(self, name="split_traj_op", interval=1, condition=None):
+        super().__init__(name, interval, condition)
+
+    def forward(self, ctx: ExecutionContext):
+
+        return ctx, {}
 
 
-class DimAdaptRMlp(nn.Module):
-    """Dimension Adaptive Recurrent Multi-Layer Perception
-    Because we created thousands of simulation instances
-    for training, during the exploration phase, the dimensions
-    of the data observed in the simulation are `[num_envs, features_dim]`.
-    However, for recurrent neural networks, the `num_envs` of the data in
-    data dimension means the time step, This is obviously wrong,
-    so this situation needs to be dealt with. This problem will not
-    occur during the training and verification phases. And it is the
-    reason why this module exists
-    Args:
-        recurrent_mlp: The recurrent multi-layer perception
-        normalizer: Use ```RunningNorm1d``` to normalize the input data.
-    """
+class FixedSplitTrajOp(Operation):
+    def __init__(self, name="split_traj_op", interval=1, condition=None):
+        super().__init__(name, interval, condition)
 
-    is_recurrent = True
+    def forward(self, ctx: ExecutionContext):
 
-    def __init__(self, recurrent_mlp: LstmMlp | GruMlp):
-        super().__init__()
-        self.recurrent_mlp = recurrent_mlp
-
-    @overload
-    def forward(
-        self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]]
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """For LSTM"""
-        ...
-
-    @overload
-    def forward(
-        self, input: torch.Tensor, hx: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """For GRU"""
-        ...
-
-    def forward(self, input: torch.Tensor, hx=None):
-        if input.dim() <= 2:
-            input = input.unsqueeze(0)
-            output, hidden = self.recurrent_mlp(input, hx)
-            return output.squeeze(0), hidden
-        else:
-            output, hidden = self.recurrent_mlp(input, hx)
-            return output, hidden
-
-    def scriptable(self):
-        return self.recurrent_mlp
-
-
-def is_recurrent(network: nn.Module) -> bool:
-    """Determine whether the given network contains a recurrent
-    neural network module. If the network does, then the network
-    is a recurrent neural network.
-    Returns:
-        Whether the given network contains a recurrent network module.
-    """
-    # if the network includes some information
-    # then return the information directly
-    if hasattr(network, "is_recurrent"):
-        return network.is_recurrent
-    for module in network.modules():
-        if isinstance(module, nn.RNNBase):
-            return True
-    return False
-
-
-def any_recurrent(*networks: Iterator[nn.Module]) -> bool:
-    """Determine whether the given networks contain a recurrent
-    neural network.
-    Returns:
-        Whether the given networks contains a recurrent network.
-    """
-    return any(map(is_recurrent, networks))
-
-
-def all_recurrent(*networks: Iterator[nn.Module]) -> bool:
-    """Determine whether the given networks are all recurrent
-    neural network.
-    Returns:
-        Whether the given networks are all recurrent network.
-    """
-    return all(map(is_recurrent, networks))
+        return ctx, {}

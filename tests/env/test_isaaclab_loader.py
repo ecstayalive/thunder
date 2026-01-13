@@ -10,4 +10,3 @@ while True:
     with torch.inference_mode():
         actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
         obs, reward, done, timeout, info = env.step(actions)
-        print(obs)

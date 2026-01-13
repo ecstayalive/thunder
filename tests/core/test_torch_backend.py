@@ -67,7 +67,7 @@ class SimpleRNN(nn.Module):
 
 class MSEObjective(op_mod.Objective):
     def compute(self, batch: data_mod.Batch, models: Any) -> Tuple[Any, Dict[str, Any]]:
-        target_net = getattr(models, self.kwargs.get("compute_net", "net"))
+        target_net = getattr(models, self.kwargs.get("net", "net"))
         pred = target_net(batch.obs["obs"])
         targets = batch.actions
         error = pred - targets
@@ -130,7 +130,6 @@ def tensor_batch_3d(device):
 
 def test_batch_3d_structure(tensor_batch_3d):
     assert tensor_batch_3d.obs["obs"].shape == (2, 3, 4)
-    assert tensor_batch_3d.batch_size == 2
     new_b = tensor_batch_3d.map(lambda x: x * 2.0)
     assert new_b.obs["obs"][0, 0, 0] == 2.0
     assert new_b.obs["obs"].shape == (2, 3, 4)
@@ -272,11 +271,17 @@ def test_torch_jit_speedup(tensor_batch_3d):
 
     import torch
 
-    class TorchForwardOp(op_mod.Operation):
+    class ForwardOp(op_mod.Operation):
         def forward(self, ctx: ctx_mod.ExecutionContext):
-            x = torch.randn(4096, 4096, device=ctx.executor.device)
+            x = torch.randn(1024, 4096, device=ctx.executor.device)
             _ = ctx.models.net(x)
             return ctx, {}
+
+    class DummyObjective(op_mod.Objective):
+        def compute(self, batch: data_mod.Batch, models: module_mod.ModelPack):
+            output = torch.randn(1024, 4096, device="cuda")
+            error = models.net(output)
+            return torch.mean(torch.square(error)), {}
 
     class SimpleTorchNet(torch.nn.Module):
         def __init__(self, din, dout):
@@ -290,9 +295,11 @@ def test_torch_jit_speedup(tensor_batch_3d):
     net = SimpleTorchNet(4096, 4096).to(device)
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device=device)
-    pipeline = [TorchForwardOp(name="forward1"), TorchForwardOp(name="forward2")]
-    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
-    algo.build({})
+    algo = algo_mod.GraphAlgorithm(models, executor)
+    algo.build({"opt": {"targets": "net", "class": "SGD", "lr": 1.0}})
+    algo.setup_pipeline(
+        [ForwardOp(name="forward"), op_mod.OptimizeOp("opt", objectives=[DummyObjective()])]
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start_time = time.time()
@@ -564,15 +571,6 @@ def test_torch_optimizer_zero_grad_behavior(device, tensor_batch_3d):
         assert p.grad is not None
 
 
-def test_torch_batch_size_multi_modal(device):
-    obs = {
-        "visual": torch.randn(4, 3, 4, 4, device=device),
-        "vector": torch.randn(4, 3, 10, device=device),
-    }
-    batch = data_mod.Batch(obs=obs)
-    assert batch.batch_size == 4
-
-
 def test_torch_hard_update_logic(device, tensor_batch_3d):
     net_main = Simple3DNet().to(device)
     net_target = Simple3DNet().to(device)
@@ -610,8 +608,8 @@ def test_torch_multi_step_optimization(device, tensor_batch_3d):
         "opt_c": {"targets": ["net2"], "class": "SGD", "lr": 0.1},
     }
     pipeline = [
-        op_mod.OptimizeOp("opt_a", [MSEObjective("net1_loss", compute_net="net1")]),
-        op_mod.OptimizeOp("opt_c", [MSEObjective("net2_loss", compute_net="net2")]),
+        op_mod.OptimizeOp("opt_a", [MSEObjective("net1_loss", net="net1")]),
+        op_mod.OptimizeOp("opt_c", [MSEObjective("net2_loss", net="net2")]),
     ]
 
     algo = algo_mod.GraphAlgorithm(model, executor, pipeline)

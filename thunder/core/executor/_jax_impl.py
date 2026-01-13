@@ -162,14 +162,52 @@ class JaxExecutor:
         return metrics
 
     def cond(self, predicate, fn, operand):
+        if isinstance(predicate, bool):
+            if predicate:
+                return fn(operand)
+            else:
+                return operand, {}
         out_structure = jax.eval_shape(fn, operand)
 
+        def _merge_dict_struct(target_d, source_d):
+            if target_d is None:
+                return None
+            source_d = source_d or {}
+            return {
+                k: (
+                    source_d.get(k)
+                    if k in source_d
+                    else jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), v)
+                )
+                for k, v in target_d.items()
+            }
+
         def _false_fn(operand):
-            _, metrics_struct = out_structure
+            ctx_struct, metrics_struct = out_structure
+            new_meta = _merge_dict_struct(ctx_struct.meta, operand.meta)
+            t_batch = ctx_struct.batch
+            s_batch = operand.batch
+            updates = {}
+            updates["obs"] = _merge_dict_struct(t_batch.obs, s_batch.obs)
+            updates["extra"] = _merge_dict_struct(t_batch.extra, s_batch.extra)
+            updates["next_obs"] = _merge_dict_struct(t_batch.next_obs, s_batch.next_obs)
+            for name in ["actions", "rewards", "dones", "mask"]:
+                t_val = getattr(t_batch, name)
+                s_val = getattr(s_batch, name)
+                if t_val is not None:
+                    updates[name] = (
+                        s_val
+                        if s_val is not None
+                        else jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), t_val)
+                    )
+                else:
+                    updates[name] = None
+            new_batch = s_batch.replace(**updates)
+            new_ctx = operand.replace(meta=new_meta, batch=new_batch)
             dummy_metrics = jax.tree_util.tree_map(
                 lambda x: jnp.zeros(x.shape, x.dtype), metrics_struct
             )
-            return operand, dummy_metrics
+            return new_ctx, dummy_metrics
 
         return jax.lax.cond(predicate, fn, _false_fn, operand)
 

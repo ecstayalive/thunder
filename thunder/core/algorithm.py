@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple
 
 from .context import ExecutionContext
 from .executor import Executor
@@ -43,7 +43,9 @@ class GraphAlgorithm(ABC):
             pipeline (Iterable[Operation]): _description_
         """
         self.pipeline = pipeline
-        self._jit_step: callable = Executor.jit(partial(self._step, pipeline=tuple(self.pipeline)))
+        self._jit_step: Callable[[ExecutionContext], Tuple[ExecutionContext, Dict]] = Executor.jit(
+            partial(self._step, pipeline=tuple(self.pipeline))
+        )
 
     def step(self, batch: Batch, jit: bool = True) -> Dict[str, Any]:
         """_summary_

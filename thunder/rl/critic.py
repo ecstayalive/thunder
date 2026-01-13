@@ -5,10 +5,6 @@ import torch
 from torch import nn
 
 from thunder.nn import LinearBlock, RunningNorm1d
-from thunder.rl import DimAdaptRMlp
-from thunder.rl.utils import any_recurrent, is_recurrent
-
-from .utils.factory import NetFactory
 
 __all__ = ["GeneralVNet", "GeneralQNet", "MultiHeadVNet", "MultiHeadQNet", "MultiVNet", "MultiQNet"]
 
@@ -19,10 +15,9 @@ class Critic(ABC, nn.Module): ...
 class GeneralVNet(nn.Module):
     """ """
 
-    def __init__(self, kernel: LinearBlock | DimAdaptRMlp):
+    def __init__(self, kernel: LinearBlock):
         super().__init__()
         self.kernel = kernel
-        self.is_recurrent = is_recurrent(kernel)
         if self.is_recurrent:
             self.forward = self.rnn_forward
 
@@ -43,34 +38,22 @@ class GeneralVNet(nn.Module):
 
 class GeneralQNet(nn.Module):
 
-    def __init__(self, kernel: LinearBlock | DimAdaptRMlp):
+    def __init__(self, kernel: LinearBlock):
         super().__init__()
         self.kernel = kernel
-        self.is_recurrent = is_recurrent(kernel)
-        if self.is_recurrent:
-            self.forward = self.rnn_forward
 
     def evaluate(self, obs, act, *args, **kwargs):
         q_value, _ = self(obs, act, *args, **kwargs)
         return q_value
 
-    def forward(self, obs, act, *args, **kwargs):
-        return self.kernel(torch.cat((obs, act), dim=-1)), None
-
-    def rnn_forward(self, obs, act, *args, **kwargs):
-        return self.kernel(torch.cat((obs, act), dim=-1), *args, **kwargs)
-
 
 class MultiHeadVNet(nn.Module):
     """ """
 
-    def __init__(self, encoder: DimAdaptRMlp | LinearBlock, decoders: Iterator[LinearBlock]):
+    def __init__(self, encoder: LinearBlock, decoders: Iterator[LinearBlock]):
         super().__init__()
         self.encoder = encoder
         self.decoders = nn.ModuleList(decoders)
-        self.is_recurrent = is_recurrent(encoder)
-        if self.is_recurrent:
-            self.forward = self.rnn_forward
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, None]:
         latent = self.encoder(obs)
@@ -90,13 +73,10 @@ class MultiHeadVNet(nn.Module):
 class MultiHeadQNet(nn.Module):
     """ """
 
-    def __init__(self, encoder: DimAdaptRMlp | LinearBlock, decoders: Iterator[LinearBlock]):
+    def __init__(self, encoder: LinearBlock, decoders: Iterator[LinearBlock]):
         super().__init__()
         self.encoder = encoder
         self.decoders = nn.ModuleList(decoders)
-        self.is_recurrent = is_recurrent(encoder)
-        if self.is_recurrent:
-            self.forward = self.rnn_forward
 
     def forward(self, obs: torch.Tensor, act: torch.Tensor) -> Tuple[torch.Tensor, None]:
         latent = self.encoder(torch.cat((obs, act), dim=-1))
@@ -117,12 +97,9 @@ class MultiHeadQNet(nn.Module):
 class MultiVNet(nn.Module):
     """ """
 
-    def __init__(self, kernels: Iterator[DimAdaptRMlp | LinearBlock]):
+    def __init__(self, kernels: Iterator[LinearBlock]):
         super().__init__()
         self.v_nets = nn.ModuleList(kernels)
-        self.is_recurrent = any_recurrent(*kernels)
-        if self.is_recurrent:
-            self.forward = self.rnn_forward
 
     def forward(self, obs: torch.Tensor) -> Tuple[Tuple[torch.Tensor, ...], None]:
         return torch.cat([m(obs) for m in self.v_nets], dim=-1), None
@@ -146,20 +123,13 @@ class MultiVNet(nn.Module):
 class MultiQNet(nn.Module):
     """ """
 
-    def __init__(self, kernels: Iterator[DimAdaptRMlp | LinearBlock]):
+    def __init__(self, kernels: Iterator[LinearBlock]):
         super().__init__()
         self.q_nets = nn.ModuleList(kernels)
-        self.is_recurrent = any_recurrent(*kernels)
-        if self.is_recurrent:
-            self.forward = self.rnn_forward
 
     @classmethod
     def make(cls, cfg, obs_dim, action_dim, n_critics=2):
         modules = []
-        for _ in range(n_critics):
-            module, _ = NetFactory.make(obs_dim, action_dim, cfg)
-            modules.append(module)
-
         return cls(modules, obs_dim)
 
     def evaluate(self, obs: torch.Tensor, act: torch.Tensor, *args, **kwargs):
@@ -187,5 +157,4 @@ class MultiQNet(nn.Module):
             output, hx = zip(*[m(q_obs) for m in self.q_nets])
         else:
             output, hx = zip(*[m(q_obs, h) for m, h in zip(self.q_nets, hidden)])
-        return torch.cat(output, dim=-1), tuple(hx)
         return torch.cat(output, dim=-1), tuple(hx)

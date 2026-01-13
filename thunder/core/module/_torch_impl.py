@@ -16,6 +16,9 @@ class TorchModelPack(nn.Module):
         """ """
         return getattr(self, key)
 
+    def get(self, name: str) -> nn.Module:
+        self.get_submodule(name)
+
     def keys(self) -> Iterator[str]:
         return iter(self._keys)
 

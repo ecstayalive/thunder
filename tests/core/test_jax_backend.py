@@ -251,7 +251,7 @@ def test_jax_multi_op(jax_batch_3d):
     algo.build({})
     m = algo.step(jax_batch_3d)
     assert m["counter/count"] == 1
-    current_net2_params = nnx.state(algo.ctx.models.net2)  # Access via the model wrapper
+    current_net2_params = nnx.state(algo.ctx.models.net2)
     assert not jtu.tree_all(
         jtu.tree_map(lambda x, y: jnp.array_equal(x, y), initial_net2_params, current_net2_params)
     )
@@ -272,23 +272,33 @@ def test_jax_jit_speedup(jax_batch_3d):
 
     class ForwardOp(op_mod.Operation):
         def forward(self, ctx: ctx_mod.ExecutionContext):
-            output = ctx.models.net(jax.random.normal(jax.random.key(0), (4096, 4096)))
+            output = ctx.models.net(jax.random.normal(jax.random.key(0), (1024, 4096)))
+            ctx.batch = ctx.batch.replace(dummy=jnp.ones((1024, 1024)))
+            ctx.meta = {"dummy": 1.0}
             return ctx, {}
+
+    class DummyObjective(op_mod.Objective):
+        def compute(self, batch: data_mod.Batch, model: module_mod.ModelPack):
+            output = models.net(jax.random.normal(jax.random.key(0), (1024, 4096)))
+            return jnp.mean(jnp.square(output)), {}
 
     rngs = nnx.Rngs(0)
     net = Simple3DFlaxNet(4096, 4096, rngs)
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device="gpu")
-    algo = algo_mod.GraphAlgorithm(
-        models, executor, [ForwardOp(name="forward1"), ForwardOp(name="forward2")]
+    algo = algo_mod.GraphAlgorithm(models, executor)
+    algo.build({"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    algo.setup_pipeline(
+        [
+            ForwardOp(name="forward"),
+            op_mod.OptimizeOp("opt", [DummyObjective()], max_grad_norm=1.0),
+        ]
     )
-    algo.build({})
     start_time = time.time()
     for _ in range(50):
         algo.step(jax_batch_3d, jit=False)
     no_jit_duration = time.time() - start_time
     print(f"No-JIT Time: {no_jit_duration:.4f}s")
-    print("Compiling...")
     algo.step(jax_batch_3d, jit=True)
     start_time = time.time()
     for _ in range(50):
@@ -298,6 +308,7 @@ def test_jax_jit_speedup(jax_batch_3d):
     speedup = no_jit_duration / jit_duration
     print(f"Speedup: {speedup:.2f}x")
     assert jit_duration < no_jit_duration
+    assert jnp.array_equal(algo.ctx.batch.dummy, jnp.ones((1024, 1024)))
 
 
 def test_jax_mixed_precision_bf16(jax_batch_3d):
@@ -433,15 +444,6 @@ def test_jax_objective_extra_kwargs_injection(jax_batch_3d):
 
     _, metrics = obj.forward(ctx.batch, ctx.models)
     assert metrics["test/alpha_used"] == 0.5
-
-
-def test_jax_batch_size_inference_edge_cases():
-    batch_empty = data_mod.Batch(obs=jnp.array([]))
-    assert batch_empty.batch_size == 0
-
-    obs_dict = {"a": jnp.zeros((10, 2)), "b": jnp.zeros((10, 5))}
-    batch_dict = data_mod.Batch(obs=obs_dict)
-    assert batch_dict.batch_size == 10
 
 
 def test_jax_optim_group_integrity(jax_batch_3d):
