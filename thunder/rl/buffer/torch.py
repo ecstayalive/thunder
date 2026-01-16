@@ -1,4 +1,3 @@
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -6,11 +5,7 @@ import numpy as np
 import torch
 
 from thunder.core.data import Batch
-from thunder.rl.ops.torch import (
-    get_trajectory_lengths,
-    get_trajectory_mask,
-    split_trajectory,
-)
+from thunder.rl.ops.torch import get_trajectory_lengths
 
 
 @dataclass(slots=True)
@@ -106,7 +101,7 @@ class Buffer:
         if isinstance(storage_node, dict):
             for k, v in data_node.items():
                 self._recursive_insert(storage_node[k], v, idx)
-        elif isinstance(storage_node, torch.Tensor):
+        elif isinstance(storage_node, (torch.Tensor, np.ndarray)):
             storage_node[idx] = torch.as_tensor(data_node, device=self.device)
 
     def _recursive_get(self, storage_node: Any, indices: torch.Tensor) -> Any:
@@ -282,11 +277,11 @@ class Buffer:
                 extra=final_data["extra"],
             )
 
-    def to_batch(self):
+    def as_batch(self):
         return self.sample_chunk(self.num_envs, self.size)
 
-    def to_batches(self, num_batch: int) -> Iterator[Batch]:
-        return self.sample_chunks(num_batch, self.num_envs // num_batch, self.size)
+    def as_batches(self, batch_size: int) -> Iterator[Batch]:
+        return self.sample_chunks(self.num_envs // batch_size, batch_size, self.size)
 
     def clear(self):
         self.ptr = 0
@@ -367,3 +362,19 @@ class Buffer:
             mask_subset = torch.cat([mask_subset, padding], dim=1)
 
         return segmented_batch.replace(mask=mask_subset)
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx: int) -> Transition:
+        head_ptr = 0 if self.size < self.capacity else self.ptr
+        idx = (head_ptr + idx) % self.capacity
+        return Transition(
+            obs=self._recursive_get(self.obs, idx),
+            actions=self._recursive_get(self.actions, idx),
+            rewards=self._recursive_get(self.rewards, idx),
+            dones=self._recursive_get(self.dones, idx),
+            timeouts=self._recursive_get(self.timeouts, idx),
+            next_obs=self._recursive_get(self.next_obs, idx),
+            extra=self._recursive_get(self.extra, idx),
+        )

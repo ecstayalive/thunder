@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from thunder.core.context import ExecutionContext, OptimGroup
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 
 
 class JaxExecutor:
+    backend = "jax"
+
     def __init__(
         self,
         device: str = "gpu",
@@ -26,6 +29,8 @@ class JaxExecutor:
         distributed: bool = False,
         donate: bool = True,
     ):
+        if device == "cuda":
+            device = "gpu"
         self.devices = jax.devices(device)
         self.precision = precision
         self.distributed = distributed
@@ -33,7 +38,7 @@ class JaxExecutor:
         self.compute_dtype = {"fp32": jnp.float32, "bf16": jnp.bfloat16, "fp16": jnp.float16}.get(
             precision, jnp.float32
         )
-        self._compiled_step_cache: Dict[Tuple, Any] = {}
+        self._jit_optimize_cache: Dict[Tuple, Any] = {}
 
     def init(
         self,
@@ -105,18 +110,23 @@ class JaxExecutor:
         group = ctx.opt_groups[opt]
         nnx_opt = group.optimizer
         objs_key = tuple(objectives)
-        if objs_key not in self._compiled_step_cache:
-            self._compiled_step_cache[objs_key] = nnx.jit(
-                self._jit_update, static_argnames=["objectives", "compute_dtype"]
+        if objs_key not in self._jit_optimize_cache:
+            self._jit_optimize_cache[objs_key] = nnx.jit(
+                self._jit_optimize, static_argnames=["objectives", "compute_dtype"]
             )
-        jit_fn = self._compiled_step_cache[objs_key]
+        jit_fn = self._jit_optimize_cache[objs_key]
         metrics = jit_fn(
             ctx.models, nnx_opt, ctx.batch, objs_key, max_grad_norm, self.compute_dtype
         )
         return metrics
 
+    def to_device(self, data: Any, device: Optional[jax.Device] = None):
+        if device is None:
+            device = self.devices[0]
+        return jax.device_put(data, device)
+
     @staticmethod
-    def _jit_update(
+    def _jit_optimize(
         models: ModelPack,
         optimizer: nnx.Optimizer,
         batch: Batch,
@@ -161,7 +171,8 @@ class JaxExecutor:
         metrics["loss_total"] = loss
         return metrics
 
-    def cond(self, predicate, fn, operand):
+    @staticmethod
+    def cond(predicate, fn, operand: ExecutionContext):
         if isinstance(predicate, bool):
             if predicate:
                 return fn(operand)
@@ -211,12 +222,6 @@ class JaxExecutor:
 
         return jax.lax.cond(predicate, fn, _false_fn, operand)
 
-    def to_device(self, data: Any):
-        return jax.device_put(data, self.devices[0])
-
-    def to_numpy(self, data: Any):
-        return jax.device_get(data)
-
     @staticmethod
     def jit(fn: Optional[Callable] = None, **kwargs):
         """ """
@@ -227,6 +232,95 @@ class JaxExecutor:
 
             return wrapper
         return jax.jit(fn, **kwargs)
+
+    @staticmethod
+    def to_numpy(data: Any):
+        return jax.tree_util.tree_map(lambda x: np.array(x), data)
+
+    @staticmethod
+    def to_jax(data: Any):
+        return data
+
+    @staticmethod
+    def to_torch(data: Any):
+        try:
+            from torch.utils.dlpack import from_dlpack
+
+            return jax.tree_util.tree_map(
+                lambda data: from_dlpack(jax.dlpack.to_dlpack(data)), data
+            )
+        except ImportError:
+            raise ImportError("Please install `pytorch` to use `to_torch` function.")
+
+    @staticmethod
+    def to_warp(data: Any):
+        try:
+            import warp
+
+            return jax.tree_util.tree_map(warp.from_jax, data)
+        except ImportError:
+            raise ImportError("Please install `warp-lang` to use `to_warp` function.")
+
+    @staticmethod
+    def to_dlpack(data: Any):
+        return jax.tree_util.tree_map(jax.dlpack.to_dlpack, data)
+
+    @staticmethod
+    def to(data: Any, target: Any, non_blocking: bool = False) -> Any:
+        """ """
+        if isinstance(target, str):
+            if target == "cpu":
+                return jax.device_put(data, jax.devices("cpu")[0])
+            return jax.device_put(data, jax.devices("gpu")[0])
+        if isinstance(data, (dict, list, tuple)):
+            return jax.tree_util.tree_map(lambda x: JaxExecutor.to(x, target), data)
+
+        if isinstance(target, type):
+            name = target.__name__
+            module = target.__module__
+            if name == "ndarray" and "numpy" in module:
+                return np.array(data)
+            if name == "Tensor" and "torch" in module:
+                from jax import dlpack as jdlpack
+                from torch.utils.dlpack import from_dlpack
+
+                return from_dlpack(jdlpack.to_dlpack(data))
+            if "warp" in module:
+                import warp
+
+                return warp.from_jax(data)
+        try:
+            return data.astype(target)
+        except (AttributeError, TypeError):
+            pass
+
+        raise ValueError(f"Executor.to: Unknown target '{target}'")
+
+    @staticmethod
+    def from_numpy(data: Any):
+        return jax.tree_util.tree_map(jnp.array, data)
+
+    @staticmethod
+    def from_torch(data: Any):
+        try:
+            from torch.utils.dlpack import to_dlpack
+
+            return jax.tree_util.tree_map(lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data)
+        except ImportError:
+            raise ImportError("Please install `pytorch` to use `from_torch` function.")
+
+    @staticmethod
+    def from_warp(data: Any):
+        try:
+            import warp
+
+            return jax.tree_util.tree_map(warp.to_jax, data)
+        except ImportError:
+            raise ImportError("Please install `warp-lang` to use `from_warp` function.")
+
+    @staticmethod
+    def from_dlpack(data: Any):
+        return jax.tree_util.tree_map(jax.dlpack.from_dlpack, data)
 
 
 def fsdp_strategy(path, param):

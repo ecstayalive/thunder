@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .data import Batch
-    from .executor.interface import ExecutorProtocol
+    from .executor.interface import Executor
     from .module import ModelPack, ThunderModule
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
@@ -45,7 +45,7 @@ class ExecutionContext:
     batch: Optional[Batch]
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
-    executor: ExecutorProtocol
+    executor: Executor
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:
@@ -67,7 +67,7 @@ class ExecutionContext:
 
     @classmethod
     def create(
-        cls, executor: ExecutorProtocol, models: ModelPack, opt_groups: Dict[str, OptimGroup]
+        cls, executor: Executor, models: ModelPack, opt_groups: Dict[str, OptimGroup]
     ) -> ExecutionContext:
         """ """
         return cls(

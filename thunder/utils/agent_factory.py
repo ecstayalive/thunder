@@ -10,7 +10,6 @@ import torch.nn as nn
 from thunder.nn import *
 from thunder.nn.models import *
 from thunder.rl import *
-from thunder.rl.distributions import ConsistentGaussian
 
 GLOBAL_ALGO_KEY = "GlobalAlgo"
 

@@ -8,5 +8,5 @@ env = make_env(spec=spec.parse())
 obs = env.reset()
 while True:
     with torch.inference_mode():
-        actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+        actions = torch.zeros(env.action_space.shape, device="cuda")
         obs, reward, done, timeout, info = env.step(actions)

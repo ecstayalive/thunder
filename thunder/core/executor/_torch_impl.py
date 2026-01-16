@@ -19,6 +19,8 @@ class TorchExecutor:
     Args:
     """
 
+    backend = "torch"
+
     def __init__(
         self,
         device: str = None,
@@ -29,6 +31,8 @@ class TorchExecutor:
         **kwargs,
     ):
         """ """
+        if device == "gpu":
+            device = "cuda"
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -131,30 +135,25 @@ class TorchExecutor:
             optim_group.scheduler.step()
         return metrics
 
-    def cond(self, predicate, fn, operand):
+    def to_device(self, data: Any, device: Optional[torch.device | str] = None) -> Any:
+        if isinstance(data, torch.Tensor):
+            return data.to(device, non_blocking=True)
+        elif isinstance(data, dict):
+            return {k: TorchExecutor.to_device(v) for k, v in data.items()}
+        elif isinstance(data, (list, tuple)):
+            return type(data)(TorchExecutor.to_device(v) for v in data)
+        return data
+
+    @staticmethod
+    def cond(predicate, fn, operand):
         if predicate:
             return fn(operand)
         return operand, {}
         # def _false_fn(operand):
         #     return operand, {}
-
         # if predicate:
         #     return fn(operand)
         # return torch.cond(predicate, fn, _false_fn, operand)
-
-    def to_device(self, data: Any) -> Any:
-        if isinstance(data, torch.Tensor):
-            return data.to(self.device, non_blocking=True)
-        elif isinstance(data, dict):
-            return {k: self.to_device(v) for k, v in data.items()}
-        elif isinstance(data, (list, tuple)):
-            return type(data)(self.to_device(v) for v in data)
-        return data
-
-    def to_numpy(self, data: Any) -> Any:
-        if isinstance(data, torch.Tensor):
-            return data.detach().cpu().numpy()
-        return data
 
     @staticmethod
     def jit(fn: Callable, **kwargs):
@@ -167,3 +166,108 @@ class TorchExecutor:
         if fn is None:
             return wrapper
         return wrapper(fn)
+
+    @staticmethod
+    def _recursive_map(func, data):
+        """Applies func to every leaf in a nested structure (Dict/List/Tuple)."""
+        if isinstance(data, dict):
+            return {k: TorchExecutor._recursive_map(func, v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [TorchExecutor._recursive_map(func, v) for v in data]
+        elif isinstance(data, tuple):
+            return tuple(TorchExecutor._recursive_map(func, v) for v in data)
+        return func(data)
+
+    @staticmethod
+    def to_numpy(data: Any) -> Any:
+        return TorchExecutor._recursive_map(lambda x: x.detach().cpu().numpy(), data)
+
+    @staticmethod
+    def to_jax(data: Any) -> Any:
+        try:
+            import jax
+            from torch.utils.dlpack import to_dlpack
+
+            return TorchExecutor._recursive_map(
+                lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data
+            )
+        except ImportError:
+            raise ImportError("Please install `jax` to use `to_jax` function.")
+
+    @staticmethod
+    def to_torch(data: Any) -> torch.Tensor:
+        return data
+
+    @staticmethod
+    def to_warp(data: Any) -> Any:
+        try:
+            import warp
+
+            return TorchExecutor._recursive_map(warp.from_torch, data)
+        except ImportError:
+            raise ImportError("Please install `warp-lang` to use `to_warp` function.")
+
+    @staticmethod
+    def to_dlpack(data: Any):
+        from torch.utils.dlpack import to_dlpack
+
+        return TorchExecutor._recursive_map(lambda x: to_dlpack(x), data)
+
+    @staticmethod
+    def to(data: Any, target: Any, non_blocking: bool = True):
+        if isinstance(target, (str, torch.dtype, torch.device)):
+            if isinstance(data, torch.Tensor):
+                return data.to(target, non_blocking=non_blocking)
+            return torch.as_tensor(data).to(target, non_blocking=non_blocking)
+
+        if isinstance(data, (dict, list, tuple)):
+            return TorchExecutor._recursive_map(
+                lambda x: TorchExecutor.to(x, target, non_blocking), data
+            )
+
+        if isinstance(target, type):
+            name = target.__name__
+            module = target.__module__
+
+            if name == "ndarray" and "numpy" in module:
+                return TorchExecutor.to_numpy(data)
+
+            if (name == "Array" or "jax" in name) and ("jax" in module):
+                return TorchExecutor.to_jax(data)
+
+            if module.startswith("warp"):
+                return TorchExecutor.to_warp(data)
+
+            if name == "Tensor" and "torch" in module:
+                return data
+
+        raise ValueError(f"TorchExecutor.to: Unknown target '{target}'")
+
+    @staticmethod
+    def from_numpy(data: Any):
+        return TorchExecutor._recursive_map(torch.as_tensor, data)
+
+    @staticmethod
+    def from_jax(data: Any):
+        try:
+            from jax import dlpack as jdlpack
+            from torch.utils.dlpack import from_dlpack
+
+            return TorchExecutor._recursive_map(lambda x: from_dlpack(jdlpack.to_dlpack(x)), data)
+        except ImportError:
+            raise ImportError("Please install `jax` to use `from_jax` function.")
+
+    @staticmethod
+    def from_warp(data: Any):
+        try:
+            import warp
+
+            return TorchExecutor._recursive_map(warp.to_torch, data)
+        except ImportError:
+            raise ImportError("Please install `warp-lang` to use `from_warp` function.")
+
+    @staticmethod
+    def from_dlpack(data: Any):
+        from torch.utils.dlpack import from_dlpack
+
+        return TorchExecutor._recursive_map(from_dlpack, data)

@@ -1,14 +1,10 @@
-import argparse
-import atexit
-import enum
-import sys
 from typing import Any, Dict, List, Literal, Tuple
 
-import gymnasium
+import gymnasium as gym
 
 from thunder.utils import ArgsOpt
 
-from .interface import EnvSpec, EnvWrapper
+from .interface import EnvSpec
 from .loader import register_loader
 
 
@@ -37,10 +33,10 @@ class IsaacLabEnvSpec(EnvSpec):
     visualizer: List[str] = None
 
 
-class IsaacLabAdapter(EnvWrapper):
+class IsaacLabAdapter(gym.Env):
     """ """
 
-    def __init__(self, env: gymnasium.Env):
+    def __init__(self, env: gym.Env):
         self.env = env
 
     def reset(self) -> Tuple[Any, Dict]:
@@ -55,7 +51,7 @@ class IsaacLabAdapter(EnvWrapper):
 
 
 @register_loader("isaaclab")
-def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> EnvWrapper:
+def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> gym.Env:
     """ """
     from isaaclab.app import AppLauncher
 
@@ -65,6 +61,7 @@ def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> EnvWrapper:
     app_launcher = AppLauncher(spec.to_namespace())
     import gymnasium
     import isaaclab_tasks
+    import isaaclab_tasks_experimental
     from isaaclab.utils.timer import Timer
     from isaaclab_tasks.utils import parse_env_cfg
 

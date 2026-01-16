@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     from ..context import ExecutionContext
@@ -11,32 +19,67 @@ if TYPE_CHECKING:
 
 
 @runtime_checkable
-class ExecutorProtocol(Protocol):
+class Executor(Protocol):
     """ """
 
-    def init(self, model: ModelPack, optim_config: Dict[str, Any]) -> ExecutionContext:
-        """ """
-        ...
+    backend: str
 
-    def call(self, model: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    def init(
+        self,
+        model: ModelPack,
+        optim_config: Dict[str, Any],
+        distributed_strategy: Optional[Callable] = None,
+    ) -> ExecutionContext:
         """ """
-        ...
+        raise NotImplementedError
 
     def optimize(
         self,
         ctx: ExecutionContext,
         opt: str,
-        objectives: list[Objective],
+        objectives: Tuple[Objective],
         max_grad_norm: float = 1.0,
     ) -> Dict[str, Any]:
         """ """
         ...
 
-    def cond(self, predicate: Any, fn: Callable[[Any], Any], operand: Any) -> Any: ...
+    def to_device(self, data: Any, device) -> Any: ...
 
-    def to_device(self, data: Any) -> Any: ...
-
-    def to_numpy(self, data: Any) -> Any: ...
+    @staticmethod
+    def cond(predicate: Any, fn: Callable[[Any], Any], operand: Any) -> Any: ...
 
     @staticmethod
     def jit(fn: Callable): ...
+
+    @staticmethod
+    def to_numpy(data: Any) -> Any: ...
+
+    @staticmethod
+    def to_jax(data: Any) -> Any: ...
+
+    @staticmethod
+    def to_torch(data: Any) -> Any: ...
+
+    @staticmethod
+    def to_warp(data: Any) -> Any: ...
+
+    @staticmethod
+    def to_dlpack(data: Any) -> Any: ...
+
+    @staticmethod
+    def to(data: Any, *args, **kwargs) -> Any: ...
+
+    @staticmethod
+    def from_numpy(data: Any) -> Any: ...
+
+    @staticmethod
+    def from_jax(data: Any) -> Any: ...
+
+    @staticmethod
+    def from_torch(data: Any) -> Any: ...
+
+    @staticmethod
+    def from_warp(data: Any) -> Any: ...
+
+    @staticmethod
+    def from_dlpack(data: Any) -> Any: ...

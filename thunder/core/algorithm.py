@@ -9,23 +9,25 @@ from .executor import Executor
 
 if TYPE_CHECKING:
     from .data import Batch
-    from .executor.interface import ExecutorProtocol
+    from .executor.interface import Executor
     from .module import ModelPack
     from .operation import Operation
 
 
-class GraphAlgorithm(ABC):
+class Algorithm(ABC):
     def __init__(
         self,
         models: ModelPack,
-        executor: ExecutorProtocol,
+        executor: Optional[Executor] = None,
+        optim_config: Optional[Dict[str, Any]] = None,
         pipeline: Optional[Iterable[Operation]] = None,
     ):
         self.models = models
-        self.executor = executor
-        if pipeline:
+        self.executor = executor if executor is not None else Executor()
+        if optim_config is not None:
+            self.build(optim_config)
+        if pipeline is not None:
             self.setup_pipeline(pipeline)
-        self.ctx: Optional[ExecutionContext] = None
 
     def build(self, optim_config: Dict[str, Any]) -> None:
         """Build the algorithm by initializing the execution context.
@@ -76,12 +78,3 @@ class GraphAlgorithm(ABC):
             ctx, m = op(ctx)
             metrics.update(m)
         return ctx, metrics
-
-
-class Agent(GraphAlgorithm):
-    def __init__(self, models, executor, pipeline):
-        super().__init__(models, executor, pipeline)
-
-    def act(self, obs: Dict[str, Any]): ...
-
-    def explore(self, obs: Dict[str, Any]): ...

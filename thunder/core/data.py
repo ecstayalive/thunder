@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
 
 if TYPE_CHECKING:
-    from .executor.interface import ExecutorProtocol
+    from .executor.interface import Executor
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
 TBatch = TypeVar("TBatch", bound="Batch")
@@ -68,7 +68,7 @@ class Batch:
             changes["extra"] = _recursive_apply(self.extra)
         return replace(self, **changes)
 
-    def to(self: TBatch, executor: ExecutorProtocol) -> TBatch:
+    def to(self: TBatch, executor: Executor) -> TBatch:
         """ """
         return self.map(executor.to_device)
 

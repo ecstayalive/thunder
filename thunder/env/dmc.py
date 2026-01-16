@@ -35,6 +35,7 @@ class DmcAdapter:
 @register_loader("dmc")
 def load_dmc(spec: DmcSpec | EnvSpec) -> DmcAdapter:
     """ """
+    spec = DmcSpec.parse(final=True)
     from dm_control import suite
 
     domain, task = spec.task.split("_", 1)

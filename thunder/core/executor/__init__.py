@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     elif _BACKEND == "warp":
         from ._warp_impl import WarpExecutor as Executor
     else:
-        from .interface import ExecutorProtocol as Executor
+        from .interface import Executor as Executor
 
 else:
     if _BACKEND not in _REGISTRY:

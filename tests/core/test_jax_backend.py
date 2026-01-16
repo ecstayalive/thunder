@@ -247,8 +247,7 @@ def test_jax_multi_op(jax_batch_3d):
         tau=0.1,
     )
     pipeline = [update_op, counter]
-    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
-    algo.build({})
+    algo = algo_mod.Algorithm(models, executor, {}, pipeline)
     m = algo.step(jax_batch_3d)
     assert m["counter/count"] == 1
     current_net2_params = nnx.state(algo.ctx.models.net2)
@@ -286,7 +285,7 @@ def test_jax_jit_speedup(jax_batch_3d):
     net = Simple3DFlaxNet(4096, 4096, rngs)
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(device="gpu")
-    algo = algo_mod.GraphAlgorithm(models, executor)
+    algo = algo_mod.Algorithm(models, executor)
     algo.build({"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
     algo.setup_pipeline(
         [
@@ -331,8 +330,7 @@ def test_jax_objective_standalone_eval(jax_batch_3d):
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
     obj = JaxMSEObjective("eval")
-    algo = algo_mod.GraphAlgorithm(models, executor, [obj])
-    algo.build({})
+    algo = algo_mod.Algorithm(models, executor, {}, [obj])
     m = algo.step(jax_batch_3d)
     assert "eval/loss" in m
     assert jnp.all(models.net.net.kernel.value == 0.0)
@@ -342,16 +340,13 @@ def test_jax_serialization_state_retrieval():
     rngs = nnx.Rngs(7)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
-    algo = algo_mod.GraphAlgorithm(models, executor, [])
-    algo.build({})
-
+    algo = algo_mod.Algorithm(models, executor, {}, [])
     # sd = algo.get_state_dict()
     # assert "net" in sd
     # assert isinstance(sd["net"], nnx.State)
     new_native = Simple3DFlaxNet(4, 2, nnx.Rngs(8))
     new_models = module_mod.ModelPack(net=new_native)
-    new_algo = algo_mod.GraphAlgorithm(new_models, executor, [])
-    new_algo.build({})
+    new_algo = algo_mod.Algorithm(new_models, executor, {}, [])
     # new_algo.load_state_dict(sd)
     assert jnp.all(new_native.net.kernel.value == 0.0)
 
@@ -468,14 +463,11 @@ def test_jax_multi_objective_complex_pipeline(jax_batch_3d):
     obj2 = JaxMSEObjective("m2", weight=0.9, net="net2")
 
     pipeline = [op_mod.OptimizeOp("opt1", [obj1]), op_mod.OptimizeOp("opt2", [obj2])]
-
-    algo = algo_mod.GraphAlgorithm(models, executor, pipeline)
-    algo.build(
-        {
-            "opt1": {"targets": ["net1"], "class": "sgd", "lr": 0.1},
-            "opt2": {"targets": ["net2"], "class": "sgd", "lr": 0.1},
-        }
-    )
+    optim_config = {
+        "opt1": {"targets": ["net1"], "class": "sgd", "lr": 0.1},
+        "opt2": {"targets": ["net2"], "class": "sgd", "lr": 0.1},
+    }
+    algo = algo_mod.Algorithm(models, executor, optim_config, pipeline)
     metrics = algo.step(jax_batch_3d)
     assert "grad_op/m1/loss" in metrics
     assert "grad_op/m2/loss" in metrics
