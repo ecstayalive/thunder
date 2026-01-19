@@ -2,8 +2,7 @@ from typing import Any, Dict, Tuple
 
 import gymnasium
 
-from .interface import EnvSpec
-from .loader import register_loader
+from .loader import EnvSpec, register_loader
 
 
 class DmcSpec(EnvSpec):
@@ -15,7 +14,7 @@ class DmcSpec(EnvSpec):
     headless: bool = False
 
 
-class DmcAdapter:
+class DmcAdapter(gymnasium.Env):
     """ """
 
     def __init__(self, env: gymnasium.Env):
@@ -35,7 +34,7 @@ class DmcAdapter:
 @register_loader("dmc")
 def load_dmc(spec: DmcSpec | EnvSpec) -> DmcAdapter:
     """ """
-    spec = DmcSpec.parse(final=True)
+    spec = DmcSpec().parse(final=True)
     from dm_control import suite
 
     domain, task = spec.task.split("_", 1)

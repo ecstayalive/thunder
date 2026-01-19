@@ -23,19 +23,16 @@ class TorchExecutor:
 
     def __init__(
         self,
-        device: str = None,
         mixed_precision: bool = False,
         compile: bool = True,
         compile_mode: str = "default",
         distributed: bool = False,
-        **kwargs,
+        device: Optional[str] = None,
     ):
         """ """
         if device == "gpu":
             device = "cuda"
-        self.device = torch.device(
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = self.default_device(device)
         if self.device.type == "cuda":
             if torch.cuda.get_device_capability() >= (8, 0):
                 torch.set_float32_matmul_precision("high")
@@ -135,26 +132,6 @@ class TorchExecutor:
             optim_group.scheduler.step()
         return metrics
 
-    def to_device(self, data: Any, device: Optional[torch.device | str] = None) -> Any:
-        if isinstance(data, torch.Tensor):
-            return data.to(device, non_blocking=True)
-        elif isinstance(data, dict):
-            return {k: TorchExecutor.to_device(v) for k, v in data.items()}
-        elif isinstance(data, (list, tuple)):
-            return type(data)(TorchExecutor.to_device(v) for v in data)
-        return data
-
-    @staticmethod
-    def cond(predicate, fn, operand):
-        if predicate:
-            return fn(operand)
-        return operand, {}
-        # def _false_fn(operand):
-        #     return operand, {}
-        # if predicate:
-        #     return fn(operand)
-        # return torch.cond(predicate, fn, _false_fn, operand)
-
     @staticmethod
     def jit(fn: Callable, **kwargs):
         compile_args = {"mode": "default"}
@@ -177,6 +154,29 @@ class TorchExecutor:
         elif isinstance(data, tuple):
             return tuple(TorchExecutor._recursive_map(func, v) for v in data)
         return func(data)
+
+    @staticmethod
+    def devices(backend: str):
+        return (torch.device(backend),)
+
+    @staticmethod
+    def default_device(device: Optional[str | torch.device] = None):
+        if isinstance(device, torch.device):
+            return device
+        if device is not None:
+            return torch.device(device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    @staticmethod
+    def to_device(data: Any, device: Optional[torch.device | str] = None) -> Any:
+        target_device = TorchExecutor.default_device(device)
+
+        def _put_data(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(target_device, non_blocking=True)
+            return x
+
+        return TorchExecutor._recursive_map(_put_data, data)
 
     @staticmethod
     def to_numpy(data: Any) -> Any:

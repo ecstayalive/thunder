@@ -5,10 +5,10 @@ import numpy as np
 import torch
 
 from thunder.core.data import Batch
-from thunder.rl.ops.torch import get_trajectory_lengths
+from thunder.rl.func.torch import get_trajectory_lengths
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class Transition:
     """The Transition class represents a transition in a reinforcement
     learning buffer.
@@ -31,6 +31,29 @@ class Transition:
     timeouts: Any = None
     next_obs: Dict[str, Any] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        obs: Dict[str, Any] = None,
+        actions: Any = None,
+        rewards: Any = None,
+        dones: Any = None,
+        timeouts: Any = None,
+        next_obs: Dict[str, Any] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        self.obs = obs
+        self.actions = actions
+        self.rewards = rewards
+        self.dones = dones
+        self.timeouts = timeouts
+        self.next_obs = next_obs
+        if extra is None:
+            extra = {}
+        extra.update(kwargs)
+
+        self.extra = extra
 
     def __getattr__(self, name: str) -> Any:
         """ """

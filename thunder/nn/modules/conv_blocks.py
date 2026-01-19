@@ -4,6 +4,7 @@ from typing import Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
+
 from thunder.nn.mapping import ACTIVATION_CLS_NAME
 
 __all__ = ["_ConvNdBlock", "Conv1dBlock", "Conv2dBlock", "ResBasicBlock", "ResBottleneckBlock"]

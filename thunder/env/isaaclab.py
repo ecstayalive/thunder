@@ -4,8 +4,7 @@ import gymnasium as gym
 
 from thunder.utils import ArgsOpt
 
-from .interface import EnvSpec
-from .loader import register_loader
+from .loader import EnvSpec, register_loader
 
 
 class IsaacLabEnvSpec(EnvSpec):
@@ -33,23 +32,6 @@ class IsaacLabEnvSpec(EnvSpec):
     visualizer: List[str] = None
 
 
-class IsaacLabAdapter(gym.Env):
-    """ """
-
-    def __init__(self, env: gym.Env):
-        self.env = env
-
-    def reset(self) -> Tuple[Any, Dict]:
-        return self.env.reset()
-
-    def step(self, action: Any) -> Tuple[Any, Any, Any, Any, Dict]:
-        return self.env.step(action)
-
-    @property
-    def unwrapped(self) -> Any:
-        return self.env.unwrapped
-
-
 @register_loader("isaaclab")
 def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> gym.Env:
     """ """
@@ -69,13 +51,9 @@ def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> gym.Env:
     Timer.enable_display_output = False
 
     cfg = parse_env_cfg(
-        spec.task,
-        device=spec.device,
-        num_envs=spec.num_envs,
-        use_fabric=not spec.disable_fabric,
+        spec.task, device=spec.device, num_envs=spec.num_envs, use_fabric=not spec.disable_fabric
     )
     if spec.distributed:
         cfg.sim.device = f"cuda:{app_launcher.local_rank}"
     env = gymnasium.make(spec.task, cfg=cfg)
-    # return IsaacLabAdapter(env)
     return env

@@ -1,8 +1,4 @@
-from abc import ABC, abstractmethod
-
-from thunder.core import Algorithm
+from .agent import Agent
 
 
-class Agent(ABC):
-    def __init__(self):
-        super().__init__()
+class Alive(Agent): ...

@@ -91,15 +91,17 @@ class MultiNetObjective(op_mod.Objective):
 
 class TorchCounterOp(op_mod.Operation):
 
-    def __init__(self, interval: int = 1):
-        super().__init__(name="counter", interval=interval)
-        self.execution_count = 0
+    def __init__(self, interval: int):
+        super().__init__(name="counter")
+        self.count = 0
+        self.interval = interval
 
     def forward(
         self, ctx: ctx_mod.ExecutionContext
     ) -> Tuple[ctx_mod.ExecutionContext, Dict[str, Any]]:
-        self.execution_count += 1
-        return ctx, {"count": self.execution_count}
+        if ctx.step % self.interval == 0:
+            self.count += 1
+        return ctx, {"count": self.count}
 
 
 @pytest.fixture
@@ -138,7 +140,7 @@ def test_batch_3d_structure(tensor_batch_3d):
 def test_torch_executor_optimization_flow(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -148,7 +150,7 @@ def test_torch_executor_optimization_flow(device, tensor_batch_3d):
     new_ctx, metrics = op(ctx)
 
     assert torch.any(native_net.net.weight != old_w)
-    assert "grad_op/test/loss" in metrics
+    assert "optimize/test/loss" in metrics
 
 
 import copy
@@ -158,7 +160,7 @@ def test_torch_multi_net_joint_update(device, tensor_batch_3d):
     net1 = Simple3DNet().to(device)
     net2 = Simple3DNet().to(device)
     model = module_mod.ModelPack(net1=net1, net2=net2)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -173,23 +175,23 @@ def test_torch_multi_net_joint_update(device, tensor_batch_3d):
 
 def test_torch_pipeline_scheduling(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     interval_op = TorchCounterOp(interval=3)
     algo = algo_mod.Algorithm(model, executor, {}, [interval_op])
     algo.step(tensor_batch_3d)
-    assert interval_op.execution_count == 1
+    assert interval_op.count == 1
     algo.step(tensor_batch_3d)
-    assert interval_op.execution_count == 1
+    assert interval_op.count == 1
     algo.step(tensor_batch_3d)
-    assert interval_op.execution_count == 1
+    assert interval_op.count == 1
     algo.step(tensor_batch_3d)
-    assert interval_op.execution_count == 2
+    assert interval_op.count == 2
 
 
 def test_torch_objective_standalone(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     obj = MSEObjective("eval")
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
 
@@ -201,7 +203,7 @@ def test_torch_objective_standalone(device, tensor_batch_3d):
 def test_torch_rnn_carry_flow(device, tensor_batch_3d):
     rnn_net = SimpleRNN().to(device)
     model = module_mod.ModelPack(rnn=rnn_net)
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     ctx = executor.init(model, {})
 
     obs_step = tensor_batch_3d.obs["obs"][:, 0]
@@ -215,14 +217,14 @@ def test_torch_rnn_carry_flow(device, tensor_batch_3d):
 def test_torch_gradient_clipping(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     obj = MSEObjective("test")
     op_no_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=999.0)
     _, metrics_large = op_no_clip(ctx)
-    raw_norm = metrics_large["grad_op/total_loss"]
+    raw_norm = metrics_large["optimize/total_loss"]
     native_net.net.weight.grad.zero_()
     clip_threshold = 0.01
     op_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=clip_threshold)
@@ -233,7 +235,7 @@ def test_torch_gradient_clipping(device, tensor_batch_3d):
 
 def test_torch_callback_side_effects(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(model, executor)
 
     def modify_ctx_hook(ctx: ctx_mod.ExecutionContext):
@@ -249,7 +251,7 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
 
 def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     obj1 = MSEObjective("m1", weight=1.0)
     obj2 = MSEObjective("m2", weight=2.0)
 
@@ -257,9 +259,9 @@ def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     algo = algo_mod.Algorithm(model, executor, {"opt": {"targets": ["net"], "class": "SGD"}}, [op])
 
     metrics = algo.step(tensor_batch_3d)
-    l1 = metrics["grad_op/m1/loss"]
-    l2 = metrics["grad_op/m2/loss"]
-    total = metrics["grad_op/total_loss"]
+    l1 = metrics["optimize/m1/loss"]
+    l2 = metrics["optimize/m2/loss"]
+    total = metrics["optimize/total_loss"]
     assert torch.isclose(total, l1 * 1.0 + l2 * 2.0)
 
 
@@ -268,15 +270,17 @@ def test_torch_jit_speedup(tensor_batch_3d):
 
     import torch
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     class ForwardOp(op_mod.Operation):
         def forward(self, ctx: ctx_mod.ExecutionContext):
-            x = torch.randn(1024, 4096, device=ctx.executor.device)
+            x = torch.randn(4096, 4096, device=device)
             _ = ctx.models.net(x)
             return ctx, {}
 
     class DummyObjective(op_mod.Objective):
         def compute(self, batch: data_mod.Batch, models: module_mod.ModelPack):
-            output = torch.randn(1024, 4096, device="cuda")
+            output = torch.randn(4096, 4096, device=device)
             error = models.net(output)
             return torch.mean(torch.square(error)), {}
 
@@ -288,30 +292,29 @@ def test_torch_jit_speedup(tensor_batch_3d):
         def forward(self, x):
             return self.net(x)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    net = SimpleTorchNet(4096, 4096).to(device)
+    net = SimpleTorchNet(4096, 4096)
     models = module_mod.ModelPack(net=net)
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(models, executor)
     algo.build({"opt": {"targets": "net", "class": "SGD", "lr": 1.0}})
-    algo.setup_pipeline(
-        [ForwardOp(name="forward"), op_mod.OptimizeOp("opt", objectives=[DummyObjective()])]
-    )
+    pipeline = [ForwardOp(name="forward"), op_mod.OptimizeOp("opt", objectives=[DummyObjective()])]
+    algo.setup_pipeline(pipeline=pipeline, jit=False)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(50):
-        algo.step(tensor_batch_3d, jit=False)
+        algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     no_jit_duration = time.time() - start_time
     print(f"No-JIT Time: {no_jit_duration:.4f}s")
-    algo.step(tensor_batch_3d, jit=True)
+    algo.setup_pipeline(pipeline, jit=True)
+    algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(50):
-        algo.step(tensor_batch_3d, jit=True)
+        algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     jit_duration = time.time() - start_time
@@ -323,7 +326,7 @@ def test_torch_jit_speedup(tensor_batch_3d):
 
 def test_torch_initialization_error(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     with pytest.raises(ValueError, match="Optimizer target 'bad' not found in models."):
         executor.init(model, {"opt": {"targets": ["bad"]}})
 
@@ -332,7 +335,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     nn.init.constant_(native_net.net.weight, 0.0)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device, mixed_precision=True, compile=False)
+    executor = exec_mod.Executor(mixed_precision=True, compile=False)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -350,19 +353,19 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     assert (
         success
     ), f"Weights failed to update after {max_attempts} iterations. Scaler may be stuck."
-    assert "grad_op/amp_test/loss" in metrics
+    assert "optimize/amp_test/loss" in metrics
     assert native_net.net.weight.dtype == torch.float32
     assert native_net.net.weight.grad is not None
 
 
 def test_torch_compile_toggle(device, tensor_batch_3d):
-    native_net = Simple3DNet().to(device)
+    native_net = Simple3DNet().to()
     model = module_mod.ModelPack(net=native_net)
 
-    executor_no_compile = exec_mod.Executor(device=device, compile=False)
+    executor_no_compile = exec_mod.Executor(compile=False)
     assert executor_no_compile._compiled_forward is None
 
-    executor_compile = exec_mod.Executor(device=device, compile=True)
+    executor_compile = exec_mod.Executor(compile=True)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD"}}
     ctx = executor_compile.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -376,7 +379,7 @@ def test_torch_compile_toggle(device, tensor_batch_3d):
 
 def test_torch_algorithm_serialization(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     op = op_mod.OptimizeOp("opt", [MSEObjective("mse")])
     algo = algo_mod.Algorithm(
         model, executor, {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}, [op]
@@ -396,7 +399,7 @@ def test_torch_algorithm_serialization(device, tensor_batch_3d):
 
 def test_torch_advanced_optimizer_params(device, tensor_batch_3d):
     model = module_mod.ModelPack(net1=Simple3DNet().to(device), net2=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {
         "opt": {"targets": ["net1", "net2"], "class": "Adam", "lr": 1e-3, "weight_decay": 1e-4}
     }
@@ -409,7 +412,7 @@ def test_torch_advanced_optimizer_params(device, tensor_batch_3d):
 
 
 def test_torch_executor_to_numpy(device):
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     tensor = torch.randn(2, 3, device=device)
     array = executor.to_numpy(tensor)
 
@@ -422,7 +425,7 @@ def test_torch_executor_to_numpy(device):
 def test_torch_distributed_initialization_mock(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device, distributed=True)
+    executor = exec_mod.Executor(distributed=True)
     with patch("torch.distributed.is_initialized", return_value=True):
         with patch(
             "torch.nn.parallel.DistributedDataParallel", side_effect=lambda x, **kwargs: x
@@ -440,22 +443,22 @@ def test_torch_distributed_initialization_mock(device, tensor_batch_3d):
 
 def test_torch_empty_step_scheduling(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     op = TorchCounterOp(interval=10)
     algo = algo_mod.Algorithm(model, executor, {}, pipeline=[op])
 
     for i in range(10):
         metrics = algo.step(tensor_batch_3d)
-        assert op.execution_count == 1
+        assert op.count == 1
 
     metrics = algo.step(tensor_batch_3d)
     assert "counter/count" in metrics
-    assert op.execution_count == 2
+    assert op.count == 2
 
 
 def test_torch_batch_device_transfer(device):
     cpu_batch = data_mod.Batch(obs=torch.randn(2, 3, 4), extra={"meta": torch.randn(2, 3, 1)})
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     gpu_batch = cpu_batch.to(executor)
 
     assert gpu_batch.obs.device.type == torch.device(device).type
@@ -477,7 +480,7 @@ def test_torch_model_pack_getattr_proxy(device, tensor_batch_3d):
 
     native_net = MethodNet().to(device)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     ctx = executor.init(model, {})
     ctx = ctx.replace(batch=tensor_batch_3d)
     res = ctx.models.net.custom_call(tensor_batch_3d.obs["obs"], value=2.0)
@@ -488,7 +491,7 @@ def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
     net1 = Simple3DNet().to(device)
     net2 = Simple3DNet().to(device)
     model = module_mod.ModelPack(net1=net1, net2=net2)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
 
     optim_config = {"joint": {"targets": ["net1", "net2"], "class": "SGD", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
@@ -512,7 +515,7 @@ def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
 
 def test_torch_context_meta_update(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     ctx = executor.init(model, {})
 
     ctx.update_meta(info="test_info", val=123)
@@ -522,7 +525,7 @@ def test_torch_context_meta_update(device, tensor_batch_3d):
 
 def test_torch_objective_standalone_eval(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     obj = MSEObjective("eval_only")
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
     metrics = algo.step(tensor_batch_3d)
@@ -534,7 +537,7 @@ def test_torch_objective_standalone_eval(device, tensor_batch_3d):
 
 def test_torch_algorithm_params_access(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(model, executor, {}, [])
     assert hasattr(algo.ctx.models, "net")
     assert isinstance(algo.ctx.models.net, nn.Module)
@@ -550,7 +553,7 @@ def test_torch_batch_repr_no_crash(tensor_batch_3d):
 def test_torch_optimizer_zero_grad_behavior(device, tensor_batch_3d):
     net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=net)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "SGD"}})
     ctx = ctx.replace(batch=tensor_batch_3d)
     # Manually set some dummy grad
@@ -574,7 +577,7 @@ def test_torch_hard_update_logic(device, tensor_batch_3d):
             p.add_(1.0)
 
     model = module_mod.ModelPack(main=net_main, target=net_target)
-    executor = exec_mod.Executor(device=device)
+    executor = exec_mod.Executor()
     ctx = executor.init(model, {})
     ctx = ctx.replace(batch=tensor_batch_3d)
 
@@ -597,7 +600,7 @@ def test_torch_hard_update_logic(device, tensor_batch_3d):
 def test_torch_multi_step_optimization(device, tensor_batch_3d):
     """ """
     model = module_mod.ModelPack(net1=Simple3DNet().to(device), net2=Simple3DNet().to(device))
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {
         "opt_a": {"targets": ["net1"], "class": "SGD", "lr": 0.1},
         "opt_c": {"targets": ["net2"], "class": "SGD", "lr": 0.1},
@@ -614,8 +617,8 @@ def test_torch_multi_step_optimization(device, tensor_batch_3d):
 
     metrics = algo.step(tensor_batch_3d)
 
-    assert "grad_op/net1_loss/loss" in metrics
-    assert "grad_op/net2_loss/loss" in metrics
+    assert "optimize/net1_loss/loss" in metrics
+    assert "optimize/net2_loss/loss" in metrics
     assert not torch.equal(algo.ctx.models.net1.net.weight, wa_before)
     assert not torch.equal(algo.ctx.models.net2.net.weight, wc_before)
 
@@ -639,7 +642,7 @@ def test_torch_gradient_accumulation_simulation(device, tensor_batch_3d):
     nn.init.constant_(native_net.net.weight, 0.0)
 
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(device=device, compile=False)
+    executor = exec_mod.Executor(compile=False)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -684,5 +687,6 @@ def test_torch_batch_mask_broadcasting(device):
     obj = MSEObjective("test")
 
     loss, metrics = obj.compute(batch, model)
+    assert loss.shape == ()  # Scalar
     assert loss.shape == ()  # Scalar
     assert loss.shape == ()  # Scalar

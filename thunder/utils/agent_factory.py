@@ -2,52 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Type
+from typing import Any, Dict, Iterable, Optional, Tuple, Type
 
-import torch
-import torch.nn as nn
-
-from thunder.nn import *
-from thunder.nn.models import *
-from thunder.rl import *
-
-GLOBAL_ALGO_KEY = "GlobalAlgo"
-
-
-class ModelPack(dict):
-    """ """
-
-    def __init__(self, **kwargs: nn.Module):
-        super().__init__(kwargs)
-
-    def __getattr__(self, name: str) -> nn.Module:
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(f"'ModelPack' object has no attribute '{name}'")
-
-    def __setattr__(self, name: str, value: nn.Module):
-        self[name] = value
-
-    def to(self, device: torch.device):
-        """ """
-        for v in self.values():
-            if isinstance(v, torch.nn.Module):
-                v.to(device)
-        return self
-
-    def state_dict(self):
-        """ """
-        return {k: v.state_dict() for k, v in self.items() if isinstance(v, torch.nn.Module)}
-
-    def load_state_dict(self, state_dict):
-        for k, v in state_dict.items():
-            if k in self and isinstance(self[k], torch.nn.Module):
-                self[k].load_state_dict(v)
+from thunder.core import ModelPack
 
 
 @dataclass
-class AgentPack(dict):
+class AgentSpec(dict):
     agent: Any
     models: ModelPack
 
@@ -56,7 +17,6 @@ class AgentPack(dict):
 class AlgoEntry:
     name: str
     algo_cls: Type[Any]
-    param_builder: SpecBuilder
     default_model_name: str
 
 
@@ -74,11 +34,7 @@ def register_model(name: str, supported_algos: Optional[Iterable[str]] = None):
 
     def decorator(builder_cls: Type[ModelBuilder]):
         builder_instance = builder_cls()
-        algos = (
-            [algo_name.lower() for algo_name in supported_algos]
-            if supported_algos
-            else [GLOBAL_ALGO_KEY]
-        )
+        algos = [algo_name.lower() for algo_name in supported_algos]
         for algo in algos:
             key = (algo, name)
             if key in MODEL_REGISTRY:
@@ -100,7 +56,7 @@ def register_algo(name: str, algo_cls: Type[Any], default_model_name: str):
         default_model_name (str): _description_
     """
 
-    def decorator(param_builder: Type[SpecBuilder]):
+    def decorator(param_builder):
         algo_name = name.lower()
         ALGOS_REGISTRY[algo_name] = AlgoEntry(
             name=algo_name,
@@ -119,28 +75,7 @@ class ModelBuilder(ABC):
     """
 
     @abstractmethod
-    def build(
-        self,
-        env: Any,
-        cfg: Dict[str, Any],
-        algo_cfg: Dict[str, Any],
-        device: torch.device,
-        optimize_model: bool = True,
-        pretrained_model_path: Optional[str] = None,
-        extra_info: Optional[Dict[str, Any]] = None,
-    ) -> ModelPack:
-        raise NotImplementedError
-
-
-class SpecBuilder(ABC):
-    @abstractmethod
-    def build(
-        self,
-        env: Type[Any],
-        cfg: Dict[str, Any],
-        algo_cfg: Dict[str, Any],
-        extra_info: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    def build(self) -> ModelPack:
         raise NotImplementedError
 
 
@@ -156,26 +91,13 @@ class AgentFactory:
         env: Any,
         cfg: Dict[str, Any],
         algo_cfg: Dict[str, Any],
-        device: torch.device,
         optimize_model: bool = True,
         pretrained_model_path: Optional[str] = None,
         extra_info: Optional[Dict[str, Any]] = None,
-    ) -> AgentPack:
+    ) -> AgentSpec:
         """
         Creates an agent pack containing the agent, actor, and critic.
-
         Args:
-            algo_name: The name of the algorithm to create (e.g., "ppo").
-            env: The environment object, used to extract necessary dimensions and info.
-            cfg: General configuration dictionary.
-            algo_cfg: Algorithm-specific hyperparameters.
-            device: The torch device.
-            actor: An optional pre-existing actor module.
-            critic: An optional pre-existing critic module.
-            optimize_model: Flag to compile the models.
-            pretrained_model_path: Path to a pre-trained model.
-            extra_info: Dictionary for optional observation IDs.
-
         Returns:
             An AgentPack containing the instantiated agent, actor, and critic.
         """
@@ -187,7 +109,7 @@ class AgentFactory:
         # print((algo_name, model_factory_name))
         model_builder = MODEL_REGISTRY.get((algo_name, model_factory_name))
         if model_builder is None:
-            model_builder = MODEL_REGISTRY.get((GLOBAL_ALGO_KEY, model_factory_name))
+            model_builder = MODEL_REGISTRY.get(model_factory_name)
         if model_builder is None:
             raise ValueError(
                 f"Model factory '{model_factory_name}' not found for algo '{algo_name}'."
@@ -198,7 +120,6 @@ class AgentFactory:
                 env,
                 cfg,
                 algo_cfg,
-                device,
                 optimize_model,
                 pretrained_model_path,
                 extra_info,
@@ -207,7 +128,7 @@ class AgentFactory:
         else:
             models = self._model_cache[cache_key]
         agent_kwargs = algo_entry.param_builder.build(env, cfg, algo_cfg, extra_info)
-        agent_kwargs.update(models | {"device": device})
+        agent_kwargs.update()
         AgentClass = algo_entry.algo_cls
         agent = AgentClass(**agent_kwargs)
-        return AgentPack(agent=agent, models=models)
+        return AgentSpec(agent=agent, models=models)

@@ -2,18 +2,18 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, Optional
 
 from thunder.core import Algorithm, Executor, ModelPack, Operation
+from thunder.rl.buffer.torch import Buffer, Transition
+from thunder.utils import ArgBase
 
 
-class Agent(Algorithm, ABC):
-    def __init__(
-        self,
-        models: ModelPack,
-        executor: Optional[Executor] = None,
-        opt_config: Optional[Dict[str, Any]] = None,
-        pipeline: Optional[Iterable[Operation]] = None,
-    ):
-        super().__init__(models, executor, opt_config, pipeline)
+class Agent(Algorithm):
+    """_summary_
 
-    @abstractmethod
-    def interact(env):
-        raise NotImplementedError
+    Args:
+        Algorithm (_type_): _description_
+    """
+
+    def __init__(self, models: ModelPack, buffer: Buffer, executor: Optional[Executor] = None):
+        self.models = models
+        self.buffer = buffer
+        super().__init__(self.models, executor=executor)

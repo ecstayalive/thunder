@@ -24,17 +24,15 @@ class JaxExecutor:
 
     def __init__(
         self,
-        device: str = "gpu",
         precision: str = "fp32",
         distributed: bool = False,
         donate: bool = True,
+        device: Optional[str] = None,
     ):
-        if device == "cuda":
-            device = "gpu"
-        self.devices = jax.devices(device)
         self.precision = precision
         self.distributed = distributed
         self.donate = donate
+        self._devices = self.devices(device)
         self.compute_dtype = {"fp32": jnp.float32, "bf16": jnp.bfloat16, "fp16": jnp.float16}.get(
             precision, jnp.float32
         )
@@ -55,8 +53,7 @@ class JaxExecutor:
 
         mesh = None
         if self.distributed:
-            devices = self.devices
-            mesh = jax.sharding.Mesh(devices, axis_names=("data",))
+            mesh = jax.sharding.Mesh(self.devices(), axis_names=("data",))
             meta["mesh"] = mesh
             meta["data_sharding"] = jax.sharding.NamedSharding(
                 mesh, jax.sharding.PartitionSpec("data")
@@ -120,11 +117,6 @@ class JaxExecutor:
         )
         return metrics
 
-    def to_device(self, data: Any, device: Optional[jax.Device] = None):
-        if device is None:
-            device = self.devices[0]
-        return jax.device_put(data, device)
-
     @staticmethod
     def _jit_optimize(
         models: ModelPack,
@@ -172,57 +164,6 @@ class JaxExecutor:
         return metrics
 
     @staticmethod
-    def cond(predicate, fn, operand: ExecutionContext):
-        if isinstance(predicate, bool):
-            if predicate:
-                return fn(operand)
-            else:
-                return operand, {}
-        out_structure = jax.eval_shape(fn, operand)
-
-        def _merge_dict_struct(target_d, source_d):
-            if target_d is None:
-                return None
-            source_d = source_d or {}
-            return {
-                k: (
-                    source_d.get(k)
-                    if k in source_d
-                    else jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), v)
-                )
-                for k, v in target_d.items()
-            }
-
-        def _false_fn(operand):
-            ctx_struct, metrics_struct = out_structure
-            new_meta = _merge_dict_struct(ctx_struct.meta, operand.meta)
-            t_batch = ctx_struct.batch
-            s_batch = operand.batch
-            updates = {}
-            updates["obs"] = _merge_dict_struct(t_batch.obs, s_batch.obs)
-            updates["extra"] = _merge_dict_struct(t_batch.extra, s_batch.extra)
-            updates["next_obs"] = _merge_dict_struct(t_batch.next_obs, s_batch.next_obs)
-            for name in ["actions", "rewards", "dones", "mask"]:
-                t_val = getattr(t_batch, name)
-                s_val = getattr(s_batch, name)
-                if t_val is not None:
-                    updates[name] = (
-                        s_val
-                        if s_val is not None
-                        else jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), t_val)
-                    )
-                else:
-                    updates[name] = None
-            new_batch = s_batch.replace(**updates)
-            new_ctx = operand.replace(meta=new_meta, batch=new_batch)
-            dummy_metrics = jax.tree_util.tree_map(
-                lambda x: jnp.zeros(x.shape, x.dtype), metrics_struct
-            )
-            return new_ctx, dummy_metrics
-
-        return jax.lax.cond(predicate, fn, _false_fn, operand)
-
-    @staticmethod
     def jit(fn: Optional[Callable] = None, **kwargs):
         """ """
         if fn is None:
@@ -232,6 +173,23 @@ class JaxExecutor:
 
             return wrapper
         return jax.jit(fn, **kwargs)
+
+    @staticmethod
+    def devices(backend: Optional[str] = None):
+        return jax.devices(backend)
+
+    @staticmethod
+    def default_device(device: Optional[jax.Device | str] = None):
+        if isinstance(device, jax.Device):
+            return device
+        try:
+            return jax.devices(device)[0]
+        except RuntimeError:
+            return jax.devices()[0]
+
+    @staticmethod
+    def to_device(data: Any, device: Optional[jax.Device | str] = None):
+        return jax.device_put(data, JaxExecutor.default_device(device))
 
     @staticmethod
     def to_numpy(data: Any):

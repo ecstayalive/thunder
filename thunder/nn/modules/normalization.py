@@ -103,9 +103,7 @@ class RunningNorm1d(nn.Module):
         with torch.inference_mode(mode=False):
             self.running_mean = self.running_mean * w1 + batch_mean * w2
             self.running_var = self.running_var * w1 + batch_var * w2 + delta * w1 * w2
-            # std is not unbiased estimation
             self.running_std = torch.sqrt(self.running_var + self.eps)
-            # self.std = np.sqrt(self.var * tot_count / (tot_count - 1) + self.eps)
             self.num_data_tracked = total_data_size
 
     def extra_repr(self):

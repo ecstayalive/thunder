@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+from .executor import Executor
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
@@ -11,31 +14,18 @@ if TYPE_CHECKING:
 
 
 class Operation(ABC):
-    """Operation is stateless"""
+    """ """
 
-    def __init__(
-        self,
-        name: str = "op",
-        interval: int = 1,
-        condition: Optional[Callable[[ExecutionContext], bool]] = None,
-        **kwargs,
-    ):
+    def __init__(self, name: str = "operation", **kwargs):
         self.name = name
-        self.interval = interval
-        self.condition = condition or (lambda ctx: True)
         self.kwargs = kwargs
+        self._prefix = "" if not name else f"{name}/"
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
-        should_run = (ctx.step % self.interval == 0) & self.condition(ctx)
-
-        def _run_branch(ctx: ExecutionContext):
-            new_ctx, raw_m = self.forward(ctx)
-            prefix = f"{self.name}/"
-            m = {f"{prefix}{k}": v for k, v in raw_m.items()}
-            return new_ctx, m
-
-        return ctx.executor.cond(predicate=should_run, fn=_run_branch, operand=ctx)
+        ctx, metrics = self.forward(ctx)
+        metrics = {f"{self._prefix}{k}": v for k, v in metrics.items()}
+        return ctx, metrics
 
     @abstractmethod
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
@@ -54,24 +44,19 @@ class Objective(Operation):
     """
 
     def __init__(self, name: str = "objective", weight: float = 1.0, **kwargs):
-        super().__init__(name=name, interval=1, **kwargs)
+        super().__init__(name=name, **kwargs)
         self.weight = weight
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        should_run = (ctx.step % self.interval == 0) & self.condition(ctx)
-
-        def _run_branch(ctx: ExecutionContext):
-            loss, metrics = self.forward(ctx.batch, ctx.models)
-            return ctx, metrics
-
-        return ctx.executor.cond(predicate=should_run, fn=_run_branch, operand=ctx)
+        loss, metrics = self.forward(ctx.batch, ctx.models)
+        return ctx, metrics
 
     def forward(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
         loss, metrics = self.compute(batch, model)
         weighted_loss = self.weight * loss
         metrics = {
-            f"{self.name}/loss": loss,
-            f"{self.name}/weighted_loss": weighted_loss,
+            f"{self._prefix}loss": loss,
+            f"{self._prefix}weighted_loss": weighted_loss,
             **metrics,
         }
         return weighted_loss, metrics
@@ -90,6 +75,59 @@ class Objective(Operation):
         pass
 
 
+class Pipeline(Operation):
+    """_summary_
+    Args:
+    """
+
+    def __init__(self, pipeline: Iterable[Operation], name="pipeline", jit: bool = True, **kwargs):
+        super().__init__(name, **kwargs)
+        self.jit = jit
+        self.setup(pipeline)
+
+    def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
+        """ """
+        if self.jit:
+            ctx, metrics = self._jit_forward(ctx)
+        else:
+            ctx, metrics = self.forward(ctx)
+        return ctx, metrics
+
+    def forward(self, ctx: ExecutionContext):
+        return self._forward(ctx, self.pipeline, self._prefix)
+
+    @staticmethod
+    def _forward(ctx: ExecutionContext, pipeline: Tuple[Operation, ...], prefix: str):
+        metrics = {}
+        for op in pipeline:
+            ctx, m = op(ctx)
+            metrics.update(m)
+        metrics = {f"{prefix}{k}": v for k, v in metrics.items()}
+        return ctx, metrics
+
+    def setup(self, pipeline):
+        self.pipeline = tuple(pipeline)
+        self._jit_forward = Executor.jit(
+            partial(self._forward, pipeline=self.pipeline, prefix=self._prefix)
+        )
+
+    def insert(self, index: int, op: Operation):
+        pipeline = self.pipeline[:index] + (op,) + self.pipeline[index:]
+        self.setup(pipeline)
+
+    def remove(self, index: int):
+        pipeline = self.pipeline[:index] + self.pipeline[index + 1 :]
+        self.setup(pipeline)
+
+    def replace(self, index: int, op: Operation):
+        pipeline = self.pipeline[:index] + (op,) + self.pipeline[index + 1 :]
+        self.setup(pipeline)
+
+    def append(self, op: Operation):
+        pipeline = self.pipeline + (op,)
+        self.setup(pipeline)
+
+
 class OptimizeOp(Operation):
     """ """
 
@@ -98,10 +136,9 @@ class OptimizeOp(Operation):
         opt: str,
         objectives: List[Objective],
         max_grad_norm: float = 1.0,
-        name: str = "grad_op",
-        interval: int = 1,
+        name: str = "optimize",
     ):
-        super().__init__(name=name, interval=interval)
+        super().__init__(name=name)
         self.opt = opt
         self.objectives = objectives
         self.max_grad_norm = max_grad_norm

@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 
-@torch.compile(mode="max-autotune", fullgraph=True)
+@torch.compile(mode="reduce-overhead", fullgraph=True)
 def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     r"""Non-Linear activation function used in Capsule Network
 
@@ -24,6 +24,26 @@ def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     scale = norm / (1 + norm**2)
 
     return scale * input
+
+
+@torch.compile(mode="reduce-overhead", fullgraph=True)
+def inverse_softplus(input: Tensor) -> Tensor:
+    r"""Inverse softplus function
+    For details: https://github.com/pytorch/pytorch/issues/72759
+    Args:
+        input: input feature vectors
+
+    Returns:
+        The inverse softplus feature vectors
+
+    Examples:
+
+        >>> input = torch.clamp(torch.randn(1, 10, 8), min=0.1)
+        >>> output = inverse_softplus(input)
+        >>> print(output.shape)
+            torch.Size([1, 10, 8])
+    """
+    return input + torch.log(-torch.expm1(-input))
 
 
 @torch.compile

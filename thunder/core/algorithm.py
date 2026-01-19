@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple
+from abc import ABC
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
 
-from .context import ExecutionContext
 from .executor import Executor
+from .operation import Pipeline
 
 if TYPE_CHECKING:
     from .data import Batch
@@ -20,7 +19,7 @@ class Algorithm(ABC):
         models: ModelPack,
         executor: Optional[Executor] = None,
         optim_config: Optional[Dict[str, Any]] = None,
-        pipeline: Optional[Iterable[Operation]] = None,
+        pipeline: Optional[Pipeline] = None,
     ):
         self.models = models
         self.executor = executor if executor is not None else Executor()
@@ -38,21 +37,19 @@ class Algorithm(ABC):
         self.ctx = self.executor.init(self.models, optim_config)
         self.models = self.ctx.models
 
-    def setup_pipeline(self, pipeline: Iterable[Operation]) -> None:
+    def setup_pipeline(self, pipeline: Iterable[Operation], jit: bool = False) -> None:
         """_summary_
 
         Args:
             pipeline (Iterable[Operation]): _description_
         """
-        self.pipeline = pipeline
-        self._jit_step: Callable[[ExecutionContext], Tuple[ExecutionContext, Dict]] = Executor.jit(
-            partial(self._step, pipeline=tuple(self.pipeline))
-        )
+        if isinstance(pipeline, Pipeline):
+            self.pipeline = pipeline
+        else:
+            self.pipeline = Pipeline(pipeline, name="", jit=jit)
 
-    def step(self, batch: Batch, jit: bool = True) -> Dict[str, Any]:
+    def step(self, batch: Optional[Batch] = None) -> Dict[str, Any]:
         """_summary_
-        Args:
-            batch (Batch):
         Raises:
             RuntimeError:
         Returns:
@@ -62,19 +59,8 @@ class Algorithm(ABC):
             raise RuntimeError("Algorithm not built. Please call .build() first.")
         if self.pipeline is None:
             raise RuntimeError("No pipeline defined for the algorithm.")
-
-        self.ctx = self.ctx.replace(batch=batch)
-        if jit:
-            self.ctx, metrics = self._jit_step(self.ctx)
-        else:
-            self.ctx, metrics = self._step(self.ctx, tuple(self.pipeline))
+        if batch is not None:
+            self.ctx = self.ctx.replace(batch=batch)
+        self.ctx, metrics = self.pipeline(self.ctx)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
         return metrics
-
-    @staticmethod
-    def _step(ctx: ExecutionContext, pipeline: Tuple[Operation, ...]):
-        metrics = {}
-        for op in pipeline:
-            ctx, m = op(ctx)
-            metrics.update(m)
-        return ctx, metrics

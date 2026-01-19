@@ -1,9 +1,9 @@
 from typing import Any, Dict, Tuple
 
 import gymnasium as gym
+import numpy as np
 
-from .interface import EnvSpec
-from .loader import register_loader
+from .loader import EnvSpec, register_loader
 
 
 class GymnasiumSpec(EnvSpec):
@@ -15,24 +15,18 @@ class GymnasiumSpec(EnvSpec):
     vectorize_mode: str = "async"
 
 
-class GymEnvAdaptor(gym.Wrapper):
-    def __init__(self, env: gym.Env):
-        self.env: gym.Env = env
-
-    def step(self, action):
-        self.env.step(action)
-
-    @property
-    def unwrapped(self):
-        return self.env.unwrapped
+class GymnasiumAdaptor(gym.ObservationWrapper):
+    def observation(self, observation):
+        return {"policy": observation}
 
 
 @register_loader("gymnasium")
-def load_gym(spec: EnvSpec | GymnasiumSpec) -> gym.Env:
+def load_gym(spec: EnvSpec | GymnasiumSpec) -> gym.Env | gym.vector.VectorEnv:
     spec = GymnasiumSpec.parse(final=True)
     if spec.num_envs > 1:
-        env = gym.make_vec(spec.task, spec.num_envs, spec.vectorize_mode)
+        env = gym.make_vec(
+            spec.task, spec.num_envs, spec.vectorize_mode, render_mode=spec.render_mode
+        )
     else:
         env = gym.make(spec.task, render_mode=spec.render_mode)
-    # return GymEnvAdaptor(env)
-    return env
+    return GymnasiumAdaptor(env)
