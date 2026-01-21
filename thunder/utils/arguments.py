@@ -10,6 +10,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Type,
     Union,
     get_args,
     get_origin,
@@ -292,10 +293,14 @@ class ArgParseMeta(type):
 
 
 class ArgBase(metaclass=ArgParseMeta):
+    _args: List[str] = []
     _unknown_args: List[str] = []
+    _prefix: str = ""
 
     def __init__(self, **kwargs):
         configs = getattr(self.__class__, "_argparse_configs", {})
+        self._args = kwargs.pop("_args", [])
+        self._prefix = kwargs.pop("_prefix", "")
 
         nested_data = {}
         for key, value in kwargs.items():
@@ -321,11 +326,22 @@ class ArgBase(metaclass=ArgParseMeta):
                     (t for t in get_args(type_hint) if t is not type(None)), type_hint
                 )
             is_nested = isinstance(actual_type, type) and issubclass(actual_type, ArgBase)
+            child_prefix = ""
+            if is_nested:
+                flag_part = attr_name.replace("_", "-")
+                child_prefix = f"{self._prefix}{flag_part}."
             if attr_name in nested_data:
                 val = nested_data[attr_name]
                 if is_nested and isinstance(val, dict):
                     # Recursively instantiate the child class
+                    val["_args"] = self._args
+                    val["_prefix"] = child_prefix
                     setattr(self, attr_name, actual_type(**val))
+                elif is_nested and isinstance(val, ArgBase):
+                    # If it's already an object, just attach it
+                    val._args = self._args
+                    val._prefix = child_prefix
+                    setattr(self, attr_name, val)
                 else:
                     # Assign primitive directly
                     setattr(self, attr_name, copy.deepcopy(val))
@@ -334,7 +350,9 @@ class ArgBase(metaclass=ArgParseMeta):
                     if origin is Union and type(None) in get_args(type_hint):
                         setattr(self, attr_name, None)
                     else:
-                        setattr(self, attr_name, actual_type())
+                        setattr(
+                            self, attr_name, actual_type(_args=self._args, _prefix=child_prefix)
+                        )
                 elif attr_name in configs:
                     _, argparse_kwargs = configs[attr_name]
                     default = argparse_kwargs.get("default")
@@ -383,14 +401,20 @@ class ArgBase(metaclass=ArgParseMeta):
     ) -> "ArgBase":
         if parser is None:
             parser = cls.parser()
+        if args_list is None:
+            import sys
 
+            args_list = sys.argv[1:]
         unknown = []
         if final:
             args_ns = parser.parse_args(args_list)
         else:
             args_ns, unknown = parser.parse_known_args(args_list)
-        instance = cls(**vars(args_ns))
-        instance._unknown_args = unknown
+        init_kwargs = vars(args_ns)
+        init_kwargs["_args"] = args_list
+        init_kwargs["_prefix"] = ""
+        instance = cls(**init_kwargs)
+        instance._prefix = ""
         return instance
 
     def to_dict(self, recurse: bool = True) -> Dict[str, Any]:
@@ -408,3 +432,24 @@ class ArgBase(metaclass=ArgParseMeta):
     def to_namespace(self) -> argparse.Namespace:
         """ """
         return argparse.Namespace(**self.to_dict(recurse=False))
+
+    def to(self, target_cls: Type["ArgBase"], final: bool = False) -> "ArgBase":
+        """ """
+        prefix_str = f"--{self._prefix}" if self._prefix else "--"
+        relevant_args = []
+        raw_args = self._args
+        i = 0
+        while i < len(raw_args):
+            arg = raw_args[i]
+            if arg.startswith(prefix_str):
+                stripped = arg.replace(prefix_str, "--", 1)
+                relevant_args.append(stripped)
+                i += 1
+                if i < len(raw_args) and not raw_args[i].startswith("-"):
+                    relevant_args.append(raw_args[i])
+                    i += 1
+            else:
+                i += 1
+        parser = target_cls.parser()
+        parser.set_defaults(**self.to_dict(recurse=False))
+        return target_cls.parse(relevant_args, parser=parser, final=final)

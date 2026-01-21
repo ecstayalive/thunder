@@ -3,10 +3,10 @@ from typing import Any, Dict, Tuple
 import gymnasium as gym
 import numpy as np
 
-from .loader import EnvSpec, register_loader
+from .loader import EnvLoaderSpec, register_loader
 
 
-class GymnasiumSpec(EnvSpec):
+class GymnasiumLoaderSpec(EnvLoaderSpec):
     framework: str = "gymnasium"
     task: str = "CartPole-v1"
     num_envs: int = 1
@@ -21,8 +21,8 @@ class GymnasiumAdaptor(gym.ObservationWrapper):
 
 
 @register_loader("gymnasium")
-def load_gym(spec: EnvSpec | GymnasiumSpec) -> gym.Env | gym.vector.VectorEnv:
-    spec = GymnasiumSpec.parse(final=True)
+def load_gym(spec: EnvLoaderSpec | GymnasiumLoaderSpec) -> gym.Env | gym.vector.VectorEnv:
+    spec = spec.to(GymnasiumLoaderSpec, final=True)
     if spec.num_envs > 1:
         env = gym.make_vec(
             spec.task, spec.num_envs, spec.vectorize_mode, render_mode=spec.render_mode

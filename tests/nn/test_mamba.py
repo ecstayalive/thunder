@@ -1,6 +1,6 @@
 import torch
 
-from thunder.nn import Mamba2Block, MambaBlock
+from thunder.nn.torch import Mamba2Block, MambaBlock
 
 
 def test_mamba_forward():

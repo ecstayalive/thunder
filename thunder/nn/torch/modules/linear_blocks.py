@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from thunder.nn.mapping import ACTIVATION_CLS_NAME
+from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
 
 from .activation import Sin
 

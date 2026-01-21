@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 import thunder.nn.ops as ops
-from thunder.nn.mapping import ACTIVATION_CLS_NAME
+from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
 
 
 class MambaBlock(nn.Module):

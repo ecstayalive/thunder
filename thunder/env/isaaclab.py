@@ -4,10 +4,10 @@ import gymnasium as gym
 
 from thunder.utils import ArgsOpt
 
-from .loader import EnvSpec, register_loader
+from .loader import EnvLoaderSpec, register_loader
 
 
-class IsaacLabEnvSpec(EnvSpec):
+class IsaacLabLoaderSpec(EnvLoaderSpec):
     """ """
 
     framework: str = "isaaclab"
@@ -33,13 +33,11 @@ class IsaacLabEnvSpec(EnvSpec):
 
 
 @register_loader("isaaclab")
-def load_isaaclab(spec: EnvSpec | IsaacLabEnvSpec) -> gym.Env:
+def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> gym.Env:
     """ """
     from isaaclab.app import AppLauncher
 
-    parser = IsaacLabEnvSpec.parser()
-    parser.set_defaults(**spec.to_dict(recurse=False))
-    spec = IsaacLabEnvSpec.parse(spec._unknown_args, parser=parser, final=True)
+    spec = spec.to(IsaacLabLoaderSpec, final=True)
     app_launcher = AppLauncher(spec.to_namespace())
     import gymnasium
     import isaaclab_tasks

@@ -103,7 +103,6 @@ class TorchExecutor:
             metrics.update(m)
         return total_loss, metrics
 
-    # @torch._dynamo.disable
     def optimize(
         self,
         ctx: ExecutionContext,

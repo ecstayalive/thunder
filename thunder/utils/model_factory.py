@@ -1,4 +1,4 @@
-from thunder.nn.models import recursive_instantiate
+from thunder.nn.torch.models import recursive_instantiate
 
 from .agent_factory import ModelBuilder
 

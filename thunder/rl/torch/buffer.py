@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from thunder.core.data import Batch
-from thunder.rl.func.torch import get_trajectory_lengths
+from thunder.rl.torch.functional import get_trajectory_lengths
 
 
 @dataclass(slots=True, init=False)

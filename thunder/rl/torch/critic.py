@@ -4,7 +4,7 @@ from typing import Iterator, Optional, Tuple
 import torch
 from torch import nn
 
-from thunder.nn import LinearBlock, RunningNorm1d
+from thunder.nn.torch import LinearBlock, RunningNorm1d
 
 
 class Critic(ABC, nn.Module): ...

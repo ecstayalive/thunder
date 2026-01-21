@@ -10,7 +10,7 @@ from thunder.utils import ArgBase
 _LOADER_REGISTRY: Dict[str, Callable[[Any], gym.Env]] = {}
 
 
-class EnvSpec(ArgBase):
+class EnvLoaderSpec(ArgBase):
     """
     Args:
 
@@ -142,7 +142,7 @@ def register_loader(framework: str):
     return decorator
 
 
-def make_env(spec: EnvSpec, wrappers: Optional[List[Type[ThunderWrapper]]] = None):
+def make_env(spec: EnvLoaderSpec, wrappers: Optional[List[Type[ThunderWrapper]]] = None):
     """ """
     if spec.framework not in _LOADER_REGISTRY:
         import importlib

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ContextManager, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .data import Batch
@@ -27,6 +28,33 @@ class OptimGroup:
     targets: Tuple[str, ...]
     optimizer: Any
     scheduler: Optional[Any] = None
+
+
+@dataclass(slots=True)
+class Manager:
+    """
+    Handles Mixed Precision AND Distributed Contexts.
+    """
+
+    _context_manager: ContextManager
+    compute_dtype: Any
+    device: Any
+
+    is_distributed: bool = False
+    rank: int = 0
+    world_size: int = 1
+    mesh: Any = None
+
+    def __enter__(self):
+        """Enter the Mesh context for `jax`, enter the Autocast context for torch"""
+        return self._context_manager.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._context_manager.__exit__(exc_type, exc_val, exc_tb)
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
 
 
 @dataclass(slots=True)

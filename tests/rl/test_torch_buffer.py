@@ -34,7 +34,7 @@ import thunder.core.data as data_mod
 import thunder.core.executor as exec_mod
 import thunder.core.module as module_mod
 import thunder.core.operation as op_mod
-from thunder.rl.buffer.torch import Buffer, Transition
+from thunder.rl.torch.buffer import Buffer, Transition
 
 
 class TestBuffer:

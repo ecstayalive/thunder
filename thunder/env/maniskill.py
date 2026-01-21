@@ -1,7 +1,7 @@
-from .loader import EnvSpec, ThunderWrapper, register_loader
+from .loader import EnvLoaderSpec, ThunderWrapper, register_loader
 
 
-class ManiSkillSpec(EnvSpec):
+class ManiSkillLoaderSpec(EnvLoaderSpec):
     framework: str = "maniskill"
     task: str = "PickCube-v1"
     num_envs: int = 1
@@ -11,9 +11,9 @@ class ManiSkillSpec(EnvSpec):
 
 
 @register_loader("maniskill")
-def load_maniskill(spec: EnvSpec | ManiSkillSpec) -> ThunderWrapper:
+def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderWrapper:
     import gymnasium as gym
     import mani_skill.envs
 
-    spec = ManiSkillSpec().parse(final=True)
+    spec = spec.to(ManiSkillLoaderSpec, final=True)
     return gym.make(spec.task, num_envs=spec.num_envs, obs_mode=spec.obs_mode)

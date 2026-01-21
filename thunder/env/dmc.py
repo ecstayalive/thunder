@@ -1,11 +1,11 @@
 from typing import Any, Dict, Tuple
 
-import gymnasium
+import gymnasium as gym
 
-from .loader import EnvSpec, register_loader
+from .loader import EnvLoaderSpec, register_loader
 
 
-class DmcSpec(EnvSpec):
+class DmcLoaderSpec(EnvLoaderSpec):
     """ """
 
     framework: str = "dmc"
@@ -14,27 +14,17 @@ class DmcSpec(EnvSpec):
     headless: bool = False
 
 
-class DmcAdapter(gymnasium.Env):
+class DmcAdapter(gym.ObservationWrapper):
     """ """
 
-    def __init__(self, env: gymnasium.Env):
-        self.env = env
-
-    def reset(self) -> Tuple[Any, Dict]:
-        return self.env.reset()
-
-    def step(self, action: Any) -> Tuple[Any, Any, Any, Any, Dict]:
-        return self.env.step(action)
-
-    @property
-    def unwrapped(self) -> gymnasium.Env:
-        return self.env.unwrapped
+    def observation(self, observation):
+        return {"policy": observation}
 
 
 @register_loader("dmc")
-def load_dmc(spec: DmcSpec | EnvSpec) -> DmcAdapter:
+def load_dmc(spec: DmcLoaderSpec | EnvLoaderSpec) -> DmcAdapter:
     """ """
-    spec = DmcSpec().parse(final=True)
+    spec = spec.to(DmcLoaderSpec, final=True)
     from dm_control import suite
 
     domain, task = spec.task.split("_", 1)

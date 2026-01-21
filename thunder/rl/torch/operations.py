@@ -1,10 +1,89 @@
-import dataclasses
-from typing import Any, Tuple
+from typing import Any
 
 import torch
+import torch.nn as nn
 
-from thunder.core import Batch, ExecutionContext, Operation
-from thunder.rl.func.torch import get_trajectory_lengths
+from thunder.core import Batch, ExecutionContext, ModelPack, Objective, Operation
+
+from .functional import get_trajectory_lengths
+
+
+class SIGRegObj(Objective):
+    def __init__(self, name="sigreg", weight=1):
+        super().__init__(name, weight)
+
+    def compute(self, batch: Batch, model: ModelPack): ...
+
+
+class LeJepaObjective(Objective):
+    def __init__(self, name="lejepa", weight=1):
+        super().__init__(name, weight)
+
+    def compute(self, batch: Batch, model: ModelPack):
+        return 0.0, {}
+
+
+class VicReg(Objective):
+    def __init__(self, name="vic_reg", weight=1, **kwargs):
+        super().__init__(name, weight)
+
+    def compute(self, batch: Batch, model: ModelPack):
+        return 0.0, {}
+
+
+class LambdaValueOp(Operation):
+    def __init__(self, name="lambda_value_op"):
+        super().__init__(name=name)
+
+    def forward(self, ctx: ExecutionContext):
+        return ctx, {}
+
+
+class GaeOp(Operation):
+    def __init__(self, name="gae_op"):
+        super().__init__(name=name)
+
+    def forward(self, ctx: ExecutionContext):
+        batch: Batch = ctx.batch
+        return ctx, {}
+
+
+class SoftUpdateOp(Operation):
+    def __init__(self, source: str, target: str, tau: float, name="soft_update_op"):
+        super().__init__(name)
+        self.source = source
+        self.target = target
+        self.tau = tau
+
+    def forward(self, ctx: ExecutionContext):
+        with torch.inference_mode():
+            models: ModelPack = ctx.models
+            source: nn.Module = models.get(self.source)
+            target: nn.Module = models.get(self.target)
+            for tgt, src in zip(target.parameters(), source.parameters(), strict=True):
+                tgt.data.mul_(1 - self.tau).add_(src.data, alpha=self.tau)
+        return ctx, {}
+
+
+class HardUpdateOp(Operation):
+    def __init__(
+        self,
+        source: str,
+        target: str,
+        name="hard_update_op",
+    ):
+        super().__init__(name)
+        self.source = source
+        self.target = target
+
+    def forward(self, ctx: ExecutionContext):
+        with torch.inference_mode():
+            models: ModelPack = ctx.models
+            source: nn.Module = models.get(self.source)
+            target: nn.Module = models.get(self.target)
+            for tgt, src in zip(target.parameters(), source.parameters(), strict=True):
+                tgt.data.copy_(src.data)
+        return ctx, {}
 
 
 class SplitTrajOp(Operation):
@@ -113,5 +192,7 @@ class FixShapeSplitTrajOp(Operation):
             padding = torch.zeros((target_batch_size, mask_pad), dtype=torch.bool, device=device)
             mask_subset = torch.cat([mask_subset, padding], dim=1)
         ctx.batch = ctx.batch.replace(mask=mask_subset)
+
+        return ctx, {}
 
         return ctx, {}

@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-from thunder.nn import LinearBlock
+from thunder.nn.torch import LinearBlock
 
 
 class RepresentationModel(nn.Module):

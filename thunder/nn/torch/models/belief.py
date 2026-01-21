@@ -3,9 +3,9 @@ from typing import Iterator, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from thunder.nn.functional import position_embedding_2d
-from thunder.nn.modules import LinearBlock, _ConvNdBlock
-from thunder.nn.modules.attention import *
+from thunder.nn.torch.functional import position_embedding_2d
+from thunder.nn.torch.modules import LinearBlock, _ConvNdBlock
+from thunder.nn.torch.modules.attention import *
 
 
 class Perception(nn.Module):

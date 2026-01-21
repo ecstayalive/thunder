@@ -6,7 +6,7 @@ import torch.distributions as distributions
 import torch.nn as nn
 import torch.nn.functional as F
 
-from thunder.nn.functional import inverse_softplus
+from thunder.nn.torch.functional import inverse_softplus
 
 
 class Distributions(nn.Module):
