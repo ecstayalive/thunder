@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 
-def SIGReg(x: torch.Tensor, global_step, num_slices: int = 256):
+def sig_reg(x: torch.Tensor, global_step, num_slices: int = 256):
     """Sketched Isotropic Gaussian Regularization (SIGReg)
     For Details:
         http://arxiv.org/abs/2511.08544

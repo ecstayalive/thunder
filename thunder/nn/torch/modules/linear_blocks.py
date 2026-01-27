@@ -36,7 +36,7 @@ class LinearBlock(nn.Module):
         in_features: int,
         out_features: int,
         hidden_features: Iterator[int] = None,
-        activation: str = "softsign",
+        activation: str = "mish",
         activate_output: bool = False,
         device=None,
         dtype=None,
@@ -152,5 +152,4 @@ class SirenBlock(nn.Module):
         return self.siren_tail(input)
 
     def extra_repr(self) -> str:
-        return f"(siren_head): Linear(in_features={self.arch[0]}, out_features={self.arch[1]}, bias=True)"
         return f"(siren_head): Linear(in_features={self.arch[0]}, out_features={self.arch[1]}, bias=True)"

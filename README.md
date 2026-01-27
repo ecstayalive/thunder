@@ -14,7 +14,9 @@ Thunder is a package that aims to simplify the process of creating and modifying
 
 ### Executor && Module
 
-An Executor refers to the backend implementation for a specific architecture (e.g., JAX, Torch). For instance, model definition, execution flow, and optimization processes differ entirely between the JAX and Torch backends. Therefore, we require a separately implemented Executor to provide a consistent API interface for common operations. The same applies to Modules. In JAX, when defining neural networks, we must inherit from `flax.nnx.Module`, whereas in PyTorch, we must inherit from `torch.nn.Module`. The differences between the two are substantial. For instance, when implementing algorithms using JAX, we must handle state management with extreme care. However, this is entirely unnecessary in the `PyTorch` backend. These differences necessitate defining Modules separately for each architecture to achieve consistency. Nevertheless, we want users to define neural networks freely according to their preferences. Therefore, instead of inheriting from our defined `Module`, we directly use the container `ModelPack` for encapsulation.
+An Executor refers to the backend implementation for a specific architecture (e.g., JAX, Torch). For instance, model definition, execution flow, and optimization processes differ entirely between the JAX and Torch backends. Therefore, we require a separately implemented Executor to provide a consistent API interface for common operations. The same applies to Modules. In JAX, when defining neural networks, we must inherit from `flax.nnx.Module`, whereas in PyTorch, we must inherit from `torch.nn.Module`. The differences between the two are substantial. For instance, when implementing algorithms using JAX, we must handle state management with extreme care. However, this is entirely unnecessary in the `PyTorch` backend. These differences necessitate defining Modules separately for each architecture to achieve consistency. At the same time, we want users to define neural networks freely according to their preferences. Therefore, instead of inheriting from our defined `Module`, we directly use the container `ModelPack` for encapsulation.
+
+**`ExecutionContext`** is created by `Executor`. It is a built-in type with which all `Operation` interact. Simultaneously, `ExecutionContext` is registered as a `pytree`, enabling the backend to recognize it.
 
 ### Operation
 
@@ -49,38 +51,51 @@ These three are the most common special **`Operation`**.
 
 Finally, after all this work, we've built the `Algorithm`. The algorithm internally maintains a `Pipeline`, which must implement a `step` function. The `step` function executes the `Pipeline` once. The entire pipeline interacts with the algorithm's `ExecutionContext`, returning both the `ExecutionContext` and a dictionary. The new `ExecutionContext` contains the effects after all operations have completed, while the dictionary holds user-defined debug information.
 
+**`Agent`** refers to an intelligent entity capable of autonomously perceiving its environment and taking actions to achieve objectives. Agents frequently appear in reinforcement learning, robotics, and large language model (LLM) domains. Within `Thunder`, an agent comprises models and a strategy that defines how it interacts with its environment. Concurrently, as an algorithm, it internally holds a pipeline that specifies how a agent should learn.
+
 For example, we want to implement a basic PPO algorithm.
 - First, we need to define a model.
   ```python
   # For demonstration, we've simplified the creation process.
   models = ModelPack(actor=actor, critic=critic)
+  buffer = Buffer()
   ```
 - Then we create the algorithm class and define the optimizer.
   ```python
   # For demonstration, we've simplified the creation process.
-  algo = Algorithm(models)
-  algo.build({"opt":{"targets": ["actor", "critic"], "class": "Adam ", "lr": 1e-4}})
+  agent = Agent(models, buffer=buffer)
+  agent.build({"opt":{"targets": ["actor", "critic"], "class": "Adam ", "lr": 1e-4}})
   ```
 - Then setup the pipeline
   ```python
   # For demonstration, we've simplified the creation process.
-  algo.setup_pipeline([
-    InteractOp(...),
-    MiniBathTrain(..., pipeline=[
-        SplitTraj(...),
-        OptimizeOp("opt", [SurrogateLoss(),...])
-        ])
-    ])
+  agent.setup_pipeline(
+    [
+      Rollout(env, agent),  # Interact with the environment to collect data
+      OptimizeLoop(
+          BufferLoader(agent.buffer),
+          Pipeline(
+              [
+                SplitTraj(),
+                OptimizeOp("opt", [SurrogateLoss()])
+              ],
+              jit=True,
+          ),
+      ),
+      ClearBuffer(agent.buffer),
+    ]
+  )
   ```
 
-Next, you can use the `step` function to run your algorithm. Although we've simplified the workflow between models and operations here, the general process is as described above. For more tutorials, please refer to the [examples]() or [tutorials]() we provide.
+Next, you can use the `step` function to run your algorithm. Although we've simplified the workflow between models and operations here, the general process is as described above. For more tutorials, please refer to the [examples](./examples/) or [tutorials]() we provide.
 
 ## The Thunder philosophy
 - Seeking Order in Chaos, Finding Truth in Phenomena
-- Composition over Inheritance
+- Maintain good performance while preserving elegance
+- Ideas are cheap, show me the mathematics and the code
+- User experience over developer coding skills
 - Code should be easy to read and understand
 - Prefer duplicating code over a bad abstraction
-- Maintain good performance while preserving elegance
 
 ## Welcome to Thunder Discussion
 

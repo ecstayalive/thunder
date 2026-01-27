@@ -4,7 +4,7 @@ import gymnasium as gym
 
 from thunder.utils import ArgsOpt
 
-from .loader import EnvLoaderSpec, register_loader
+from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
 
 
 class IsaacLabLoaderSpec(EnvLoaderSpec):
@@ -33,7 +33,7 @@ class IsaacLabLoaderSpec(EnvLoaderSpec):
 
 
 @register_loader("isaaclab")
-def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> gym.Env:
+def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnvWrapper:
     """ """
     from isaaclab.app import AppLauncher
 
@@ -54,4 +54,4 @@ def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> gym.Env:
     if spec.distributed:
         cfg.sim.device = f"cuda:{app_launcher.local_rank}"
     env = gymnasium.make(spec.task, cfg=cfg)
-    return env
+    return ThunderEnvWrapper(env)

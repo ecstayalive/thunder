@@ -2,7 +2,7 @@ from typing import Any, Dict, Tuple
 
 import gymnasium as gym
 
-from .loader import EnvLoaderSpec, register_loader
+from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
 
 
 class DmcLoaderSpec(EnvLoaderSpec):
@@ -14,7 +14,7 @@ class DmcLoaderSpec(EnvLoaderSpec):
     headless: bool = False
 
 
-class DmcAdapter(gym.ObservationWrapper):
+class DmcAdapter(ObservationWrapper):
     """ """
 
     def observation(self, observation):

@@ -1,9 +1,15 @@
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 
-from .loader import EnvLoaderSpec, register_loader
+from thunder.utils import ArgBase
+
+from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
+
+
+class GymVecLoaderSpec(ArgBase):
+    autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.NEXT_STEP
 
 
 class GymnasiumLoaderSpec(EnvLoaderSpec):
@@ -13,20 +19,27 @@ class GymnasiumLoaderSpec(EnvLoaderSpec):
     num_agents: int = 1
     render_mode: str = "human"
     vectorize_mode: str = "async"
+    vector_kwargs: Optional[GymVecLoaderSpec] = None
 
 
-class GymnasiumAdaptor(gym.ObservationWrapper):
+class GymnasiumAdaptor(ObservationWrapper):
     def observation(self, observation):
         return {"policy": observation}
 
 
 @register_loader("gymnasium")
-def load_gym(spec: EnvLoaderSpec | GymnasiumLoaderSpec) -> gym.Env | gym.vector.VectorEnv:
-    spec = spec.to(GymnasiumLoaderSpec, final=True)
+def load_gym(spec: EnvLoaderSpec | GymnasiumLoaderSpec) -> GymnasiumAdaptor:
+    spec: GymnasiumLoaderSpec = spec.to(GymnasiumLoaderSpec, final=True)
     if spec.num_envs > 1:
         env = gym.make_vec(
-            spec.task, spec.num_envs, spec.vectorize_mode, render_mode=spec.render_mode
+            spec.task,
+            spec.num_envs,
+            spec.vectorize_mode,
+            render_mode=spec.render_mode,
+            vector_kwargs=spec.vector_kwargs.to_dict(),
         )
     else:
         env = gym.make(spec.task, render_mode=spec.render_mode)
-    return GymnasiumAdaptor(env)
+    env = GymnasiumAdaptor(env)
+    env.autoreset_mode = spec.vector_kwargs.autoreset_mode
+    return env

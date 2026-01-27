@@ -80,10 +80,11 @@ class Pipeline(Operation):
     Args:
     """
 
-    def __init__(self, pipeline: Iterable[Operation], name="pipeline", jit: bool = True, **kwargs):
+    def __init__(self, pipeline: Iterable[Operation], name="pipeline", jit: bool = False, **kwargs):
         super().__init__(name, **kwargs)
         self.jit = jit
-        self.setup(pipeline)
+        self.pipeline = list(pipeline)
+        self.setup()
 
     def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
@@ -94,7 +95,7 @@ class Pipeline(Operation):
         return ctx, metrics
 
     def forward(self, ctx: ExecutionContext):
-        return self._forward(ctx, self.pipeline, self._prefix)
+        return self._forward(ctx, tuple(self.pipeline), self._prefix)
 
     @staticmethod
     def _forward(ctx: ExecutionContext, pipeline: Tuple[Operation, ...], prefix: str):
@@ -105,27 +106,35 @@ class Pipeline(Operation):
         metrics = {f"{prefix}{k}": v for k, v in metrics.items()}
         return ctx, metrics
 
-    def setup(self, pipeline):
-        self.pipeline = tuple(pipeline)
+    def setup(self):
         self._jit_forward = Executor.jit(
-            partial(self._forward, pipeline=self.pipeline, prefix=self._prefix)
+            partial(self._forward, pipeline=tuple(self.pipeline), prefix=self._prefix)
         )
 
+    def __iter__(self):
+        return iter(self.pipeline)
+
+    def __len__(self):
+        return len(self.pipeline)
+
+    def __getitem__(self, index):
+        return self.pipeline[index]
+
+    def __setitem__(self, index, value):
+        self.pipeline[index] = value
+        self.setup()
+
     def insert(self, index: int, op: Operation):
-        pipeline = self.pipeline[:index] + (op,) + self.pipeline[index:]
-        self.setup(pipeline)
+        self.pipeline.insert(index, op)
+        self.setup()
 
     def remove(self, index: int):
-        pipeline = self.pipeline[:index] + self.pipeline[index + 1 :]
-        self.setup(pipeline)
-
-    def replace(self, index: int, op: Operation):
-        pipeline = self.pipeline[:index] + (op,) + self.pipeline[index + 1 :]
-        self.setup(pipeline)
+        self.pipeline.pop(index)
+        self.setup()
 
     def append(self, op: Operation):
-        pipeline = self.pipeline + (op,)
-        self.setup(pipeline)
+        self.pipeline.append(op)
+        self.setup()
 
 
 class OptimizeOp(Operation):

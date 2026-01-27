@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-import thunder.nn.ops as ops
+import thunder.nn.torch.ops as ops
 from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
 
 

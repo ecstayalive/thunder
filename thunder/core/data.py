@@ -38,9 +38,15 @@ class Batch:
         if name in self.__class__.__dataclass_fields__:
             object.__setattr__(self, name, value)
         else:
-            # if not hasattr(self, "extra"):
-            #     object.__setattr__(self, "extra", {})
             self.extra[name] = value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """ """
+        setattr(self, key, value)
+
+    def __getitem__(self, key: str) -> Any:
+        """ """
+        return getattr(self, key)
 
     def __dir__(self):
         """ """
@@ -78,6 +84,8 @@ class Batch:
                 return f"Arr{tuple(v.shape)}"
             if isinstance(v, dict):
                 return f"Dict[{len(v)}]"
+            if isinstance(v, (list, tuple)):
+                return f"{type(v).__name__}[{len(v)}]"
             return str(v)
 
         core = []
@@ -107,33 +115,49 @@ class Batch:
         return replace(self, **core_changes)
 
 
-def _flatten_batch(batch: Batch):
-    core_fields = [f.name for f in fields(batch) if f.name != "extra"]
-    core_values = [getattr(batch, f) for f in core_fields]
-    extra_keys = sorted(batch.extra.keys())
-    extra_values = [batch.extra[k] for k in extra_keys]
-    children = tuple(core_values + extra_values)
-    aux_data = (tuple(core_fields), tuple(extra_keys))
-    return children, aux_data
-
-
-def _unflatten_batch(aux_data, children):
-    core_names, extra_keys = aux_data
-    n_core = len(core_names)
-    core_vals = children[:n_core]
-    extra_vals = children[n_core:]
-    init_kwargs = dict(zip(core_names, core_vals))
-    extra_dict = dict(zip(extra_keys, extra_vals))
-    return Batch(extra=extra_dict, **init_kwargs)
-
-
 if _BACKEND == "torch":
     import torch.utils._pytree as pytree
+
+    def _flatten_batch(batch: Batch):
+        core_fields = [f.name for f in fields(batch) if f.name != "extra"]
+        core_values = [getattr(batch, f) for f in core_fields]
+        extra_keys = sorted(batch.extra.keys())
+        extra_values = [batch.extra[k] for k in extra_keys]
+        children = tuple(core_values + extra_values)
+        aux_data = (tuple(core_fields), tuple(extra_keys))
+        return children, aux_data
+
+    def _unflatten_batch(children, aux_data):
+        core_names, extra_keys = aux_data
+        n_core = len(core_names)
+        core_vals = children[:n_core]
+        extra_vals = children[n_core:]
+        init_kwargs = dict(zip(core_names, core_vals))
+        extra_dict = dict(zip(extra_keys, extra_vals))
+        return Batch(extra=extra_dict, **init_kwargs)
 
     pytree.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)
 
 if _BACKEND == "jax":
     import jax
+
+    def _flatten_batch(batch: Batch):
+        core_fields = [f.name for f in fields(batch) if f.name != "extra"]
+        core_values = [getattr(batch, f) for f in core_fields]
+        extra_keys = sorted(batch.extra.keys())
+        extra_values = [batch.extra[k] for k in extra_keys]
+        children = tuple(core_values + extra_values)
+        aux_data = (tuple(core_fields), tuple(extra_keys))
+        return children, aux_data
+
+    def _unflatten_batch(aux_data, children):
+        core_names, extra_keys = aux_data
+        n_core = len(core_names)
+        core_vals = children[:n_core]
+        extra_vals = children[n_core:]
+        init_kwargs = dict(zip(core_names, core_vals))
+        extra_dict = dict(zip(extra_keys, extra_vals))
+        return Batch(extra=extra_dict, **init_kwargs)
 
     jax.tree_util.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)
 

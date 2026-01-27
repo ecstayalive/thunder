@@ -9,12 +9,12 @@ import torch.nn.functional as F
 from thunder.nn.torch.functional import inverse_softplus
 
 
-class Distributions(nn.Module):
+class NeuralDistribution(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
 
-class Normal(Distributions):
+class Normal(NeuralDistribution):
     def __init__(
         self,
         in_features: int,
@@ -55,7 +55,7 @@ class Normal(Distributions):
         return distributions.Normal(mean, std)
 
 
-class ConsistentNormal(Distributions):
+class ConsistentNormal(NeuralDistribution):
     def __init__(
         self,
         in_features: int,

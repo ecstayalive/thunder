@@ -22,12 +22,16 @@ class OptimGroup:
         params:
         optimizer: `nnx.Optimizer` for jax, `torch.optim.Optimizer` for torch
         scheduler: learning rate scheduler, None for `jax`
+        grad_scaler: The scaler object (optax.amp.DynamicScale or torch.cuda.amp.GradScaler)
+        scaler_state: The dynamic state of the scaler (JAX only, None for Torch)
     """
 
     name: str
     targets: Tuple[str, ...]
     optimizer: Any
     scheduler: Optional[Any] = None
+    # grad_scaler: Optional[Any] = None
+    # scaler_state: Optional[Any] = None
 
 
 @dataclass(slots=True)
@@ -74,6 +78,7 @@ class ExecutionContext:
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
     executor: Executor
+    # manager: Manager
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:

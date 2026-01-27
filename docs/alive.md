@@ -26,7 +26,7 @@ $$
 $$
 \begin{align}
 \mathbb{E}_{q(s)} \left[ \ln(\frac{p(s|o) p(o)}{q(s)}) \right] &= -D_{KL}(q(s) || p(s|o)) + \mathbb{E}_{q(s)} \left[ \ln(p(o)) \right] \\
-&= -D_{KL}(q(s)||p(s|o)) + \int p(s) \ln(p(o)) ds \\
+&= -D_{KL}(q(s)||p(s|o)) + \int q(s) \ln(p(o)) ds \\
 &= -D_{KL}(q(s)||p(s|o)) + \ln(p(o))
 \end{align}
 $$

@@ -1,11 +1,11 @@
-from abc import abstractmethod
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
 
 from thunder.core import ThunderModule
-from thunder.nn.torch.distributions import Distributions as Dist
+from thunder.nn.torch.distributions import NeuralDistribution
+from thunder.nn.torch.models import Represent
 
 from ..types import ActorStep
 
@@ -13,10 +13,10 @@ from ..types import ActorStep
 class Actor(ThunderModule):
     """ """
 
-    def __init__(self, backbone: nn.Module, dist: Dist):
+    def __init__(self, represent: Represent, decoder: NeuralDistribution):
         super().__init__()
-        self.backbone = backbone
-        self.dist = dist
+        self.represent = represent
+        self.decoder = decoder
 
     def reset(self, indices: Optional[Sequence[int]] = None):
         """
@@ -34,10 +34,10 @@ class Actor(ThunderModule):
         backbones_kwargs=None,
         dist_kwargs=None,
     ):
-        embedding, carry = self.backbone(
+        embedding, carry = self.represent(
             embedding, carry, **backbones_kwargs if backbones_kwargs is not None else {}
         )
-        dist = self.dist(embedding, **dist_kwargs if dist_kwargs is not None else {})
+        dist = self.decoder(embedding, **dist_kwargs if dist_kwargs is not None else {})
         return dist, carry
 
     def explore(
@@ -88,12 +88,3 @@ class Actor(ThunderModule):
         action = dist.mean()
         log_prob = dist.log_prob(action)
         return ActorStep(action=action, log_prob=log_prob, distribution=dist, carry=carry)
-
-    def transform_action(fn: callable, fn_inv: callable, action_step: ActorStep):
-        """
-        Docstring for transform_action
-
-        :param self: Description
-        :param action: Description
-        """
-        ...

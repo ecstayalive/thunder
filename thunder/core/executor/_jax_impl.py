@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
@@ -50,13 +51,12 @@ class JaxExecutor:
         import optax
 
         meta = {}
-
-        mesh = None
+        self._mesh = None
         if self.distributed:
-            mesh = jax.sharding.Mesh(self.devices(), axis_names=("data",))
-            meta["mesh"] = mesh
+            self._mesh = jax.sharding.Mesh(self.devices(), axis_names=("data",))
+            meta["mesh"] = self._mesh
             meta["data_sharding"] = jax.sharding.NamedSharding(
-                mesh, jax.sharding.PartitionSpec("data")
+                self._mesh, jax.sharding.PartitionSpec("data")
             )
 
         def apply_sharding_to_tree(params_tree):
@@ -64,12 +64,12 @@ class JaxExecutor:
 
             def _map_fn(path, val):
                 spec = strategy_fn(path, val)
-                return jax.sharding.NamedSharding(mesh, spec)
+                return jax.sharding.NamedSharding(self._mesh, spec)
 
             sharding_tree = jax.tree_util.tree_map_with_path(_map_fn, params_tree)
             return jax.device_put(params_tree, sharding_tree)
 
-        if self.distributed and mesh:
+        if self.distributed and self._mesh:
             for name in models._fields:
                 model = getattr(models, name)
                 _, params = nnx.split(model, nnx.Param)
@@ -95,6 +95,25 @@ class JaxExecutor:
         ctx = ExecutionContext.create(executor=self, models=models, opt_groups=opt_groups)
         ctx.update_meta(**meta)
         return ctx
+
+    def get_manager_config(self) -> Dict[str, Any]:
+        """ """
+        ctx_manager = self._mesh if self.distributed and self._mesh else contextlib.nullcontext()
+        if self.distributed:
+            rank = jax.process_index()
+            world_size = jax.process_count()
+        else:
+            rank = 0
+            world_size = 1
+        return {
+            "native_context": ctx_manager,
+            "compute_dtype": self.compute_dtype,
+            "device": self._devices,
+            "is_distributed": self.distributed,
+            "rank": rank,
+            "world_size": world_size,
+            "mesh": self._mesh if self.distributed else None,
+        }
 
     def optimize(
         self,
@@ -284,4 +303,5 @@ class JaxExecutor:
 def fsdp_strategy(path, param):
     if path[-1] == "kernel" and param.size > 1024:
         return jax.sharding.PartitionSpec("data", None)
+    return jax.sharding.PartitionSpec()
     return jax.sharding.PartitionSpec()

@@ -1,4 +1,4 @@
-from .loader import EnvLoaderSpec, ThunderWrapper, register_loader
+from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
 
 
 class ManiSkillLoaderSpec(EnvLoaderSpec):
@@ -11,7 +11,7 @@ class ManiSkillLoaderSpec(EnvLoaderSpec):
 
 
 @register_loader("maniskill")
-def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderWrapper:
+def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderEnvWrapper:
     import gymnasium as gym
     import mani_skill.envs
 
