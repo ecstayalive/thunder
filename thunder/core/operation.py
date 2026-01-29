@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple
 
 from .executor import Executor
 
@@ -143,13 +143,13 @@ class OptimizeOp(Operation):
     def __init__(
         self,
         opt: str,
-        objectives: List[Objective],
+        objectives: Iterable[Objective],
         max_grad_norm: float = 1.0,
         name: str = "optimize",
     ):
         super().__init__(name=name)
         self.opt = opt
-        self.objectives = objectives
+        self.objectives = tuple(objectives)
         self.max_grad_norm = max_grad_norm
 
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:

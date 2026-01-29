@@ -30,6 +30,7 @@ def setup_torch_env():
 
 import torch
 import torch.nn as nn
+import torch.utils._pytree as pytree
 
 import thunder.core.algorithm as algo_mod
 import thunder.core.context as ctx_mod
@@ -128,13 +129,6 @@ def tensor_batch_3d(device):
         mask=torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]], device=device),
         extra={"val": torch.zeros((2, 3, 1), device=device)},
     )
-
-
-def test_batch_3d_structure(tensor_batch_3d):
-    assert tensor_batch_3d.obs["obs"].shape == (2, 3, 4)
-    new_b = tensor_batch_3d.map(lambda x: x * 2.0)
-    assert new_b.obs["obs"][0, 0, 0] == 2.0
-    assert new_b.obs["obs"].shape == (2, 3, 4)
 
 
 def test_torch_executor_optimization_flow(device, tensor_batch_3d):
@@ -270,50 +264,54 @@ def test_torch_jit_speedup(tensor_batch_3d):
 
     import torch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = exec_mod.Executor.default_device()
+    d_model = 4096
 
     class ForwardOp(op_mod.Operation):
         def forward(self, ctx: ctx_mod.ExecutionContext):
-            x = torch.randn(4096, 4096, device=device)
-            _ = ctx.models.net(x)
+            _ = ctx.models.net(ctx.batch["input"])
             return ctx, {}
 
     class DummyObjective(op_mod.Objective):
         def compute(self, batch: data_mod.Batch, models: module_mod.ModelPack):
-            output = torch.randn(4096, 4096, device=device)
-            error = models.net(output)
+            error = models.net(batch["input"])
             return torch.mean(torch.square(error)), {}
 
     class SimpleTorchNet(torch.nn.Module):
         def __init__(self, din, dout):
             super().__init__()
-            self.net = torch.nn.Linear(din, dout, bias=False)
+            self.net = torch.nn.Linear(din, dout)
 
         def forward(self, x):
             return self.net(x)
 
-    net = SimpleTorchNet(4096, 4096)
+    net = SimpleTorchNet(d_model, d_model)
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(models, executor)
-    algo.build({"opt": {"targets": "net", "class": "SGD", "lr": 1.0}})
+    algo.build({"opt": {"targets": "net", "class": "SGD", "lr": 1e-2}})
     pipeline = [ForwardOp(name="forward"), op_mod.OptimizeOp("opt", objectives=[DummyObjective()])]
     algo.setup_pipeline(pipeline=pipeline, jit=False)
+    # tensor_batch_3d["input"] = torch.randn(d_model, d_model, device=device)
+    # report = torch._dynamo.explain(algo.step)(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(50):
+        tensor_batch_3d["input"] = torch.randn(d_model, d_model, device=device)
         algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     no_jit_duration = time.time() - start_time
     print(f"No-JIT Time: {no_jit_duration:.4f}s")
     algo.setup_pipeline(pipeline, jit=True)
+    tensor_batch_3d["input"] = torch.randn(d_model, d_model, device=device)
     algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(50):
+        tensor_batch_3d["input"] = torch.randn(d_model, d_model, device=device)
         algo.step(tensor_batch_3d)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -356,25 +354,6 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     assert "optimize/amp_test/loss" in metrics
     assert native_net.net.weight.dtype == torch.float32
     assert native_net.net.weight.grad is not None
-
-
-def test_torch_compile_toggle(device, tensor_batch_3d):
-    native_net = Simple3DNet().to()
-    model = module_mod.ModelPack(net=native_net)
-
-    executor_no_compile = exec_mod.Executor(compile=False)
-    assert executor_no_compile._compiled_forward is None
-
-    executor_compile = exec_mod.Executor(compile=True)
-    optim_config = {"opt": {"targets": ["net"], "class": "SGD"}}
-    ctx = executor_compile.init(model, optim_config)
-    ctx = ctx.replace(batch=tensor_batch_3d)
-
-    obj = MSEObjective("test")
-    executor_compile.optimize(ctx, "opt", [obj])
-
-    if hasattr(torch, "compile"):
-        assert executor_compile._compiled_forward is not None
 
 
 def test_torch_algorithm_serialization(device, tensor_batch_3d):
@@ -426,19 +405,29 @@ def test_torch_distributed_initialization_mock(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(distributed=True)
-    with patch("torch.distributed.is_initialized", return_value=True):
-        with patch(
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_world_size", return_value=1),
+        patch(
             "torch.nn.parallel.DistributedDataParallel", side_effect=lambda x, **kwargs: x
-        ) as mock_ddp:
-            ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "SGD"}})
-            ctx = ctx.replace(batch=tensor_batch_3d)
-            assert mock_ddp.called
-            called_module = mock_ddp.call_args[0][0]
-            assert called_module is native_net
-            if "cuda" in str(device):
-                assert mock_ddp.call_args[1]["device_ids"] == [torch.device(device).index]
-            assert hasattr(ctx.models, "net")
-            assert ctx.opt_groups["opt"].targets == ("net",)
+        ) as mock_ddp,
+    ):
+        ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "SGD"}})
+        ctx = ctx.replace(batch=tensor_batch_3d)
+        # Assertions
+        assert mock_ddp.called
+        called_module = mock_ddp.call_args[0][0]
+        assert called_module is ctx.models.net
+        if "cuda" in str(device):
+            # Check if device_ids were passed correctly
+            assert mock_ddp.call_args[1]["device_ids"] == [torch.device(device).index]
+        assert hasattr(ctx.models, "net")
+        assert ctx.opt_groups["opt"].targets == ("net",)
+        # Verify manager state
+        assert ctx.manager.rank == 0
+        assert ctx.manager.world_size == 1
+        assert ctx.manager.distributed is True
 
 
 def test_torch_empty_step_scheduling(device, tensor_batch_3d):
@@ -459,7 +448,13 @@ def test_torch_empty_step_scheduling(device, tensor_batch_3d):
 def test_torch_batch_device_transfer(device):
     cpu_batch = data_mod.Batch(obs=torch.randn(2, 3, 4), extra={"meta": torch.randn(2, 3, 1)})
     executor = exec_mod.Executor()
-    gpu_batch = cpu_batch.to(executor)
+
+    def _to(leaf):
+        if leaf is None:
+            return None
+        return leaf.to(device)
+
+    gpu_batch = pytree.tree_map(_to, cpu_batch)
 
     assert gpu_batch.obs.device.type == torch.device(device).type
     assert gpu_batch.extra["meta"].device.type == torch.device(device).type

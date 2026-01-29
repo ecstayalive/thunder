@@ -1,17 +1,36 @@
 from __future__ import annotations
 
-from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from thunder.core.context import ExecutionContext, OptimGroup
+from thunder.core.context import ExecutionContext, ExecutionContextManager, OptimGroup
 
 if TYPE_CHECKING:
     from ..data import Batch
     from ..module import ModelPack
     from ..operation import Objective
+
+
+class _IdentityScaler:
+    def __init__(self, enabled: bool = False):
+        pass
+
+    def scale(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss
+
+    def unscale(self, optimizer: torch.optim.Optimizer):
+        return
+
+    def unscale_(self, optimizer: torch.optim.Optimizer):
+        return
+
+    def step(self, optimizer: torch.optim.Optimizer):
+        optimizer.step()
+
+    def update(self):
+        return
 
 
 class TorchExecutor:
@@ -24,26 +43,33 @@ class TorchExecutor:
     def __init__(
         self,
         mixed_precision: bool = False,
-        compile: bool = True,
-        compile_mode: str = "default",
         distributed: bool = False,
         device: Optional[str] = None,
+        enable_cudnn_benchmark: bool = True,
+        compile=True,
+        compile_args=None,
+        **kwargs,
     ):
         """ """
         if device == "gpu":
             device = "cuda"
         self.device = self.default_device(device)
+        self.compiled_autograd = False
+        self.compile = False
         if self.device.type == "cuda":
             if torch.cuda.get_device_capability() >= (8, 0):
                 torch.set_float32_matmul_precision("high")
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = enable_cudnn_benchmark
+            torch._dynamo.allow_in_graph(ExecutionContext)
+            # torch._dynamo.config.compiled_autograd = True
+            self.compile = compile
+            self.compile_args = {} if compile_args is None else compile_args
         self.mixed_precision = mixed_precision
         self.distributed = distributed
         self.use_scaler = self.mixed_precision and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler(enabled=self.use_scaler)
-        self._compile_enabled = compile
-        self._compile_mode = compile_mode
-        self._compiled_forward = None
+        self.scaler = (
+            torch.amp.GradScaler(enabled=self.use_scaler) if self.use_scaler else _IdentityScaler()
+        )
 
     def init(
         self,
@@ -56,6 +82,8 @@ class TorchExecutor:
         for name in models._fields:
             model = getattr(models, name)
             model = model.to(self.device)
+            if self.compile:
+                model = torch.compile(model, **self.compile_args)
             if self.distributed:
                 if distributed_strategy is not None:
                     model = distributed_strategy(model)
@@ -85,11 +113,38 @@ class TorchExecutor:
             OptimCls = getattr(torch.optim, cls_name)
             optimizer = OptimCls(all_optimize_params, **cfg)
             opt_groups[opt_key] = OptimGroup(
-                name=opt_key, targets=target_names, optimizer=optimizer, scheduler=None
+                name=opt_key,
+                targets=target_names,
+                optimizer=optimizer,
+                scheduler=None,
+                scaler=self.scaler,
+                scaler_state=None,
             )
-
-        ctx = ExecutionContext.create(executor=self, models=new_models_pack, opt_groups=opt_groups)
+        ctx = ExecutionContext.create(
+            models=new_models_pack,
+            executor=self,
+            manager=self.init_manager(),
+            opt_groups=opt_groups,
+        )
         return ctx
+
+    def init_manager(self) -> ExecutionContextManager:
+        device_type = self.device.type
+        compute_dtype = torch.get_autocast_dtype(device_type)
+        amp_ctx = torch.amp.autocast(
+            device_type=device_type,
+            dtype=torch.get_autocast_dtype(device_type),
+            enabled=self.mixed_precision,
+        )
+        return ExecutionContextManager(
+            _context_manager=amp_ctx,
+            compute_dtype=compute_dtype if self.mixed_precision else torch.float32,
+            device=self.device,
+            distributed=self.distributed,
+            rank=torch.distributed.get_rank() if self.distributed else 0,
+            world_size=torch.distributed.get_world_size() if self.distributed else 1,
+            mesh=None,
+        )
 
     def _forward(
         self, objectives: Tuple[Objective, ...], batch: Batch, models: ModelPack
@@ -113,12 +168,8 @@ class TorchExecutor:
         """ """
         optim_group = ctx.opt_groups[opt]
         optimizer: torch.optim.Optimizer = optim_group.optimizer
-        if self._compile_enabled and self._compiled_forward is None:
-            self._compiled_forward = torch.compile(self._forward, mode=self._compile_mode)
-        forward_fn = self._compiled_forward if self._compile_enabled else self._forward
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type=self.device.type, enabled=self.mixed_precision):
-            loss, metrics = forward_fn(objectives, ctx.batch, ctx.models)
+        loss, metrics = self._forward(objectives, ctx.batch, ctx.models)
         metrics["total_loss"] = loss
         self.scaler.scale(loss).backward()
         if max_grad_norm > 0:
@@ -133,7 +184,10 @@ class TorchExecutor:
 
     @staticmethod
     def jit(fn: Callable, **kwargs):
-        compile_args = {"mode": "default"}
+        compile_args = {
+            "mode": kwargs.pop("mode", "default"),
+            "fullgraph": kwargs.pop("fullgraph", False),
+        }
         compile_args.update(kwargs)
 
         def wrapper(f):
@@ -230,13 +284,10 @@ class TorchExecutor:
 
             if name == "ndarray" and "numpy" in module:
                 return TorchExecutor.to_numpy(data)
-
             if (name == "Array" or "jax" in name) and ("jax" in module):
                 return TorchExecutor.to_jax(data)
-
             if module.startswith("warp"):
                 return TorchExecutor.to_warp(data)
-
             if name == "Tensor" and "torch" in module:
                 return data
 

@@ -52,32 +52,6 @@ class Batch:
         """ """
         return list(self.__class__.__dataclass_fields__.keys()) + list(self.extra.keys())
 
-    def map(self: TBatch, fn: Callable[[Any], Any]) -> TBatch:
-        """ """
-
-        def _recursive_apply(val):
-            if val is None:
-                return None
-            if isinstance(val, dict):
-                return {k: _recursive_apply(v) for k, v in val.items()}
-            if isinstance(val, (list, tuple)):
-                return type(val)(_recursive_apply(v) for v in val)
-            return fn(val)
-
-        changes = {}
-        for f in fields(self):
-            if f.name == "extra":
-                continue
-            val = getattr(self, f.name)
-            changes[f.name] = _recursive_apply(val)
-        if self.extra:
-            changes["extra"] = _recursive_apply(self.extra)
-        return replace(self, **changes)
-
-    def to(self: TBatch, executor: Executor) -> TBatch:
-        """ """
-        return self.map(executor.to_device)
-
     def __repr__(self) -> str:
         def _fmt(v):
             if hasattr(v, "shape"):

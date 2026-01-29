@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ContextManager, Dict, Optional, Tuple
 
@@ -13,6 +14,36 @@ if TYPE_CHECKING:
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
 
 
+class ComposedContextManager(ContextManager):
+    def __init__(self, *contexts):
+        self.contexts = contexts
+        self._stack = None
+
+    def __enter__(self):
+        self._stack = contextlib.ExitStack()
+        self._stack.__enter__()
+
+        try:
+            for ctx in self.contexts:
+                self._stack.enter_context(ctx)
+        except:
+            self._stack.__exit__(*sys.exc_info())
+            raise
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._stack.__exit__(exc_type, exc_val, exc_tb)
+
+    def __eq__(self, other):
+        if not isinstance(other, ComposedContextManager):
+            return False
+        return self.contexts == other.contexts
+
+    def __hash__(self):
+        return hash(self.contexts)
+
+
 @dataclass(slots=True)
 class OptimGroup:
     """
@@ -22,7 +53,7 @@ class OptimGroup:
         params:
         optimizer: `nnx.Optimizer` for jax, `torch.optim.Optimizer` for torch
         scheduler: learning rate scheduler, None for `jax`
-        grad_scaler: The scaler object (optax.amp.DynamicScale or torch.cuda.amp.GradScaler)
+        scaler: The scaler object (optax.amp.DynamicScale or torch.cuda.amp.GradScaler)
         scaler_state: The dynamic state of the scaler (JAX only, None for Torch)
     """
 
@@ -30,27 +61,29 @@ class OptimGroup:
     targets: Tuple[str, ...]
     optimizer: Any
     scheduler: Optional[Any] = None
-    # grad_scaler: Optional[Any] = None
-    # scaler_state: Optional[Any] = None
+    scaler: Optional[Any] = None
+    scaler_state: Optional[Any] = None
 
 
 @dataclass(slots=True)
-class Manager:
+class ExecutionContextManager:
     """
     Handles Mixed Precision AND Distributed Contexts.
+    Args:
+
     """
 
-    _context_manager: ContextManager
+    _context_manager: ContextManager | ComposedContextManager
     compute_dtype: Any
     device: Any
 
-    is_distributed: bool = False
+    distributed: bool = False
     rank: int = 0
     world_size: int = 1
     mesh: Any = None
 
     def __enter__(self):
-        """Enter the Mesh context for `jax`, enter the Autocast context for torch"""
+        """ """
         return self._context_manager.__enter__()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -78,7 +111,7 @@ class ExecutionContext:
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
     executor: Executor
-    # manager: Manager
+    manager: ExecutionContextManager
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:
@@ -100,11 +133,20 @@ class ExecutionContext:
 
     @classmethod
     def create(
-        cls, executor: Executor, models: ModelPack, opt_groups: Dict[str, OptimGroup]
+        cls,
+        models: ModelPack,
+        executor: Executor,
+        manager: ExecutionContextManager,
+        opt_groups: Dict[str, OptimGroup],
     ) -> ExecutionContext:
         """ """
         return cls(
-            step=0, batch=None, models=models, opt_groups=opt_groups, executor=executor, meta={}
+            step=0,
+            batch=None,
+            models=models,
+            opt_groups=opt_groups,
+            executor=executor,
+            manager=manager,
         )
 
 
@@ -157,25 +199,56 @@ if _BACKEND == "torch":
     import torch.utils._pytree as pytree
 
     def _optim_group_flatten(obj: OptimGroup):
-        children = [obj.optimizer]
-        aux_data = (obj.name, obj.targets, obj.scheduler)
+        children = [obj.optimizer, obj.scaler_state]
+        aux_data = (obj.name, obj.targets, obj.scheduler, obj.scaler)
         return children, aux_data
 
-    def _optim_group_unflatten(aux_data, children):
+    def _optim_group_unflatten(children, aux_data):
         return OptimGroup(
-            name=aux_data[0], targets=aux_data[1], optimizer=children[0], scheduler=aux_data[3]
+            name=aux_data[0],
+            targets=aux_data[1],
+            optimizer=children[0],
+            scheduler=aux_data[2],
+            scaler=aux_data[3],
+            scaler_state=children[1],
         )
 
     pytree.register_pytree_node(OptimGroup, _optim_group_flatten, _optim_group_unflatten)
 
+    def _manager_flatten(obj: ExecutionContextManager):
+        children = []
+        aux_data = (
+            obj._context_manager,
+            obj.compute_dtype,
+            obj.device,
+            obj.distributed,
+            obj.rank,
+            obj.world_size,
+            obj.mesh,
+        )
+        return children, aux_data
+
+    def _manager_unflatten(children, aux_data):
+        return ExecutionContextManager(
+            _context_manager=aux_data[0],
+            compute_dtype=aux_data[1],
+            device=aux_data[2],
+            distributed=aux_data[3],
+            rank=aux_data[4],
+            world_size=aux_data[5],
+            mesh=aux_data[6],
+        )
+
+    pytree.register_pytree_node(ExecutionContextManager, _manager_flatten, _manager_unflatten)
+
     def _context_flatten(obj: ExecutionContext):
         children = [obj.models, obj.opt_groups, obj.step, obj.batch, obj.meta]
-        aux_data = obj.executor
+        aux_data = (obj.executor, obj.manager)
 
         return children, aux_data
 
-    def _context_unflatten(aux_data, children):
-        executor = aux_data
+    def _context_unflatten(children, aux_data):
+        executor, manager = aux_data
         models, opt_groups, step, batch, meta = children
 
         return ExecutionContext(
@@ -184,6 +257,7 @@ if _BACKEND == "torch":
             models=models,
             opt_groups=opt_groups,
             executor=executor,
+            manager=manager,
             meta=meta,
         )
 
@@ -194,28 +268,59 @@ if _BACKEND == "jax":
     import jax.tree_util as jtu
 
     def _optim_group_flatten(obj: OptimGroup):
-        children = (obj.optimizer,)
-        aux_data = (obj.name, obj.targets, obj.scheduler)
+        children = (obj.optimizer, obj.scaler_state)
+        aux_data = (obj.name, obj.targets, obj.scheduler, obj.scaler)
         return children, aux_data
 
     def _optim_group_unflatten(aux_data, children):
         return OptimGroup(
-            name=aux_data[0], targets=aux_data[1], optimizer=children[0], scheduler=aux_data[2]
+            name=aux_data[0],
+            targets=aux_data[1],
+            optimizer=children[0],
+            scheduler=aux_data[2],
+            scaler=aux_data[3],
+            scaler_state=children[1],
         )
 
     jtu.register_pytree_node(OptimGroup, _optim_group_flatten, _optim_group_unflatten)
+
+    def _manager_flatten(obj: ExecutionContextManager):
+        children = []
+        aux_data = (
+            obj._context_manager,
+            obj.compute_dtype,
+            obj.device,
+            obj.distributed,
+            obj.rank,
+            obj.world_size,
+            obj.mesh,
+        )
+        return children, aux_data
+
+    def _manager_unflatten(aux_data, children):
+        return ExecutionContextManager(
+            _context_manager=aux_data[0],
+            compute_dtype=aux_data[1],
+            device=aux_data[2],
+            distributed=aux_data[3],
+            rank=aux_data[4],
+            world_size=aux_data[5],
+            mesh=aux_data[6],
+        )
+
+    jtu.register_pytree_node(ExecutionContextManager, _manager_flatten, _manager_unflatten)
 
     def _context_flatten(obj: ExecutionContext):
         """ """
         nnx_containers = (obj.models, obj.opt_groups)
         graphdef, state = nnx.split(nnx_containers)
         children = (obj.step, obj.batch, state, obj.meta)
-        aux_data = (obj.executor, graphdef)
+        aux_data = (obj.executor, graphdef, obj.manager)
 
         return children, aux_data
 
     def _context_unflatten(aux_data, children):
-        executor, graphdef = aux_data
+        executor, graphdef, manager = aux_data
         step, batch, state, meta = children
         models, opt_groups = nnx.merge(graphdef, state)
         return ExecutionContext(
@@ -225,8 +330,15 @@ if _BACKEND == "jax":
             opt_groups=opt_groups,
             executor=executor,
             meta=meta,
+            manager=manager,
         )
 
     jtu.register_pytree_node(ExecutionContext, _context_flatten, _context_unflatten)
 
-__all__ = ["OptimGroup", "ExecutionContext", "CtxRef"]
+__all__ = [
+    "ComposedContextManager",
+    "OptimGroup",
+    "ExecutionContextManager",
+    "ExecutionContext",
+    "CtxRef",
+]

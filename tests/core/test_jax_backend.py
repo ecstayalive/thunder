@@ -130,13 +130,6 @@ def test_jax_batch_pytree_behavior(jax_batch_3d):
     assert jnp.all(res[0, 0] == 2.0)
 
 
-def test_jax_batch_mapping():
-    batch = data_mod.Batch(obs={"obs": jnp.ones((2, 2))}, extra={"v": jnp.zeros(1)})
-    new_batch = batch.map(lambda x: x + 5.0)
-    assert jnp.all(new_batch.obs["obs"] == 6.0)
-    assert jnp.all(new_batch.v == 5.0)
-
-
 def test_jax_executor_init_flow(jax_batch_3d):
     rngs = nnx.Rngs(42)
     models = module_mod.ModelPack(
@@ -271,24 +264,28 @@ def test_jax_multi_op(jax_batch_3d):
 def test_jax_jit_speedup(jax_batch_3d):
     import time
 
+    d_model = 4096
+
     class ForwardOp(op_mod.Operation):
         def forward(self, ctx: ctx_mod.ExecutionContext):
-            output = ctx.models.net(jax.random.normal(jax.random.key(0), (4096, 4096)))
-            ctx.batch = ctx.batch.replace(dummy=jnp.ones((4096, 4096)))
+            input = jax.random.normal(jax.random.key(0), (d_model, d_model))
+            output = ctx.models.net(input)
+            ctx.batch = ctx.batch.replace(dummy=jnp.ones((d_model, d_model)))
             ctx.meta = {"dummy": 1.0}
             return ctx, {}
 
     class DummyObjective(op_mod.Objective):
         def compute(self, batch: data_mod.Batch, model: module_mod.ModelPack):
-            output = models.net(jax.random.normal(jax.random.key(0), (4096, 4096)))
+            input = jax.random.normal(jax.random.key(0), (d_model, d_model))
+            output = models.net(input)
             return jnp.mean(jnp.square(output)), {}
 
     rngs = nnx.Rngs(0)
-    net = Simple3DFlaxNet(4096, 4096, rngs)
+    net = Simple3DFlaxNet(d_model, d_model, rngs)
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(models, executor)
-    algo.build({"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    algo.build({"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0e-3}})
     pipeline = [
         ForwardOp(name="forward"),
         op_mod.OptimizeOp("opt", [DummyObjective()], max_grad_norm=1.0),
@@ -309,7 +306,7 @@ def test_jax_jit_speedup(jax_batch_3d):
     speedup = no_jit_duration / jit_duration
     print(f"Speedup: {speedup:.2f}x")
     assert jit_duration < no_jit_duration
-    assert jnp.array_equal(algo.ctx.batch.dummy, jnp.ones((4096, 4096)))
+    assert jnp.array_equal(algo.ctx.batch.dummy, jnp.ones((d_model, d_model)))
 
 
 def test_jax_mixed_precision_bf16(jax_batch_3d):
@@ -317,14 +314,25 @@ def test_jax_mixed_precision_bf16(jax_batch_3d):
     native = Simple3DFlaxNet(4, 2, rngs)
     models = module_mod.ModelPack(net=native)
     executor = exec_mod.Executor(precision="bf16")
+
+    class ForwardOp(op_mod.Operation):
+        def __init__(self):
+            super().__init__("forward")
+
+        def forward(self, ctx):
+            ctx.batch["y"] = ctx.models.net(jax.random.normal(jax.random.key(0), (4, 4)))
+            return ctx, {}
+
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 0.1}})
     ctx.batch = jax_batch_3d
-
-    obj = JaxMSEObjective("mse")
-    op = op_mod.OptimizeOp("opt", [obj])
-    op(ctx)
-
-    assert native.net.kernel.value.dtype == jnp.float32
+    with ctx.manager:
+        forward_op = ForwardOp()
+        ctx, _ = forward_op(ctx)
+        assert ctx.batch["y"].dtype == jnp.bfloat16
+        obj = JaxMSEObjective("mse")
+        op = op_mod.OptimizeOp("opt", [obj])
+        ctx, _ = op(ctx)
+        assert native.net.kernel.value.dtype == jnp.float32
 
 
 def test_jax_objective_standalone_eval(jax_batch_3d):
@@ -351,22 +359,6 @@ def test_jax_serialization_state_retrieval():
     new_algo = algo_mod.Algorithm(new_models, executor, {}, [])
     # new_algo.load_state_dict(sd)
     assert jnp.all(new_native.net.kernel.value == 0.0)
-
-
-def test_jax_jit_cache_integrity(jax_batch_3d):
-    rngs = nnx.Rngs(9)
-    models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
-    executor = exec_mod.Executor()
-    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd"}})
-    ctx = ctx.replace(batch=jax_batch_3d)
-    obj = JaxMSEObjective("m")
-    executor.optimize(ctx, "opt", [obj])
-    assert len(executor._jit_optimize_cache) == 1
-    executor.optimize(ctx, "opt", [obj])
-    assert len(executor._jit_optimize_cache) == 1
-    obj2 = JaxMSEObjective("m2")
-    executor.optimize(ctx, "opt", [obj, obj2])
-    assert len(executor._jit_optimize_cache) == 2
 
 
 def test_jax_complex_pytree_nesting():
@@ -500,7 +492,7 @@ def test_jax_nan_inf_handling_in_optimize(jax_batch_3d):
     executor = exec_mod.Executor()
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam"}})
     ctx.batch = jax_batch_3d
-    metrics = executor.optimize(ctx, "opt", [NanObjective("nan")])
+    metrics = executor.optimize(ctx, "opt", (NanObjective("nan"),))
     assert jnp.isnan(metrics["nan/loss"])
 
 

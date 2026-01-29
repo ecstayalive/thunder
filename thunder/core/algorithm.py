@@ -67,7 +67,8 @@ class Algorithm(ABC):
             )
         if batch is not None:
             self.ctx = self.ctx.replace(batch=batch)
-        self.ctx, metrics = self.pipeline(self.ctx)
+        with self.ctx.manager:
+            self.ctx, metrics = self.pipeline(self.ctx)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
         return metrics
 
