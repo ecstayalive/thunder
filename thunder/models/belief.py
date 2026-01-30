@@ -1,4 +1,4 @@
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,7 +77,7 @@ class Perception(nn.Module):
         self.project = nn.Linear(self.conv_head.out_features, rnn_hidden_size)
 
     def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        seq_len, batch_size, _ = input.shape
+        input_shape = input.shape
         input1: torch.Tensor = input[..., : -self.conv_head.in_features]
         conv_input: torch.Tensor = (
             input[..., -self.conv_head.in_features :]
@@ -87,7 +87,7 @@ class Perception(nn.Module):
         conv_output: torch.Tensor = (
             self.conv_head(conv_input)
             .flatten(start_dim=-3, end_dim=-1)
-            .unflatten(0, (seq_len, batch_size))
+            .unflatten(0, input_shape[:-1])
         )
         rnn_output, rnn_hidden = self.rnn(torch.cat([input1, conv_output], dim=-1), hx)
         output = self.mlp(rnn_output + self.project(conv_output))
@@ -235,17 +235,17 @@ class BeliefPerception(nn.Module):
         self.project = nn.Linear(self.conv_head.out_features, mlp_dim)
 
     def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        seq_len, batch_size, _ = input.shape
+        input_shape = input.shape
         input1: torch.Tensor = input[..., : -self.conv_head.in_features]
         conv_input: torch.Tensor = (
             input[..., -self.conv_head.in_features :]
+            .flatten(end_dim=-2)
             .unflatten(-1, self.conv_head.in_shape)
-            .flatten(end_dim=1)
         )
         conv_output: torch.Tensor = (
             self.conv_head(conv_input)
             .flatten(start_dim=-3, end_dim=-1)
-            .unflatten(0, (seq_len, batch_size))
+            .unflatten(0, input_shape[:-1])
         )
         rnn_output, rnn_hidden = self.rnn(torch.cat([input1, conv_output], dim=-1), hx)
         gated = self.gate_project(rnn_output[..., -self.gate_dim :])
@@ -315,16 +315,16 @@ class MhaBelief(nn.Module):
         nn.init.orthogonal_(self.project.weight, math.sqrt(gain))
 
     def forward(self, input: torch.Tensor, hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        L, B, _ = input.shape
+        input_shape = input.shape
         query: torch.Tensor = input[..., : self.q_dim]
         conv_input: torch.Tensor = (
-            input[..., self.q_dim :].unflatten(-1, self.conv_head.in_shape).flatten(end_dim=1)
+            input[..., self.q_dim :].flatten(end_dim=-2).unflatten(-1, self.conv_head.in_shape)
         )
         # [T*B, C, L, W] => [T*B, L*W, C]
         conv_output: torch.Tensor = self.conv_head(conv_input)
         conv_output = conv_output + self.pos_embedding
         kv = self.v_norm(conv_output.flatten(2).transpose(1, 2))
-        values = self.mha(query.view(-1, 1, self.q_dim), kv).view(L, B, self.embed_dim)
+        values = self.mha(query.view(-1, 1, self.q_dim), kv).view(*input_shape[:-1], self.embed_dim)
         rnn_output, rnn_hidden = self.rnn(torch.cat([query, values], dim=-1), hx)
         gated = self.gate_project(rnn_output[..., -self.gate_dim :])
         output = self.mlp(rnn_output[..., : -self.gate_dim] + self.project(values * gated))

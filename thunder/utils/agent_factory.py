@@ -263,11 +263,11 @@ class PerceptionModelFactory:
         heightmap_shape = env.getLocalHeightMapShape()
         foot_heightmap_shape = env.getLocalFootHeightMapShape()
         # c_conv_head = Conv2dBlock(foot_heightmap_shape, (8, 16), ((1, 5), (1, 5)), ((1, 3), (1, 3)))
-        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        c_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, (5, 3)), (3, (3, 2)))
         critic_kernel = Perception(critic_obs_dim, 1, 256, c_conv_head, [256, 256])
         critic = GeneralVNet(DimAdaptRMlp(critic_kernel))
         # Actor Network
-        a_conv_head = Conv2dBlock(heightmap_shape, (8, 16), (5, 5), (3, 3))
+        a_conv_head = Conv2dBlock(heightmap_shape, (8, 8), (5, (5, 3)), (3, (3, 2)))
         enc = BeliefPerception(actor_obs_dim, 256, 256, a_conv_head)
         dec = ConsistentGaussian(256, action_dim, [256])
         actor = GeneralActor(DimAdaptRMlp(enc), dec)

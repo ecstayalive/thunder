@@ -117,9 +117,9 @@ class PPO:
         # Smooth loss
         self.smooth_coef: Optional[float] = smooth_coef
         self.smooth_conv = self.as_th([[[-1.0, 2.0, -1.0]]])
-        self.torso_smooth_weight = 1 / torch.tensor([0.3, 0.5, 0.3] * 4, device=self.device)
+        self.torso_smooth_weight = 1 / torch.tensor([0.3, 0.4, 0.3] * 4, device=self.device)
         self.arm_smooth_weight = 1 / torch.tensor(
-            [0.4, 0.3, 0.3, 0.4, 0.4, 0.4], device=self.device
+            [0.5, 0.4, 0.4, 0.5, 0.5, 0.5], device=self.device
         )
         self.smooth_weight = torch.cat((self.torso_smooth_weight, self.arm_smooth_weight))
 

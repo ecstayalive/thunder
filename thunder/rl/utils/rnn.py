@@ -1,8 +1,7 @@
-from typing import Iterator, Optional, Tuple, overload
+from typing import Iterator, List, Optional, Tuple, overload
 
 import torch
 import torch.nn as nn
-
 from thunder.nn import *
 
 
@@ -175,13 +174,14 @@ class DimAdaptRMlp(nn.Module):
         ...
 
     def forward(self, input: torch.Tensor, hx=None):
-        if input.dim() <= 2:
-            input = input.unsqueeze(0)
-            output, hidden = self.recurrent_mlp(input, hx)
-            return output.squeeze(0), hidden
-        else:
-            output, hidden = self.recurrent_mlp(input, hx)
-            return output, hidden
+        original_shape = input.shape
+        if input.ndim < 3:
+            input = input.view(1, -1, input.shape[-1])
+        output, hidden = self.recurrent_mlp(input, hx)
+        output: torch.Tensor
+        if output.ndim > len(original_shape):
+            output = output.view(*original_shape[:-1], -1)
+        return output, hidden
 
     def scriptable(self):
         return self.recurrent_mlp

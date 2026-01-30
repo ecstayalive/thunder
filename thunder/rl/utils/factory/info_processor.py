@@ -21,9 +21,7 @@ class NetInfo:
 class ModulesInfoProcessor:
     def __init__(self, modules_info: Iterator[Dict]) -> None:
         self.num_modules = len(modules_info)
-        assert (
-            self.num_modules >= 1
-        ), "Error, there is no module information in input parameters!!"
+        assert self.num_modules >= 1, "Error, there is no module information in input parameters!!"
         self.net_info = NetInfo(self.num_modules)
         self.modules_info = tuple(map(self._preprocess_modules_info, modules_info))
 
@@ -66,9 +64,7 @@ class ModulesInfoProcessor:
                 self.net_info.out_features = module_params_info["shape"][-1]
             # preprocess module params information according its type
             if module_name in LINEAR_BLOCK:
-                module_params = self._get_linear_block_params(
-                    module_idx, module_params_info
-                )
+                module_params = self._get_linear_block_params(module_idx, module_params_info)
                 self.net_info.rnn_net_id.append(None)
             elif module_name in RECURRENT_MLP:
                 self.net_info.is_recurrent = True
@@ -79,9 +75,7 @@ class ModulesInfoProcessor:
                 self.net_info.num_rnn_net += 1
             elif module_name in RECURRENT:
                 self.net_info.is_recurrent = True
-                module_params = self._get_rnn_params(
-                    module_name, module_idx, module_params_info
-                )
+                module_params = self._get_rnn_params(module_name, module_idx, module_params_info)
                 self.net_info.rnn_net_id.append(self.net_info.num_rnn_net)
                 self.net_info.num_rnn_net += 1
 
@@ -90,9 +84,7 @@ class ModulesInfoProcessor:
 
         return modules_config
 
-    def _get_linear_block_params(
-        self, module_idx: int, module_params_info: Dict
-    ) -> Dict:
+    def _get_linear_block_params(self, module_idx: int, module_params_info: Dict) -> Dict:
         module_params = {}
         if self.prev_module_out_features is not None:
             origin_shape_info = module_params_info["shape"]

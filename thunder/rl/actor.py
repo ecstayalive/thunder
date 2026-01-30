@@ -4,7 +4,6 @@ from typing import Any, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from thunder.models import GaussianRbf
 from thunder.nn import LinearBlock, Normalization, RunningNorm1d
 from thunder.rl import DimAdaptRMlp, NetFactory, NetInfo

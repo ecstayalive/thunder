@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
+from thunder.models import BeliefPerception
 from thunder.nn import (
     GruMlp,
     LinearBlock,
@@ -27,7 +27,7 @@ class ScriptNet(nn.Module):
         self.normalizer = normalizer
         self.kernel = kernel
         self.kernel_type = kernel_type
-        if isinstance(kernel, LstmMlp):
+        if isinstance(kernel, (LstmMlp, BeliefPerception)):
             if self.normalizer is not None:
                 self.forward = self.forward_lstm_with_norm
             else:
@@ -71,7 +71,7 @@ class ScriptNet(nn.Module):
 class ScriptGeneralActor(nn.Module):
     def __init__(
         self,
-        encoder: LinearBlock | LstmMlp | GruMlp | RecurrentMlp,
+        encoder: LinearBlock | LstmMlp | GruMlp | RecurrentMlp | BeliefPerception,
         action_decoder: Distribution,
         normalizer: Normalization | RunningNorm1d,
         denormalizer: Normalization | RunningNorm1d,
@@ -83,7 +83,7 @@ class ScriptGeneralActor(nn.Module):
         self.action_decoder = action_decoder
         self.denormalizer = denormalizer
         self.module_type = module_type
-        if isinstance(encoder, LstmMlp):
+        if isinstance(encoder, (LstmMlp, BeliefPerception)):
             self.forward = self.forward_lstm
         elif isinstance(encoder, GruMlp):
             self.forward = self.forward_gru
