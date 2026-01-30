@@ -1,36 +1,38 @@
 import argparse
-import copy
+import dataclasses
 import enum
 import re
-from dataclasses import dataclass
-from textwrap import dedent
+import sys
+import textwrap
+from dataclasses import asdict, field, fields, is_dataclass
 from typing import (
     Any,
     Dict,
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
+    TypeVar,
     Union,
     get_args,
     get_origin,
-    get_type_hints,
 )
 
 from rich.table import Table
 from rich.text import Text
 from rich_argparse import RichHelpFormatter
 
-__all__ = ["ArgsOpt", "ArgBase"]
-
-
-_ARGS_OPT_DEFAULT_SENTINEL = object()
+T = TypeVar("T")
+_TYPE_CACHE = {}
+_DOC_CACHE = {}
 
 
 class TyroStyleHelpFormatter(RichHelpFormatter):
     """A tyro style help formatter"""
 
     def __init__(self, *args, **kwargs):
+        kwargs["max_help_position"] = 45
         super().__init__(*args, **kwargs)
         self.styles["argparse.args"] = "bright_cyan"
         self.styles["argparse.groups"] = "bold magenta"
@@ -77,6 +79,7 @@ class TyroStyleHelpFormatter(RichHelpFormatter):
         for action in actions:
             invocation = self._format_action_invocation(action)
             max_invocation_width = max(max_invocation_width, len(invocation))
+
         wrapper_table = Table(box=None, show_header=False, padding=0, expand=True)
         wrapper_table.add_column(style=self.styles["argparse.groups"], width=1, no_wrap=True)
         wrapper_table.add_column(width=1)
@@ -87,14 +90,19 @@ class TyroStyleHelpFormatter(RichHelpFormatter):
 
         for action in actions:
             invocation_str = self._format_action_invocation(action)
-            metavar = self._get_default_metavar_for_optional(action)
-            if metavar and metavar in invocation_str:
-                command, _, _ = invocation_str.rpartition(f" {metavar}")
-                invocation_text = Text.assemble(
-                    (command, self.styles["argparse.args"]),
-                    (f" {metavar}", self.styles["argparse.metavar"]),
-                )
-            else:  # For simple flags like --verbose
+            metavar = (
+                action.metavar if action.metavar else self._get_default_metavar_for_optional(action)
+            )
+            if metavar:
+                pattern = re.escape(metavar)
+                parts = re.split(f"({pattern})", invocation_str)
+                invocation_text = Text()
+                for part in parts:
+                    if part == metavar:
+                        invocation_text.append(part, style=self.styles["argparse.metavar"])
+                    else:
+                        invocation_text.append(part, style=self.styles["argparse.args"])
+            else:
                 invocation_text = Text(invocation_str, style=self.styles["argparse.args"])
             help_text = Text.from_markup(action.help or "", style=self.styles["argparse.help"])
             wrapper_table.add_row("│", " ", invocation_text, " ", help_text, "│")
@@ -102,395 +110,285 @@ class TyroStyleHelpFormatter(RichHelpFormatter):
         self.console.print(wrapper_table)
 
 
-@dataclass
-class Positional:
-    help: Optional[str] = None
+def ArgOpt(
+    default=dataclasses.MISSING, *, help="", short=None, factory=None, external=False, **kwargs
+):
+    metadata = {"help": help, "short": short, "external": external, "argparse_kwargs": kwargs}
+    if factory:
+        return field(default_factory=factory, metadata=metadata)
+    if default is not dataclasses.MISSING:
+        return field(default=default, metadata=metadata)
+    return field(metadata=metadata)
 
 
-@dataclass
-class ArgsOpt:
-    """
-    Utility class to provide defaults and argparse options simultaneously.
-    Assign this instead of a direct value to customize parsing.
-    Using ArgsOpt generally implies the argument is Optional, unless
-    a non-None default is provided.
-    Attributes:
-        default (Any): The default value. If not set here (remains sentinel),
-            the behavior depends on the type hint (Optional[T] -> None,
-            List[T] -> [], other T -> Error or handled by argparse).
-        help (Optional[str]): Help text. Overrides class docstring help.
-        short (Optional[str]): Short alias (e.g., '-a').
-    """
+class DocstringResolver:
+    @staticmethod
+    def resolve(cls: Type) -> Dict[str, str]:
+        if cls in _DOC_CACHE:
+            return _DOC_CACHE[cls]
 
-    default: Any = _ARGS_OPT_DEFAULT_SENTINEL
-    help: Optional[str] = None
-    short: Optional[str] = None
-
-
-class ArgParseMeta(type):
-    def __new__(cls, name: str, bases: tuple, namespace: dict):
-        new_cls = super().__new__(cls, name, bases, namespace)
-        attr_docs = {}
-        for base in reversed(bases):
-            if hasattr(base, "__mro__"):
-                for ancestor in reversed(base.__mro__):
-                    if ancestor is object:
-                        continue
-                    doc = getattr(ancestor, "__doc__", "")
-                    attr_docs.update(cls._parse_attr_docs(doc))
-        current_doc = namespace.get("__doc__", "")
-        attr_docs.update(cls._parse_attr_docs(current_doc))
-
-        argparse_configs = {}
-        for base in reversed(bases):
-            if hasattr(base, "_argparse_configs"):
-                argparse_configs.update(copy.deepcopy(base._argparse_configs))
-        try:
-            type_hints = get_type_hints(new_cls)
-        except Exception:
-            type_hints = getattr(new_cls, "__annotations__", {})
-
-        new_cls._cached_type_hints = type_hints
-        for attr_name, type_hint in type_hints.items():
-            if attr_name.startswith("_") or callable(namespace.get(attr_name)):
+        doc_map = {}
+        for base in reversed(cls.__mro__):
+            if base is object or not base.__doc__:
                 continue
-            assigned_value = getattr(new_cls, attr_name, ...)
-            arg_opt = assigned_value if isinstance(assigned_value, ArgsOpt) else None
+            DocstringResolver._parse_class_content(base.__doc__, doc_map)
 
-            origin = get_origin(type_hint)
-            is_optional = origin is Union and type(None) in get_args(type_hint)
-            actual_type = type_hint
-            if origin is Union:
-                actual_type = next(
-                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
-                )
-            # Nested ArgBase handling
-            if isinstance(actual_type, type) and issubclass(actual_type, ArgBase):
-                child_configs = getattr(actual_type, "_argparse_configs", {})
-                prefix = attr_name.replace("_", "-")
-                nested_default = None
-                if (
-                    not arg_opt
-                    and assigned_value is not ...
-                    and isinstance(assigned_value, actual_type)
-                ):
-                    nested_default = assigned_value
-                elif arg_opt and isinstance(arg_opt.default, actual_type):
-                    nested_default = arg_opt.default
-                for child_dest, (child_flags, child_kwargs) in child_configs.items():
-                    new_dest = f"{attr_name}.{child_dest}"
-                    new_flags = []
-                    for flag in child_flags:
-                        if flag.startswith("--"):
-                            suffix = flag.lstrip("-")
-                            new_flags.append(f"--{prefix}.{suffix}")
-                    new_kwargs = copy.deepcopy(child_kwargs)
-                    new_kwargs["dest"] = new_dest
-                    if nested_default and hasattr(nested_default, child_dest):
-                        child_val = getattr(nested_default, child_dest)
-                        # If the default object has a valid value, use it as default
-                        if child_val is not ...:
-                            new_kwargs["default"] = child_val
-                            # It is no longer required since we have a default
-                            if new_kwargs.get("required"):
-                                del new_kwargs["required"]
-                            # If nargs was +, switch to * because it's now optional
-                            if new_kwargs.get("nargs") == "+":
-                                new_kwargs["nargs"] = "*"
-                    if is_optional and new_kwargs.get("required"):
-                        del new_kwargs["required"]
-                    argparse_configs[new_dest] = (new_flags, new_kwargs)
-                continue
-
-            # Primitive handling
-            has_explicit_default = False
-            default_val = ...
-            if arg_opt:
-                if arg_opt.default is not _ARGS_OPT_DEFAULT_SENTINEL:
-                    has_explicit_default = True
-                    default_val = arg_opt.default
-            elif assigned_value is not ...:
-                has_explicit_default = True
-                default_val = assigned_value
-
-            help_text = (
-                (arg_opt.help if arg_opt else None)
-                or attr_docs.get(attr_name)
-                or f"Value for {attr_name}"
-            )
-            long_name = f"--{attr_name.replace('_', '-')}"
-            arg_names = [
-                alias for alias in [arg_opt.short if arg_opt else None, long_name] if alias
-            ]
-
-            kwargs = {"dest": attr_name}
-            actual_origin = get_origin(actual_type)
-
-            if actual_origin is Literal:
-                choices = get_args(actual_type)
-                kwargs.update({"choices": choices, "type": type(choices[0])})
-            elif isinstance(actual_type, type) and issubclass(actual_type, enum.Enum):
-                choices = [e.value for e in actual_type]
-                kwargs.update({"choices": choices, "type": type(choices[0])})
-                if has_explicit_default:
-                    kwargs["default"] = default_val.value
-            elif actual_type is bool:
-                kwargs["action"] = (
-                    "store_false"
-                    if (has_explicit_default and default_val is True)
-                    else "store_true"
-                )
-            elif actual_origin in (list, List):
-                item_type = get_args(actual_type)[0] if get_args(actual_type) else str
-                kwargs.update(
-                    {
-                        "type": item_type,
-                        "nargs": "+" if not has_explicit_default and not is_optional else "*",
-                    }
-                )
-            elif actual_type in [int, float, str]:
-                kwargs["type"] = actual_type
-
-            # if arg_opt and arg_opt.external:
-            #     kwargs["_external"] = True
-
-            is_required = not has_explicit_default and not is_optional
-            if is_required:
-                kwargs["required"] = True
-            elif "action" not in kwargs:
-                kwargs["default"] = (
-                    default_val
-                    if has_explicit_default
-                    else ([] if actual_origin in (list, List) else None)
-                )
-
-            help_parts = [help_text]
-            if "action" not in kwargs:
-                type_name = getattr(actual_type, "__name__", str(actual_type))
-                help_parts.append(f"[dim]({type_name})[/dim]")
-            if has_explicit_default and default_val is not None:
-                help_parts.append(f"[dim](default: {default_val!r})[/dim]")
-            kwargs["help"] = " ".join(help_parts)
-
-            if "dest" in kwargs or "action" in kwargs:
-                argparse_configs[attr_name] = (arg_names, kwargs)
-
-        new_cls._argparse_configs = argparse_configs
-        return new_cls
+        _DOC_CACHE[cls] = doc_map
+        return doc_map
 
     @staticmethod
-    def _parse_attr_docs(docstring: Optional[str]) -> dict[str, str]:
-        if not docstring:
-            return {}
-        docstring = dedent(docstring)
-        docs = {}
-        current_attr = None
-        in_attr_section = False
-        attr_start_regex = re.compile(r"^\s*(\w+)\s*(?:\(.*\))?:\s*(.*)")
-        for line in docstring.strip().splitlines():
-            if line.strip().lower() in ("args:", "attributes:", "parameters:"):
-                in_attr_section = True
-                current_attr = None
+    def _parse_class_content(docstring: str, doc_map: Dict[str, str]):
+        content = textwrap.dedent(docstring)
+        current_attr, in_section = None, False
+        for line in content.splitlines():
+            line = line.strip()
+            if line.lower() in ("args:", "parameters:", "attributes:"):
+                in_section = True
                 continue
-            if not in_attr_section:
+            if not in_section or not line:
                 continue
-            match = attr_start_regex.match(line)
+            match = re.match(r"^(\w+)(?:\s*\(.*\))?\s*:\s*(.*)", line)
             if match:
-                current_attr, help_text = match.groups()
-                docs[current_attr] = help_text.strip()
-            elif current_attr and line.strip() and (line.startswith(" ") or line.startswith("\t")):
-                docs[current_attr] += " " + line.strip()
-            else:
-                current_attr = None
-        return docs
+                current_attr, text = match.groups()
+                doc_map[current_attr] = text
+            elif current_attr:
+                doc_map[current_attr] += " " + line
 
 
-class ArgBase(metaclass=ArgParseMeta):
-    _args: List[str] = []
-    _unknown_args: List[str] = []
-    _prefix: str = ""
-
-    def __init__(self, **kwargs):
-        configs = getattr(self.__class__, "_argparse_configs", {})
-
-        self._args = kwargs.pop("_args", [])
-        self._prefix = kwargs.pop("_prefix", "")
-
-        nested_data = {}
-        for key, value in kwargs.items():
-            if "." in key:
-                parent, child = key.split(".", 1)
-                nested_data.setdefault(parent, {})[child] = value
-            else:
-                nested_data[key] = value
-
-        type_hints = getattr(self.__class__, "_cached_type_hints", {})
-        if not type_hints:
+class TypeReflector:
+    @staticmethod
+    def resolve_hints(cls: Type) -> Dict[str, Any]:
+        """ """
+        if cls not in _TYPE_CACHE:
             try:
-                type_hints = get_type_hints(self.__class__)
+                from typing import get_type_hints
+
+                _TYPE_CACHE[cls] = get_type_hints(cls)
             except Exception:
-                type_hints = getattr(self.__class__, "__annotations__", {})
+                _TYPE_CACHE[cls] = getattr(cls, "__annotations__", {})
+        return _TYPE_CACHE[cls]
 
-        for attr_name, type_hint in type_hints.items():
-            if attr_name.startswith("_"):
-                continue
+    @staticmethod
+    def unwrap(t: Type) -> Type:
+        origin = get_origin(t)
+        args = get_args(t)
 
-            origin = get_origin(type_hint)
-            actual_type = type_hint
+        if origin is Union:
+            valid = [x for x in args if x is not type(None)]
+            if len(valid) == 1:
+                return TypeReflector.unwrap(valid[0])
+        elif origin in (list, List):
+            if args:
+                return TypeReflector.unwrap(args[0])
+
+        return t
+
+    @staticmethod
+    def get_origin_type(t: Type) -> Any:
+        origin = get_origin(t)
+        if origin is Union:
+            args = get_args(t)
+            valid = [x for x in args if x is not type(None)]
+            if len(valid) == 1:
+                return get_origin(valid[0]) or valid[0]
+        return origin
+
+    @staticmethod
+    def to_str(t: Type) -> str:
+        try:
+            origin = get_origin(t)
+            args = get_args(t)
+
+            # 1. Literal -> {a, b, c}
+            if origin is Literal:
+                return f"{{{','.join(map(str, args))}}}"
+
+            # 2. List -> list[int]
+            if origin in (list, List):
+                inner = TypeReflector.to_str(args[0]) if args else "Any"
+                return f"list[{inner}]"
+            if isinstance(t, type) and issubclass(t, enum.Enum):
+                return t.__name__
             if origin is Union:
-                actual_type = next(
-                    (t for t in get_args(type_hint) if t is not type(None)), type_hint
-                )
+                valid = [x for x in args if x is not type(None)]
+                if len(valid) == 1:
+                    return TypeReflector.to_str(valid[0])
+                return "|".join(TypeReflector.to_str(x) for x in valid)
+            if hasattr(t, "__name__"):
+                return t.__name__
 
-            is_nested = isinstance(actual_type, type) and issubclass(actual_type, ArgBase)
+            return str(t).replace("typing.", "")
+        except:
+            return str(t)
 
-            default_val = getattr(self.__class__, attr_name, ...)
-            if isinstance(default_val, ArgsOpt):
-                default_val = default_val.default
-            default_instance = None
-            if is_nested and isinstance(default_val, actual_type):
-                default_instance = default_val
 
-            child_prefix = ""
-            if is_nested:
-                flag_part = attr_name.replace("_", "-")
-                child_prefix = f"{self._prefix}{flag_part}."
+class ArgumentAdapter:
+    def __init__(self, parser: argparse.ArgumentParser):
+        self.groups = {
+            True: parser.add_argument_group("Required arguments"),
+            False: parser.add_argument_group("Optional arguments"),
+        }
 
-            if attr_name in nested_data:
-                val = nested_data[attr_name]
-                if is_nested and isinstance(val, dict):
-                    if default_instance:
-                        child_obj = copy.deepcopy(default_instance)
-                        # Update with CLI overrides
-                        for k, v in val.items():
-                            setattr(child_obj, k, v)
-                        # Inject context
-                        child_obj._args = self._args
-                        child_obj._prefix = child_prefix
-                        setattr(self, attr_name, child_obj)
-                    else:
-                        # No default, raw init
-                        val["_args"] = self._args
-                        val["_prefix"] = child_prefix
-                        setattr(self, attr_name, actual_type(**val))
-                elif is_nested and isinstance(val, ArgBase):
-                    val._args = self._args
-                    val._prefix = child_prefix
-                    setattr(self, attr_name, val)
-                else:
-                    if isinstance(val, (list, dict, set)):
-                        setattr(self, attr_name, copy.deepcopy(val))
-                    else:
-                        setattr(self, attr_name, val)
-            else:
-                if is_nested:
-                    if origin is Union and type(None) in get_args(type_hint):
-                        setattr(self, attr_name, None)
-                    else:
-                        # Instantiate default child
-                        setattr(
-                            self, attr_name, actual_type(_args=self._args, _prefix=child_prefix)
-                        )
-                elif attr_name in configs:
-                    _, argparse_kwargs = configs[attr_name]
-                    default = argparse_kwargs.get("default")
-                    if default is ...:
-                        raise ValueError(f"Missing required argument: {attr_name}")
-                    if default is not None and isinstance(default, (list, dict, set)):
-                        val = copy.deepcopy(default)
-                    else:
-                        val = default
-                    setattr(self, attr_name, val)
+    def add_field(
+        self, field: dataclasses.Field, field_type: Type, prefix: str, default: Any, help_text: str
+    ):
+        name = f"{prefix}{field.name}"
+        flag = f"--{name.replace('_', '-')}"
 
-    @classmethod
-    def add_args_to_parser(cls, parser: argparse.ArgumentParser):
-        configs = getattr(cls, "_argparse_configs", {})
-        existing_groups = {g.title: g for g in parser._action_groups}
-        req_group = existing_groups.get("Required arguments")
-        if req_group is None:
-            req_group = parser.add_argument_group("Required arguments")
-        opt_group = existing_groups.get("Optional arguments")
-        if opt_group is None:
-            opt_group = parser.add_argument_group("Optional arguments")
+        real_type = TypeReflector.unwrap(field_type)
+        origin = TypeReflector.get_origin_type(field_type)
+        type_str = TypeReflector.to_str(field_type)
 
-        for _, (arg_names, kwargs) in configs.items():
-            if kwargs.get("_external"):
-                continue
-            target = req_group if kwargs.get("required") else opt_group
-            target.add_argument(*arg_names, **kwargs)
+        kwargs = {
+            "dest": name,
+            "default": default if default is not dataclasses.MISSING else None,
+        }
 
-    @classmethod
-    def parser(cls) -> argparse.ArgumentParser:
-        doc = cls.__doc__ or ""
-        desc = doc.split("\n\n")[0].strip() if doc else f"Arguments for {cls.__name__}"
-        parser = argparse.ArgumentParser(
-            description=desc, formatter_class=TyroStyleHelpFormatter, add_help=True
-        )
-        cls.add_args_to_parser(parser)
-        return parser
-
-    @classmethod
-    def parse(
-        cls,
-        args_list: Optional[List[str]] = None,
-        *,
-        parser: Optional[argparse.ArgumentParser] = None,
-        final: bool = False,
-    ) -> "ArgBase":
-        if parser is None:
-            parser = cls.parser()
-
-        if args_list is None:
-            import sys
-
-            args_list = sys.argv[1:]
-
-        unknown = []
-        if final:
-            args_ns = parser.parse_args(args_list)
+        if real_type is bool:
+            self._handle_bool(kwargs, default)
+            kwargs.pop("metavar", None)
+        elif origin in (list, List):
+            self._handle_list(kwargs, real_type, default)
+            inner_type = get_args(field_type)[0] if get_args(field_type) else str
+            kwargs["metavar"] = TypeReflector.to_str(inner_type).upper()
+        elif origin is Literal:
+            self._handle_literal(kwargs, field_type)
+            # Literal: {a,b}
+            # kwargs["metavar"] = type_str
+            kwargs["metavar"] = f"{{{','.join(map(str, kwargs['choices']))}}}"
+        elif isinstance(real_type, type) and issubclass(real_type, enum.Enum):
+            self._handle_enum(kwargs, real_type)
+            # Enum : {SGD,ADAM}
+            kwargs["metavar"] = f"{{{','.join(map(str, kwargs['choices']))}}}"
         else:
-            args_ns, unknown = parser.parse_known_args(args_list)
+            self._handle_primitive(kwargs, real_type, default)
+            # INT, STR
+            if "metavar" not in kwargs:
+                kwargs["metavar"] = TypeReflector.to_str(real_type).upper()
+        kwargs.update(field.metadata.get("argparse_kwargs", {}))
+        if real_type is bool:
+            kwargs.pop("metavar", None)
+        is_required = kwargs.get("required", False)
+        kwargs["help"] = self._format_help(help_text, type_str, default, is_required)
 
-        init_kwargs = vars(args_ns)
-        init_kwargs["_args"] = args_list
-        init_kwargs["_prefix"] = ""
-        instance = cls(**init_kwargs)
-        instance._unknown_args = unknown
-        return instance
+        flags = [flag]
+        if field.metadata.get("short"):
+            flags.append(field.metadata.get("short"))
 
-    def to_dict(self, recurse: bool = True) -> Dict[str, Any]:
-        configs = getattr(self.__class__, "_argparse_configs", {})
-        res = {}
-        for k in configs.keys():
-            if hasattr(self, k):
-                val = getattr(self, k)
-                if recurse and isinstance(val, ArgBase):
-                    res[k] = val.to_dict()
-                else:
-                    res[k] = val
-        return res
+        self.groups[is_required].add_argument(*flags, **kwargs)
 
-    def to_namespace(self) -> argparse.Namespace:
-        return argparse.Namespace(**self.to_dict(recurse=False))
+    def _handle_bool(self, kwargs, default):
+        kwargs["action"] = "store_false" if default is True else "store_true"
+        kwargs.pop("default", None)
 
-    def to(self, target_cls: Type["ArgBase"], final: bool = False) -> "ArgBase":
-        prefix_str = f"--{self._prefix}" if self._prefix else "--"
-        relevant_args = []
-        raw_args = self._args
-        # Optimized loop for stripping prefixes
-        n = len(raw_args)
-        i = 0
-        while i < n:
-            arg = raw_args[i]
-            if arg.startswith(prefix_str):
-                relevant_args.append(arg.replace(prefix_str, "--", 1))
-                i += 1
-                if i < n and not raw_args[i].startswith("-"):
-                    relevant_args.append(raw_args[i])
-                    i += 1
+    def _handle_list(self, kwargs, inner_type, default):
+        kwargs["type"] = inner_type
+        kwargs["nargs"] = "*" if default is not dataclasses.MISSING else "+"
+
+    def _handle_literal(self, kwargs, full_type):
+        args = get_args(full_type)
+        if get_origin(full_type) is Union:
+            args = get_args(next(t for t in get_args(full_type) if t is not type(None)))
+        kwargs["choices"] = args
+        kwargs["type"] = type(args[0])
+
+    def _handle_enum(self, kwargs, enum_type):
+        choices = [e.value for e in enum_type]
+        kwargs["choices"] = choices
+        kwargs["type"] = type(choices[0])
+
+    def _handle_primitive(self, kwargs, real_type, default):
+        kwargs["type"] = real_type
+        if default is dataclasses.MISSING:
+            kwargs["required"] = True
+            kwargs.pop("default", None)
+
+    def _format_help(self, base_help: str, type_str: str, default: Any, required: bool) -> str:
+        parts = []
+        # if type_str:
+        #     parts.append(type_str.upper())
+        if required:
+            parts.append("required")
+        elif default is not dataclasses.MISSING:
+            val = default.name if isinstance(default, enum.Enum) else str(default)
+            parts.append(f"default: {val}")
+
+        meta = f"[dim]({', '.join(parts)})[/dim]" if parts else ""
+        return f"{base_help}  {meta}" if base_help else meta
+
+
+class ArgParser:
+    def __init__(self, target_cls: Type[T], default_instance: Any = None):
+        self.target_cls = target_cls
+        self.parser = argparse.ArgumentParser(
+            formatter_class=TyroStyleHelpFormatter, description=target_cls.__doc__
+        )
+        self.unknown_args = []
+
+        self.adapter = ArgumentAdapter(self.parser)
+        self._build_recursive(target_cls, default_instance=default_instance)
+
+    def parse(self, args: Optional[List[str]] = None) -> T:
+        if args is None:
+            args = sys.argv[1:]
+        namespace, self.unknown_args = self.parser.parse_known_args(args)
+        return self._reconstruct(self.target_cls, vars(namespace))
+
+    @classmethod
+    def transform(cls, source: Any, target_cls: Type[T], args: Optional[List[str]] = None) -> T:
+        parser = cls(target_cls, default_instance=source)
+        return parser.parse(args)
+
+    @staticmethod
+    def as_dict(cfg: Any) -> Dict[str, Any]:
+        return asdict(cfg)
+
+    def _build_recursive(self, cls: Type, prefix: str = "", default_instance: Any = None):
+        hints = TypeReflector.resolve_hints(cls)
+        docs = DocstringResolver.resolve(cls)
+        for f in fields(cls):
+            if f.metadata.get("external"):
+                continue
+            f_type = hints.get(f.name, f.type)
+            real_type = TypeReflector.unwrap(f_type)
+            default_val = self._get_effective_default(f, default_instance)
+            if is_dataclass(real_type):
+                nested_def = default_val if is_dataclass(default_val) else None
+                self._build_recursive(
+                    real_type, prefix=f"{prefix}{f.name}.", default_instance=nested_def
+                )
             else:
-                i += 1
+                help_text = f.metadata.get("help") or docs.get(f.name, "")
+                self.adapter.add_field(f, f_type, prefix, default_val, help_text)
 
-        parser = target_cls.parser()
-        parser.set_defaults(**self.to_dict(recurse=False))
-        return target_cls.parse(relevant_args, parser=parser, final=final)
+    def _reconstruct(self, cls: Type, data: Dict[str, Any], prefix: str = "") -> Any:
+        init_kwargs = {}
+        hints = TypeReflector.resolve_hints(cls)
+
+        for f in fields(cls):
+            full_key = f"{prefix}{f.name}"
+            f_type = hints.get(f.name, f.type)
+            real_type = TypeReflector.unwrap(f_type)
+
+            if is_dataclass(real_type):
+                init_kwargs[f.name] = self._reconstruct(real_type, data, prefix=f"{full_key}.")
+            elif full_key in data:
+                val = data[full_key]
+                if isinstance(real_type, type) and issubclass(real_type, enum.Enum):
+                    val = real_type(val)
+                init_kwargs[f.name] = val
+
+        return cls(**init_kwargs)
+
+    def _get_effective_default(self, f: dataclasses.Field, instance: Any) -> Any:
+        if instance and hasattr(instance, f.name):
+            return getattr(instance, f.name)
+
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            try:
+                return f.default_factory()
+            except:
+                pass
+        return dataclasses.MISSING

@@ -1,18 +1,19 @@
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
-import numpy as np
 
-from thunder.utils import ArgBase
+from thunder.utils import ArgParser
 
 from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
 
 
-class GymVecLoaderSpec(ArgBase):
-    autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.NEXT_STEP
-
-
+@dataclass(kw_only=True)
 class GymnasiumLoaderSpec(EnvLoaderSpec):
+    @dataclass
+    class GymVecLoaderSpec:
+        autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.NEXT_STEP
+
     framework: str = "gymnasium"
     task: str = "CartPole-v1"
     num_envs: int = 1
@@ -29,7 +30,7 @@ class GymnasiumAdaptor(ObservationWrapper):
 
 @register_loader("gymnasium")
 def load_gym(spec: EnvLoaderSpec | GymnasiumLoaderSpec) -> GymnasiumAdaptor:
-    spec: GymnasiumLoaderSpec = spec.to(GymnasiumLoaderSpec, final=True)
+    spec = ArgParser.transform(spec, GymnasiumLoaderSpec)
     if spec.num_envs > 1:
         env = gym.make_vec(
             spec.task,

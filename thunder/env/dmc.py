@@ -1,11 +1,12 @@
-from typing import Any, Dict, Tuple
+from dataclasses import dataclass
 
-import gymnasium as gym
+from thunder.utils import ArgParser
 
 from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
 
 
-class DmcLoaderSpec(EnvLoaderSpec):
+@dataclass
+class DmcLoaderSpec:
     """ """
 
     framework: str = "dmc"
@@ -24,7 +25,7 @@ class DmcAdapter(ObservationWrapper):
 @register_loader("dmc")
 def load_dmc(spec: DmcLoaderSpec | EnvLoaderSpec) -> DmcAdapter:
     """ """
-    spec = spec.to(DmcLoaderSpec, final=True)
+    spec = ArgParser.transform(spec, DmcLoaderSpec)
     from dm_control import suite
 
     domain, task = spec.task.split("_", 1)

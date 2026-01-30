@@ -4,19 +4,23 @@ An example of a world model-based agent using Thunder.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from thunder.core import Batch, ModelPack, OptimizeOp, Pipeline
 from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
 from thunder.nn.torch import *
 from thunder.rl.torch import *
-from thunder.utils.arguments import ArgBase
+from thunder.utils import ArgOpt, ArgParser
 from thunder.utils.torch import AsyncLogger, TensorBoardLogger, Workspace
 
 
-class ExperimentSpec(ArgBase):
-    env: EnvLoaderSpec = EnvLoaderSpec(
-        framework="isaaclab", task="Isaac-Velocity-Flat-G1-v1", num_envs=4096
+@dataclass
+class ExperimentSpec:
+    env: EnvLoaderSpec = ArgOpt(
+        factory=lambda: EnvLoaderSpec(
+            framework="isaaclab", task="Isaac-Velocity-Flat-G1-v1", num_envs=4096
+        )
     )
     d_model: int = 128
     buffer_capacity: int = 128
@@ -25,8 +29,7 @@ class ExperimentSpec(ArgBase):
     project: str = "experiment"
     run_name: str = None
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __post_init__(self):
         self._workspace = None
 
     @property
@@ -202,7 +205,7 @@ if __name__ == "__main__":
             expand=False,
         )
 
-    spec: ExperimentSpec = ExperimentSpec().parse()
+    spec: ExperimentSpec = ArgParser(ExperimentSpec).parse()
 
     env = make_env(spec.env)
     agent = AliveAgent.from_env(env, spec)
@@ -215,4 +218,5 @@ if __name__ == "__main__":
             duration = end - start
             logger.log(metrics, agent.ctx.step)
             panel = generate_step_panel(agent.ctx.step - 1, spec.iteration, duration, metrics)
+            live.update(panel)
             live.update(panel)

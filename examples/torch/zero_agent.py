@@ -5,6 +5,7 @@ import torch
 from thunder.core import Executor, ModelPack
 from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
 from thunder.rl.torch import Agent, Rollout
+from thunder.utils import ArgParser
 
 
 class DummyAgent(Agent):
@@ -19,8 +20,8 @@ class DummyAgent(Agent):
 
 
 if __name__ == "__main__":
-    loader_spec = EnvLoaderSpec()
-    env = make_env(loader_spec.parse())
+    loader_spec: EnvLoaderSpec = ArgParser(EnvLoaderSpec).parse()
+    env = make_env(loader_spec)
     agent = DummyAgent.from_env(env)
     while True:
         agent.step()
