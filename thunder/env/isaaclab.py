@@ -1,28 +1,28 @@
-from typing import Any, Dict, List, Literal, Tuple
+from dataclasses import dataclass
+from typing import List, Literal
 
-import gymnasium as gym
-
-from thunder.utils import ArgsOpt
+from thunder.utils import ArgParser
 
 from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
 
 
+@dataclass(kw_only=True)
 class IsaacLabLoaderSpec(EnvLoaderSpec):
     """ """
 
     framework: str = "isaaclab"
-    task: str = ArgsOpt(default="Isaac-Cartpole-Direct-v0")
+    task: str = "Isaac-Cartpole-Direct-v0"
     num_envs: int = 1024
     headless: bool = False
-    device: str = ArgsOpt(default="cuda:0")
+    device: str = "cuda:0"
     livestream: int = -1
     enable_cameras: bool = False
     xr: bool = False
     verbose: bool = False
     info: bool = False
-    experience: str = ArgsOpt(default="")
+    experience: str = ""
     rendering_mode: Literal["performance", "balanced", "quality"] = "balanced"
-    kit_args: str = ArgsOpt(default="")
+    kit_args: str = ""
     disable_fabric: bool = False
     distributed: bool = False
     cpu: bool = False
@@ -37,8 +37,8 @@ def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnvWrapper
     """ """
     from isaaclab.app import AppLauncher
 
-    spec = spec.to(IsaacLabLoaderSpec, final=True)
-    app_launcher = AppLauncher(spec.to_namespace())
+    spec = ArgParser.transform(spec, IsaacLabLoaderSpec)
+    app_launcher = AppLauncher(ArgParser.as_dict(spec))
     import gymnasium
     import isaaclab_tasks
     import isaaclab_tasks_experimental

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import gymnasium as gym
 
 from thunder.core import Executor
-from thunder.utils import ArgBase
 
 if TYPE_CHECKING:
     from gymnasium import Space
@@ -16,13 +16,14 @@ if TYPE_CHECKING:
 _LOADER_REGISTRY: Dict[str, Callable[[Any], gym.Env]] = {}
 
 
-class EnvLoaderSpec(ArgBase):
+@dataclass
+class EnvLoaderSpec:
     """
     Args:
     """
 
-    framework: str = ...
-    task: str = ...
+    framework: str
+    task: str
     num_envs: int = 1
     num_agents: int = 1
     seed: int = 0

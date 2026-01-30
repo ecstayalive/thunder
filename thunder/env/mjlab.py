@@ -1,11 +1,10 @@
-from typing import Any, Dict, Tuple
-
-import gymnasium
+from dataclasses import dataclass
 
 from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
 
 
-class MjLabLoaderSpec(EnvLoaderSpec):
+@dataclass(kw_only=True)
+class MjLabLoaderSpec:
     framework: str = "mjlab"
     task: str = "default"
     num_envs: int = 1

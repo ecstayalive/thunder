@@ -1,6 +1,11 @@
+from dataclasses import dataclass
+
+from thunder.utils import ArgParser
+
 from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
 
 
+@dataclass(kw_only=True)
 class ManiSkillLoaderSpec(EnvLoaderSpec):
     framework: str = "maniskill"
     task: str = "PickCube-v1"
@@ -15,5 +20,5 @@ def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderEnvWrapp
     import gymnasium as gym
     import mani_skill.envs
 
-    spec = spec.to(ManiSkillLoaderSpec, final=True)
+    spec = ArgParser.transform(spec, ManiSkillLoaderSpec)
     return gym.make(spec.task, num_envs=spec.num_envs, obs_mode=spec.obs_mode)
