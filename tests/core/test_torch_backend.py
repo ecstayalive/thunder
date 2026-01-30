@@ -190,7 +190,7 @@ def test_torch_objective_standalone(device, tensor_batch_3d):
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
 
     metrics = algo.step(tensor_batch_3d)
-    assert "eval/loss" in metrics
+    assert "algorithm/eval/loss" in metrics
     assert torch.all(native_net.net.weight == 0.0)
 
 
@@ -240,7 +240,7 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
     )
     algo.build({})
     m = algo.step(tensor_batch_3d)
-    assert m["callable_op/hook"] is True
+    assert m["algorithm/callable_op/hook"] is True
 
 
 def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
@@ -253,9 +253,9 @@ def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     algo = algo_mod.Algorithm(model, executor, {"opt": {"targets": ["net"], "class": "SGD"}}, [op])
 
     metrics = algo.step(tensor_batch_3d)
-    l1 = metrics["optimize/m1/loss"]
-    l2 = metrics["optimize/m2/loss"]
-    total = metrics["optimize/total_loss"]
+    l1 = metrics["algorithm/optimize/m1/loss"]
+    l2 = metrics["algorithm/optimize/m2/loss"]
+    total = metrics["algorithm/optimize/total_loss"]
     assert torch.isclose(total, l1 * 1.0 + l2 * 2.0)
 
 
@@ -333,7 +333,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     nn.init.constant_(native_net.net.weight, 0.0)
     model = module_mod.ModelPack(net=native_net)
-    executor = exec_mod.Executor(mixed_precision=True, compile=False)
+    executor = exec_mod.Executor(precision="fp16", compile=False)
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
@@ -441,7 +441,7 @@ def test_torch_empty_step_scheduling(device, tensor_batch_3d):
         assert op.count == 1
 
     metrics = algo.step(tensor_batch_3d)
-    assert "counter/count" in metrics
+    assert "algorithm/counter/count" in metrics
     assert op.count == 2
 
 
@@ -524,10 +524,10 @@ def test_torch_objective_standalone_eval(device, tensor_batch_3d):
     obj = MSEObjective("eval_only")
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
     metrics = algo.step(tensor_batch_3d)
-    assert "eval_only/loss" in metrics
-    assert "eval_only/weighted_loss" in metrics
+    assert "algorithm/eval_only/loss" in metrics
+    assert "algorithm/eval_only/weighted_loss" in metrics
     # Weight is 1.0 by default
-    assert metrics["eval_only/loss"] == metrics["eval_only/weighted_loss"]
+    assert metrics["algorithm/eval_only/loss"] == metrics["algorithm/eval_only/weighted_loss"]
 
 
 def test_torch_algorithm_params_access(device, tensor_batch_3d):
@@ -612,8 +612,8 @@ def test_torch_multi_step_optimization(device, tensor_batch_3d):
 
     metrics = algo.step(tensor_batch_3d)
 
-    assert "optimize/net1_loss/loss" in metrics
-    assert "optimize/net2_loss/loss" in metrics
+    assert "algorithm/optimize/net1_loss/loss" in metrics
+    assert "algorithm/optimize/net2_loss/loss" in metrics
     assert not torch.equal(algo.ctx.models.net1.net.weight, wa_before)
     assert not torch.equal(algo.ctx.models.net2.net.weight, wc_before)
 

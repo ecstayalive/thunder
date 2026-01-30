@@ -159,27 +159,6 @@ class OptimizeOp(Operation):
         return ctx, metrics
 
 
-class Condition(Operation):
-    """_summary_
-
-    Args:
-        Operation (_type_): _description_
-    """
-
-    def __init__(
-        self, condition: Callable[[ExecutionContext], bool], op: Operation, name="condition"
-    ):
-        super().__init__(name)
-        self.op = op
-        self.condition = condition
-
-    def forward(self, ctx: ExecutionContext):
-        if self.condition(ctx):
-            return self.op(ctx)
-        else:
-            return ctx, {}
-
-
 class CallableOp(Operation):
     __slots__ = ("_fn",)
 

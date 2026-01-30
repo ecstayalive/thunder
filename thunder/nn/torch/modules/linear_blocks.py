@@ -69,6 +69,10 @@ class LinearBlock(nn.Module):
         for layer in self.linear_block:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, math.sqrt(gain))
+                if layer.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(layer.weight)
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(layer.bias, -bound, bound)
 
     def forward(self, input: Tensor) -> Tensor:
         return self.linear_block(input)

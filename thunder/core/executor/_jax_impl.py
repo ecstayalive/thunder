@@ -206,6 +206,7 @@ class JaxExecutor:
             precision, jnp.float32
         )
         self.mixed_precision = self.compute_dtype is not jnp.float32
+        self.use_scaler = self.compute_dtype is jnp.float16
         self._mesh = None
 
     def init(
@@ -264,7 +265,7 @@ class JaxExecutor:
                 target_names = [target_names]
             target_names = tuple(target_names)
             target_modules = {t: getattr(models, t) for t in target_names}
-            scaler = _DynamicScaler() if self.mixed_precision else _IdentityScaler()
+            scaler = _DynamicScaler() if self.use_scaler else _IdentityScaler()
             scaler_state = scaler.init()
             # Create Optax optimizer
             cls_name = cfg.pop("class", "adam").lower()
@@ -371,17 +372,19 @@ class JaxExecutor:
             scaled_loss = scaler.scale(jnp.asarray(total_loss, dtype=jnp.float32), scaler_state)
             return scaled_loss, metrics
 
-        tracked_state = nnx.state(optimizer.model)
-        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-        (loss, metrics), grads = grad_fn(tracked_state)
-        grads = scaler.unscale(grads, scaler_state)
-        grad_norm = optax.global_norm(grads)
-        scale = jnp.where(
-            max_grad_norm > 0, jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6)), 1.0
-        )
-        grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
-        scaler.step(optimizer, grads)
-        new_scaler_state = scaler.update(scaler_state, grads)
+        with _precision_scope(jnp.float32):
+            tracked_state = nnx.state(optimizer.model)
+            grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+            (loss, metrics), grads = grad_fn(tracked_state)
+            grads = scaler.unscale(grads, scaler_state)
+            grad_norm = optax.global_norm(grads)
+            # scale = jnp.where(
+            #     max_grad_norm > 0, jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6)), 1.0
+            # )
+            scale = jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6))
+            grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
+            scaler.step(optimizer, grads)
+            new_scaler_state = scaler.update(scaler_state, grads)
         # nnx.update(models, nnx.state(optimizer.model))
         metrics["grad_norm"] = optax.global_norm(grads)
         metrics["loss_total"] = loss

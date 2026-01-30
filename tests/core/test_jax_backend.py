@@ -244,7 +244,7 @@ def test_jax_multi_op(jax_batch_3d):
     pipeline = [update_op, counter]
     algo = algo_mod.Algorithm(models, executor, {}, pipeline)
     m = algo.step(jax_batch_3d)
-    assert m["counter/count"] == 1
+    assert m["algorithm/counter/count"] == 1
     current_net2_params = nnx.state(algo.ctx.models.net2)
     assert not jtu.tree_all(
         jtu.tree_map(lambda x, y: jnp.array_equal(x, y), initial_net2_params, current_net2_params)
@@ -256,9 +256,9 @@ def test_jax_multi_op(jax_batch_3d):
     assert jtu.tree_all(is_correct)
     for i in range(4):
         m = algo.step(jax_batch_3d)
-        assert m["counter/count"] == 1
+        assert m["algorithm/counter/count"] == 1
     m_final = algo.step(jax_batch_3d)
-    assert m_final["counter/count"] == 2
+    assert m_final["algorithm/counter/count"] == 2
 
 
 def test_jax_jit_speedup(jax_batch_3d):
@@ -342,7 +342,7 @@ def test_jax_objective_standalone_eval(jax_batch_3d):
     obj = JaxMSEObjective("eval")
     algo = algo_mod.Algorithm(models, executor, {}, [obj])
     m = algo.step(jax_batch_3d)
-    assert "eval/loss" in m
+    assert "algorithm/eval/loss" in m
     assert jnp.all(models.net.net.kernel.value == 0.0)
 
 
@@ -463,8 +463,8 @@ def test_jax_multi_objective_complex_pipeline(jax_batch_3d):
     }
     algo = algo_mod.Algorithm(models, executor, optim_config, pipeline)
     metrics = algo.step(jax_batch_3d)
-    assert "optimize/m1/loss" in metrics
-    assert "optimize/m2/loss" in metrics
+    assert "algorithm/optimize/m1/loss" in metrics
+    assert "algorithm/optimize/m2/loss" in metrics
     assert algo.ctx.step == 1
 
 

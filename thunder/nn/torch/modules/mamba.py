@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 import thunder.nn.torch.ops as ops
@@ -29,7 +30,7 @@ class MambaBlock(nn.Module):
         dt_init_floor: float = 1.0e-4,
         bias: bool = False,
         conv_bias: bool = True,
-        kernel_fused_opt: bool = True,
+        official_ops: bool = True,
         activation: str = "silu",
         device=None,
         dtype=None,
@@ -41,8 +42,7 @@ class MambaBlock(nn.Module):
         self.d_conv = d_conv
         self.d_inner = int(expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.kernel_fused_opt = kernel_fused_opt
-
+        self.official_ops = official_ops
         # Projection
         self.in_proj = nn.Linear(
             self.d_model, out_features=self.d_inner * 2, bias=bias, **factory_kwargs
@@ -184,7 +184,6 @@ class MambaBlock(nn.Module):
         y, last_state = ops.selective_scan(
             x, delta, A, B, C, self.D, z, self.dt_proj.bias.float(), state, delta_softplus=True
         )
-
         y = y.transpose(1, 2)  # (B, L, ED)
         return y, last_state
 

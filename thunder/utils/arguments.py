@@ -168,6 +168,15 @@ class ArgParseMeta(type):
             if isinstance(actual_type, type) and issubclass(actual_type, ArgBase):
                 child_configs = getattr(actual_type, "_argparse_configs", {})
                 prefix = attr_name.replace("_", "-")
+                nested_default = None
+                if (
+                    not arg_opt
+                    and assigned_value is not ...
+                    and isinstance(assigned_value, actual_type)
+                ):
+                    nested_default = assigned_value
+                elif arg_opt and isinstance(arg_opt.default, actual_type):
+                    nested_default = arg_opt.default
                 for child_dest, (child_flags, child_kwargs) in child_configs.items():
                     new_dest = f"{attr_name}.{child_dest}"
                     new_flags = []
@@ -177,6 +186,17 @@ class ArgParseMeta(type):
                             new_flags.append(f"--{prefix}.{suffix}")
                     new_kwargs = copy.deepcopy(child_kwargs)
                     new_kwargs["dest"] = new_dest
+                    if nested_default and hasattr(nested_default, child_dest):
+                        child_val = getattr(nested_default, child_dest)
+                        # If the default object has a valid value, use it as default
+                        if child_val is not ...:
+                            new_kwargs["default"] = child_val
+                            # It is no longer required since we have a default
+                            if new_kwargs.get("required"):
+                                del new_kwargs["required"]
+                            # If nargs was +, switch to * because it's now optional
+                            if new_kwargs.get("nargs") == "+":
+                                new_kwargs["nargs"] = "*"
                     if is_optional and new_kwargs.get("required"):
                         del new_kwargs["required"]
                     argparse_configs[new_dest] = (new_flags, new_kwargs)
@@ -323,6 +343,14 @@ class ArgBase(metaclass=ArgParseMeta):
                 )
 
             is_nested = isinstance(actual_type, type) and issubclass(actual_type, ArgBase)
+
+            default_val = getattr(self.__class__, attr_name, ...)
+            if isinstance(default_val, ArgsOpt):
+                default_val = default_val.default
+            default_instance = None
+            if is_nested and isinstance(default_val, actual_type):
+                default_instance = default_val
+
             child_prefix = ""
             if is_nested:
                 flag_part = attr_name.replace("_", "-")
@@ -331,9 +359,20 @@ class ArgBase(metaclass=ArgParseMeta):
             if attr_name in nested_data:
                 val = nested_data[attr_name]
                 if is_nested and isinstance(val, dict):
-                    val["_args"] = self._args
-                    val["_prefix"] = child_prefix
-                    setattr(self, attr_name, actual_type(**val))
+                    if default_instance:
+                        child_obj = copy.deepcopy(default_instance)
+                        # Update with CLI overrides
+                        for k, v in val.items():
+                            setattr(child_obj, k, v)
+                        # Inject context
+                        child_obj._args = self._args
+                        child_obj._prefix = child_prefix
+                        setattr(self, attr_name, child_obj)
+                    else:
+                        # No default, raw init
+                        val["_args"] = self._args
+                        val["_prefix"] = child_prefix
+                        setattr(self, attr_name, actual_type(**val))
                 elif is_nested and isinstance(val, ArgBase):
                     val._args = self._args
                     val._prefix = child_prefix

@@ -21,7 +21,9 @@ class Algorithm(ABC):
         executor: Optional[Executor] = None,
         optim_config: Optional[Dict[str, Any]] = None,
         pipeline: Optional[Pipeline | Iterable[Operation]] = None,
+        name: str = "algorithm",
     ):
+        self.name = name
         self.models = models
         self.ctx = None
         self.executor = executor if executor is not None else Executor()
@@ -46,11 +48,12 @@ class Algorithm(ABC):
             pipeline (Iterable[Operation]): _description_
         """
         if pipeline is None:
-            self.pipeline = Pipeline([], jit=False)
+            self.pipeline = Pipeline([], name=self.name, jit=False)
         elif isinstance(pipeline, Pipeline):
+            pipeline.name = self.name
             self.pipeline = pipeline
         else:
-            self.pipeline = Pipeline(pipeline, name="", jit=jit)
+            self.pipeline = Pipeline(pipeline, name=self.name, jit=jit)
 
     def step(self, batch: Optional[Batch] = None) -> Dict[str, Any]:
         """_summary_

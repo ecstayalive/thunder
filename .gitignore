@@ -4,3 +4,8 @@ build
 .pytest_cache
 .vscode
 *.ini
+logs
+.logs
+log
+.log
+wandb

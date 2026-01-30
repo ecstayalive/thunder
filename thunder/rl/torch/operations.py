@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Iterable
 
 import gymnasium as gym
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 
 from thunder.core import (
     Batch,
     ExecutionContext,
+    Executor,
     ModelPack,
     Objective,
     Operation,
@@ -18,7 +20,7 @@ from thunder.core import (
 )
 from thunder.env.loader import ThunderEnvWrapper
 
-from .functional import get_trajectory_lengths
+from .functional import all_reduce, get_trajectory_lengths
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -26,33 +28,72 @@ if TYPE_CHECKING:
 
 
 class SIGRegObj(Objective):
-    def __init__(self, name="sigreg", weight=1.0, num_slices=128, t_points=17, t_range=5.0):
+    """Sketched Isotropic Gaussian Regularization
+    For details: https://arxiv.org/abs/2511.08544
+    Args:
+
+    """
+
+    def __init__(self, name="sigreg", weight=1.0, num_slices=128, t_points=17, t_range=3.0):
         super().__init__(name, weight)
         self.num_slices = num_slices
-        self.t_points = t_points
-        self.t_range = t_range
+        self.device = Executor.default_device()
+        self.t = torch.linspace(0, t_range, t_points, device=self.device, dtype=torch.float32)
+        dt = t_range / (t_points - 1)
+        weights = torch.full((t_points,), 2 * dt, device=self.device, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        self.phi = torch.exp(-0.5 * self.t.square())
+        self.integration_weights = weights * self.phi
+        self.global_step = torch.zeros((), device=self.device, dtype=torch.long)
+        self._generator = None
+
+    def _get_generator(self, device, seed):
+        if self._generator is None:
+            self._generator = torch.Generator(device=device)
+        self._generator.manual_seed(seed)
+        return self._generator
 
     def compute(self, batch: Batch, model: ModelPack):
         embeddings: torch.Tensor = batch["embeddings"]
-        embeddings = embeddings.reshape(-1, embeddings.size(-1))
-        N, D = embeddings.shape
-        device = embeddings.device
-        proj_shape = (D, self.num_slices)
-        A = torch.randn(proj_shape, device=device)
-        A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
-        z_proj = embeddings @ A
-        t = torch.linspace(-self.t_range, self.t_range, self.t_points, device=device)
-        t = t.view(1, 1, -1)
-        exp_f = torch.exp(-0.5 * t**2)
-        arg = z_proj.unsqueeze(-1) * t
-        cos_val = torch.cos(arg)
-        sin_val = torch.sin(arg)
-        ecf = torch.complex(cos_val, sin_val).mean(dim=0)
-        diff_sq = (ecf - exp_f).abs().square()
-        weighted_err = diff_sq * exp_f
-        integral = torch.trapezoid(weighted_err, x=t, dim=-1)
-        loss_per_slice = integral * N
-        loss = loss_per_slice.mean()
+        mask: torch.Tensor = batch.mask
+        x = embeddings[mask].reshape(-1, embeddings.size(-1))
+        N_local = x.size(0)
+        D = x.size(-1)
+        device = x.device
+        with torch.no_grad():
+            if dist.is_available() and dist.is_initialized():
+                seed_tensor = self.global_step.clone()
+                dist.all_reduce(seed_tensor, op=dist.ReduceOp.MAX)
+                seed = seed_tensor.item()
+            else:
+                seed = self.global_step.item()
+            g = self._get_generator(device, seed)
+            A = torch.randn((D, self.num_slices), device=device, generator=g)
+            A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
+            self.global_step.add_(1)
+
+        # x_proj: [N, K]
+        # x_proj(i,k) represents the projected value of the (i)th sample in the (k)th random direction.
+        x_proj = x @ A
+        # x_t: [N, K, T] = [N, K, 1] * [T]
+        # The projected value of sample `i` in direction `k`` is multiplied by `t`
+        x_t = x_proj.unsqueeze(-1) * self.t
+        cos_vals = torch.cos(x_t)
+        sin_vals = torch.sin(x_t)
+        cos_mean = cos_vals.mean(dim=0)
+        sin_mean = sin_vals.mean(dim=0)
+
+        if dist.is_available() and dist.is_initialized():
+            cos_mean = all_reduce(cos_mean, "AVG")
+            sin_mean = all_reduce(sin_mean, "AVG")
+
+        err_sq = (cos_mean - self.phi).square() + sin_mean.square()
+        # The trapezoidal rule integrals
+        loss_per_slice = err_sq @ self.integration_weights
+        total_N = N_local
+        if dist.is_available() and dist.is_initialized():
+            total_N = total_N * dist.get_world_size()
+        loss = loss_per_slice.mean() * total_N
         return loss, {}
 
 
@@ -68,7 +109,7 @@ class Rollout(Operation):
         self.obs, _ = env.reset()
 
     def forward(self, ctx: ExecutionContext | None = None):
-        with torch.inference_mode():
+        with torch.no_grad():
             for _ in range(self.step):
                 action = self.agent.act(self.obs)
                 next_obs, rewards, dones, timeouts, info = self.env.step(action)
@@ -221,6 +262,20 @@ class StaticSplitTraj(Operation):
 
         ctx.batch = tree_map(_transform_leaf, ctx.batch)
         ctx.batch = ctx.batch.replace(mask=mask[idxs])
+        return ctx, {}
+
+
+class SaveModels(Operation):
+    def __init__(self, interval: int, path="./logs/models/", name="save_models"):
+        super().__init__(name)
+        self.interval = interval
+        if not os.path.exists(path):
+            os.makedirs(path)
+        self.path = path
+
+    def forward(self, ctx):
+        if ctx.step % self.interval == 0:
+            torch.save(ctx.models.state_dict(), f"{self.path}/weights_{ctx.step}.pth")
         return ctx, {}
 
 

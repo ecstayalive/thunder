@@ -24,8 +24,9 @@ class Agent(Algorithm):
         executor: Optional[Executor] = None,
         optim_config: Optional[Dict[str, Any]] = None,
         pipeline: Optional[Pipeline | Iterable[Operation]] = None,
+        name: str = "agent",
     ):
-        super().__init__(models, executor, optim_config, pipeline)
+        super().__init__(models, executor, optim_config, pipeline, name=name)
         self.buffer = buffer if buffer is not None else Buffer()
 
     def act(self, obs):

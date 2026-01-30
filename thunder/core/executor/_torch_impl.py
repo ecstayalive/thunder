@@ -42,11 +42,11 @@ class TorchExecutor:
 
     def __init__(
         self,
-        mixed_precision: bool = False,
+        precision: str = "fp32",
         distributed: bool = False,
         device: Optional[str] = None,
         enable_cudnn_benchmark: bool = True,
-        compile=True,
+        compile=False,
         compile_args=None,
         **kwargs,
     ):
@@ -54,6 +54,12 @@ class TorchExecutor:
         if device == "gpu":
             device = "cuda"
         self.device = self.default_device(device)
+        self.precision = precision
+        self.compute_dtype = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }.get(precision, torch.float32)
         self.compiled_autograd = False
         self.compile = False
         if self.device.type == "cuda":
@@ -64,9 +70,11 @@ class TorchExecutor:
             # torch._dynamo.config.compiled_autograd = True
             self.compile = compile
             self.compile_args = {} if compile_args is None else compile_args
-        self.mixed_precision = mixed_precision
+        self.mixed_precision = (
+            self.device.type == "cuda" and self.compute_dtype is not torch.float32
+        )
         self.distributed = distributed
-        self.use_scaler = self.mixed_precision and self.device.type == "cuda"
+        self.use_scaler = self.compute_dtype is torch.float16 and self.device.type == "cuda"
         self.scaler = (
             torch.amp.GradScaler(enabled=self.use_scaler) if self.use_scaler else _IdentityScaler()
         )
@@ -171,13 +179,13 @@ class TorchExecutor:
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = self._forward(objectives, ctx.batch, ctx.models)
         metrics["total_loss"] = loss
-        self.scaler.scale(loss).backward()
-        if max_grad_norm > 0:
+        with torch.amp.autocast(enabled=False, device_type=self.device.type, dtype=torch.float32):
+            self.scaler.scale(loss).backward()
             self.scaler.unscale_(optimizer)
             params_to_clip = [p for group in optimizer.param_groups for p in group["params"]]
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
-        self.scaler.step(optimizer)
-        self.scaler.update()
+            self.scaler.step(optimizer)
+            self.scaler.update()
         if optim_group.scheduler is not None:
             optim_group.scheduler.step()
         return metrics

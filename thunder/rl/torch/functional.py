@@ -1,34 +1,18 @@
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 
-def sig_reg(x: torch.Tensor, global_step, num_slices: int = 256):
-    """Sketched Isotropic Gaussian Regularization (SIGReg)
-    For Details:
-        http://arxiv.org/abs/2511.08544
-    Args:
-        x (torch.Tensor): _description_
-        global_step (_type_): _description_
-        num_slices (int, optional): _description_. Defaults to 256.
-    """
-    dev = dict(device=x.device)
-    g = torch.Generator(**dev)
-    g.manual_seed(global_step)
-    proj_shape = (x.size(1), num_slices)
-    A = torch.randn(proj_shape, generator=g, **dev)
-    A /= A.norm(p=2, dim=0)
-    t = torch.linspace(-5, 5, 17, **dev)
-    exp_f = torch.exp(-0.5 * t**2)
-    x_t = x.unsqueeze(2) * t
-    ecf = (1j * x_t).exp().mean(0)
-    # ecf = all_reduce(ecf, op="AVG")
-    # err = (ecf - exp_f).abs().square().mul(exp_f)
-    # N = x.size(0) * world_size
-    # T = torch.trapz(err, t, dim=1) * N
-    # return T
-    # return T
+def all_reduce(tensor, op="AVG"):
+    if dist.is_available() and dist.is_initialized():
+        if op == "AVG":
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            tensor /= dist.get_world_size()
+        elif op == "MAX":
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return tensor
 
 
 @torch.inference_mode()
