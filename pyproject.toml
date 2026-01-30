@@ -8,25 +8,28 @@ version = "0.0.0"
 authors = [{ name = "ecstayalive", email = "ecstayalive@163.com" }]
 description = ""
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = [
-    "torch",
-    "mamba-ssm",
     "numpy",
     "gymnasium",
-    "wandb",
     "tqdm",
     "rich",
     "rich_argparse",
     "pytest",
+    "coolname",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest", "black"]
 
 [project.urls]
 "Homepage" = "https://github.com/ecstayalive/thunder"
 "Bug Tracker" = "https://github.com/ecstayalive/thunder/issues"
+"Discussions" = "https://github.com/ecstayalive/thunder/discussions"
 
 [project.scripts]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1.0", "mamba-ssm"]
+jax = ["jax[cuda12]>=0.4.0", "flax", "optax"]
+warp = ["warp-lang"]
+all = ["thunder[torch,jax,warp]"]
