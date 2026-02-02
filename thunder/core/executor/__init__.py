@@ -34,8 +34,8 @@ else:
 
     except (ImportError, ModuleNotFoundError) as e:
         _hints = {
-            "torch": "pip install thunder-rl[torch]",
-            "jax": "pip install thunder-rl[jax]",
+            "torch": "pip install thunder[torch]",
+            "jax": "pip install thunder[jax]",
             "warp": "Make sure nvidia-warp is installed.",
         }
         raise ImportError(

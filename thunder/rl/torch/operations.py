@@ -34,8 +34,17 @@ class SIGRegObj(Objective):
 
     """
 
-    def __init__(self, name="sigreg", weight=1.0, num_slices=128, t_points=17, t_range=3.0):
-        super().__init__(name, weight)
+    def __init__(
+        self,
+        weight=1.0,
+        name="sigreg",
+        key: str = "embeddings",
+        num_slices=128,
+        t_points=17,
+        t_range=3.0,
+    ):
+        super().__init__(weight, name)
+        self.key = key
         self.num_slices = num_slices
         self.device = Executor.default_device()
         self.t = torch.linspace(0, t_range, t_points, device=self.device, dtype=torch.float32)
@@ -54,7 +63,7 @@ class SIGRegObj(Objective):
         return self._generator
 
     def compute(self, batch: Batch, model: ModelPack):
-        embeddings: torch.Tensor = batch["embeddings"]
+        embeddings: torch.Tensor = batch[self.key]  # [B, L ,D]
         mask: torch.Tensor = batch.mask
         x = embeddings[mask].reshape(-1, embeddings.size(-1))
         N_local = x.size(0)
@@ -109,7 +118,7 @@ class Rollout(Operation):
         self.obs, _ = env.reset()
 
     def forward(self, ctx: ExecutionContext | None = None):
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(self.step):
                 action = self.agent.act(self.obs)
                 next_obs, rewards, dones, timeouts, info = self.env.step(action)
@@ -160,8 +169,8 @@ class SoftUpdate(Operation):
     def forward(self, ctx: ExecutionContext):
         with torch.inference_mode():
             models: ModelPack = ctx.models
-            source: nn.Module = models.get(self.source)
-            target: nn.Module = models.get(self.target)
+            source: nn.Module = models[self.source]
+            target: nn.Module = models[self.target]
             for tgt, src in zip(target.parameters(), source.parameters(), strict=True):
                 tgt.data.mul_(1 - self.tau).add_(src.data, alpha=self.tau)
         return ctx, {}
@@ -217,6 +226,16 @@ class SplitTraj(Operation):
 
         ctx.batch = tree_map(_transform_leaf, ctx.batch)
         ctx.batch = ctx.batch.replace(mask=mask)
+        return ctx, {}
+
+
+class UnpadTraj(Operation):
+    """ """
+
+    def __init__(self, name="split_traj"):
+        super().__init__(name)
+
+    def forward(self, ctx: ExecutionContext):
         return ctx, {}
 
 

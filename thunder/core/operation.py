@@ -43,7 +43,7 @@ class Objective(Operation):
 
     """
 
-    def __init__(self, name: str = "objective", weight: float = 1.0, **kwargs):
+    def __init__(self, weight: float = 1.0, name: str = "objective", **kwargs):
         super().__init__(name=name, **kwargs)
         self.weight = weight
 

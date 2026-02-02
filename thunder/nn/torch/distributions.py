@@ -59,7 +59,7 @@ class NeuralNormal(NeuralDistribution):
             last_layer.bias[self.out_features :].fill_(std_bias)
             last_layer.bias[: self.out_features].fill_(0.0)
 
-    def forward(self, features: torch.Tensor):
+    def forward(self, features: torch.Tensor)->distributions.Normal:
         mean, inv_std = torch.chunk(self.ffn(features), 2, -1)
         std = torch.clamp(F.softplus(inv_std) + self.min_std, max=self.max_std)
         return distributions.Normal(mean, std)

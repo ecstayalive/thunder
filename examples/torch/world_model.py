@@ -7,12 +7,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from thunder.core import Batch, ModelPack, OptimizeOp, Pipeline
+import torch.nn.functional as F
+
+from thunder.core import OptimizeOp, Pipeline
 from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
-from thunder.nn.torch import *
+from thunder.nn.torch import LinearBlock, Mamba2Block, NeuralNormal, clone_net
 from thunder.rl.torch import *
 from thunder.utils import ArgOpt, ArgParser
-from thunder.utils.torch import AsyncLogger, TensorBoardLogger, Workspace
+from thunder.utils.torch import (
+    AsyncLogger,
+    CumlTSNELogger,
+    TensorBoardLogger,
+    Workspace,
+)
 
 
 @dataclass
@@ -35,7 +42,7 @@ class ExperimentSpec:
     @property
     def workspace(self) -> Workspace:
         if self._workspace is None:
-            self._workspace = Workspace("./logs", self.project, self.run_name)
+            self._workspace = Workspace("./logs", self.project, self.run_name, True)
         return self._workspace
 
 
@@ -44,27 +51,23 @@ class Represent(nn.Module):
         self, in_features: int, d_model: int, d_state: int = 4, d_expand: int = 2, d_conv: int = 4
     ):
         super().__init__()
-        self.in_proj = nn.Linear(in_features, d_model)
+        # self.in_proj = nn.Sequential(nn.Linear(in_features, d_model, [256]), nn.LayerNorm(d_model))
+        self.in_proj = LinearBlock(in_features, d_model, activate_output=True)
         self.d_model = d_model
         self.d_state = d_state
         self.d_expand = d_expand
         self.d_conv = d_conv
-        self.layer_norm = nn.LayerNorm(d_model)
         self.enc = Mamba2Block(d_model, d_state=d_state, d_conv=d_conv, expand=d_expand)
 
     def forward(self, obs, carry=None):
         input = self.in_proj(obs)
-        embedding, carry = self.enc(self.layer_norm(input), carry)
+        embedding, carry = self.enc(input, carry)
         return embedding, carry
 
-
-class Transition(nn.Module):
-    def __init__(self, action_dim: int, d_model: int, hidden_features: Tuple[int] = [256, 256]):
-        super().__init__()
-        self.transition = LinearBlock(action_dim + d_model, d_model, hidden_features)
-
-    def forward(self, embedding: torch.Tensor, actions: torch.Tensor):
-        return self.transition(torch.cat((embedding, actions), dim=-1))
+    def step(self, obs, carry=None):
+        input = self.in_proj(obs)
+        embedding, carry = self.enc.step(input, carry)
+        return embedding, carry
 
 
 class RepresentOp(Operation):
@@ -76,38 +79,47 @@ class RepresentOp(Operation):
     def forward(self, ctx: ExecutionContext):
         batch: Batch = ctx.batch
         models: ModelPack = ctx.models
-        carry = tree_map(lambda x: x[:, 0], batch["represent_carry"])
+        carry = pytree.tree_map(lambda x: x[:, 0], batch["represent_carry"])
         obs = batch.obs["policy"]
         embeddings: torch.Tensor
-        embeddings, carry = models.represent(obs, carry=carry)
+        embeddings, _ = models.represent(obs, carry=carry)
         ctx.batch = ctx.batch.replace(embeddings=embeddings)
         return ctx, {}
 
 
 class PredictionObj(Objective):
     class Models:
-        transition: Transition
+        transition: NeuralNormal
         represent: Represent
         actor: NeuralNormal
 
-    def __init__(self, name="predict", weight=1.0):
-        super().__init__(name, weight)
+    def __init__(self, weight=1.0, name="predict"):
+        super().__init__(weight, name)
+        self.dz_l2_weight = 0.1
 
     def compute(self, batch: Batch, models: Models):
-        z_curr = batch["embeddings"][:, :-1]
-        a_curr = batch.actions[:, :-1]
-        z_target = batch["embeddings"][:, 1:].detach()
-        z_pred = models.transition(z_curr, a_curr)
-        pred_loss = F.mse_loss(z_pred, z_target, reduction="none")
-        pred_loss = pred_loss[batch.mask[:, 1:]].mean()
-        return pred_loss, {}
+        embeddings: torch.Tensor = batch["embeddings"]
+        mask: torch.Tensor = batch.mask[:, 1:]
+
+        a_t = batch.actions[:, :-1]
+        z_t = embeddings[:, :-1]
+        z_next = embeddings[:, 1:].detach()
+        tau = torch.rand((z_t.shape[0], z_t.shape[1], 1), device=z_t.device)  # [B, L, 1]
+        x_tau = (1.0 - tau) * z_t + tau * z_next
+        ut = z_next - z_t
+        vt_pred = models.transition(torch.cat((x_tau, a_t, tau), dim=-1))
+        fm_loss = F.mse_loss(vt_pred[mask], ut[mask])
+        dz_l2 = ut[mask].square().mean()
+        pred_loss = fm_loss + dz_l2
+        metrics = {f"{self._prefix}fm_loss": fm_loss, f"{self._prefix}dz": dz_l2}
+        return pred_loss, metrics
 
 
 class AliveAgent(Agent):
     class Models:
-        transition: Transition
+        transition: NeuralNormal
         represent: Represent
-        actor: Actor
+        actor: NeuralNormal
 
     def __init__(self, models, buffer=None, executor=None, optim_config=None, pipeline=None):
         super().__init__(models, buffer, executor, optim_config, pipeline)
@@ -152,7 +164,7 @@ class AliveAgent(Agent):
         obs_shape = env.observation_space["policy"].shape[-1]
         action_dim = env.action_space.shape[-1]
         represent = Represent(obs_shape, spec.d_model)
-        transition = Transition(action_dim, spec.d_model)
+        transition = LinearBlock(spec.d_model + action_dim + 1, spec.d_model, [256, 256])
         actor = NeuralNormal(spec.d_model, action_dim, [256, 256], init_std=0.5)
         models = ModelPack(represent=represent, transition=transition, actor=actor)
         optim_config = {
@@ -163,17 +175,17 @@ class AliveAgent(Agent):
         executor = Executor(precision=spec.precision, compile=False)
         agent = cls(models=models, executor=executor, optim_config=optim_config, buffer=buffer)
         pipeline = [
-            Rollout(env, agent),
+            Rollout(env, agent, step=32),
             OptimizeLoop(
                 BufferLoader(
                     buffer,
-                    ChunkBufferSampler(buffer, batch_size=32, chunk_len=32, num_batches=10),
+                    ChunkBufferSampler(buffer, batch_size=128, chunk_len=32, num_batches=10),
                 ),
                 Pipeline(
                     [
                         SplitTraj(),
                         RepresentOp(),
-                        OptimizeOp("wm_opt", [PredictionObj(), SIGRegObj(weight=0.05)]),
+                        OptimizeOp("wm_opt", [PredictionObj(), SIGRegObj(0.05)]),
                     ],
                     jit=False,
                 ),
@@ -209,7 +221,7 @@ if __name__ == "__main__":
 
     env = make_env(spec.env)
     agent = AliveAgent.from_env(env, spec)
-    logger = AsyncLogger([TensorBoardLogger(spec.workspace)])
+    logger = AsyncLogger([TensorBoardLogger(spec.workspace), CumlTSNELogger(spec.workspace)])
     with Live(console=console, refresh_per_second=1) as live:
         for _ in range(spec.iteration):
             start = time.time()
@@ -217,6 +229,6 @@ if __name__ == "__main__":
             end = time.time()
             duration = end - start
             logger.log(metrics, agent.ctx.step)
-            panel = generate_step_panel(agent.ctx.step - 1, spec.iteration, duration, metrics)
-            live.update(panel)
+            panel = generate_step_panel(agent.ctx.step, spec.iteration, duration, metrics)
+            # console.print(panel)
             live.update(panel)

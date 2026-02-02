@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 import thunder.nn.torch.ops as ops
@@ -31,6 +32,7 @@ class MambaBlock(nn.Module):
         bias: bool = False,
         conv_bias: bool = True,
         official_ops: bool = True,
+        rmsnorm: bool = True,
         activation: str = "silu",
         device=None,
         dtype=None,
@@ -43,6 +45,7 @@ class MambaBlock(nn.Module):
         self.d_inner = int(expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.official_ops = official_ops
+        self.rmsnorm = rmsnorm
         # Projection
         self.in_proj = nn.Linear(
             self.d_model, out_features=self.d_inner * 2, bias=bias, **factory_kwargs
@@ -85,6 +88,9 @@ class MambaBlock(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.D._no_weight_decay = True
 
+        if self.rmsnorm:
+            pass  # TODO:
+
     def forward(
         self, input: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -107,6 +113,8 @@ class MambaBlock(nn.Module):
         x = x.transpose(1, 2)  # (B, L, ED)
         x = self.activate_layer(x)
         y, last_ssm_state = self.ssm(x, z, ssm_state)
+        if self.rmsnorm:
+            pass
         output = self.out_proj(y)
         return output, (last_conv_state, last_ssm_state)
 
@@ -213,6 +221,7 @@ class Mamba2Block(nn.Module):
         bias: bool = False,
         conv_bias: bool = True,
         official_ops: bool = False,
+        rmsnorm: bool = True,
         activation: str = "silu",
         device=None,
         dtype=None,
@@ -231,7 +240,7 @@ class Mamba2Block(nn.Module):
             self.d_inner % self.headdim == 0
         ), f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}"
         self.nheads = self.d_inner // self.headdim  # H
-
+        self.rmsnorm = rmsnorm
         self.in_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=bias, **factory_kwargs)
 
         # depthwise causal conv
@@ -244,25 +253,17 @@ class Mamba2Block(nn.Module):
             bias=conv_bias,
             **factory_kwargs,
         )
+        # activate layer
+        act_cls = getattr(nn, ACTIVATION_CLS_NAME.get(activation, "SiLU"))
+        self.activate_layer = act_cls()
         #  dt:   (B, L, nheads)
         #  B,C:  (B, L, nheads, d_state)
         self.ssm_proj = nn.Linear(
             self.d_inner,
-            self.nheads + 2 * self.nheads * self.d_state,  # dt  # B / C
+            self.nheads + 2 * self.nheads * self.d_state,
             bias=False,
             **factory_kwargs,
         )
-
-        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
-        A_log = torch.log(A).to(dtype=dtype)
-        self.A_log = nn.Parameter(A_log)  # (H,)
-        self.A_log._no_weight_decay = True
-
-        # D skip per head
-        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
-        self.D._no_weight_decay = True
-
         # dt bias initialization：softplus(dt_bias) belong to [dt_min, dt_max]
         dt = torch.exp(
             torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
@@ -272,8 +273,17 @@ class Mamba2Block(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         self.dt_bias = nn.Parameter(inv_dt)  # (H,)
         self.dt_bias._no_weight_decay = True
-        act_cls = getattr(nn, ACTIVATION_CLS_NAME.get(activation, "SiLU"))
-        self.activate_layer = act_cls()
+        # A matrix initialization
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A_log = torch.log(A).to(dtype=dtype)
+        self.A_log = nn.Parameter(A_log)  # (H,)
+        self.A_log._no_weight_decay = True
+        # D skip per head
+        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+        self.D._no_weight_decay = True
+        if self.rmsnorm:
+            self.norm = RMSNormGated(self.d_inner, norm_before_gate=False, **factory_kwargs)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(
@@ -295,12 +305,13 @@ class Mamba2Block(nn.Module):
         x, last_conv_state = self._conv_forward(x, conv_state)
         x = x.transpose(1, 2)  # (B, L, ED)
         x = self.activate_layer(x)  # (B, L, ED)
-
+        # if self.rmsnorm:
+        #     x = self.norm(x)
         y, last_ssm_state = self._ssm_mamba2(x, ssm_state)  # (B, L, ED)
-
-        # sigmoid gating
-        y = y * torch.sigmoid(z)
-
+        if self.rmsnorm:
+            y = self.norm(y, z)
+        else:
+            y = y * F.silu(z)
         out = self.out_proj(y)  # (B, L, D)
         return out, (last_conv_state, last_ssm_state)
 
@@ -382,7 +393,6 @@ class Mamba2Block(nn.Module):
                 initial_states=state,  # (B, H, P, N) or None
             )  # Y_heads: (B, L, H, P)
         # final_state: (B, H, P, N)
-        # 5) D skip
         Y_heads = Y_heads + self.D.view(1, 1, H, 1) * X
         y = Y_heads.reshape(Bsz, L, ED)  # (B, L, ED)
         return y, last_state
