@@ -25,7 +25,7 @@ class DmcAdapter(ObservationWrapper):
 @register_loader("dmc")
 def load_dmc(spec: DmcLoaderSpec | EnvLoaderSpec) -> DmcAdapter:
     """ """
-    spec = ArgParser.transform(spec, DmcLoaderSpec)
+    spec: DmcLoaderSpec = ArgParser.transform(spec, DmcLoaderSpec)
     from dm_control import suite
 
     domain, task = spec.task.split("_", 1)

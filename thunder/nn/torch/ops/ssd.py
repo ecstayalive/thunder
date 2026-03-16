@@ -139,7 +139,7 @@ def ssd_minimal(
     )  # (b, c, l, h, p)
 
     Y = Y_diag + Y_off  # (b, c, l, h, p)
-    Y = Y.view(Bsz, L_pad, H, P)  # (b, L_pad, h, p)
+    Y = Y.contiguous().view(Bsz, L_pad, H, P)  # (b, L_pad, h, p)
 
     if pad > 0:
         Y = Y[:, :L]

@@ -37,8 +37,8 @@ class SIGRegObj(Objective):
     def __init__(
         self,
         weight=1.0,
+        key: str = "embedding",
         name="sigreg",
-        key: str = "embeddings",
         num_slices=128,
         t_points=17,
         t_range=3.0,
@@ -64,10 +64,10 @@ class SIGRegObj(Objective):
 
     def compute(self, batch: Batch, model: ModelPack):
         embeddings: torch.Tensor = batch[self.key]  # [B, L ,D]
-        mask: torch.Tensor = batch.mask
+        mask: torch.Tensor = batch.mask  # [B, L]
+        B, L, D = embeddings.shape
         x = embeddings[mask].reshape(-1, embeddings.size(-1))
         N_local = x.size(0)
-        D = x.size(-1)
         device = x.device
         with torch.no_grad():
             if dist.is_available() and dist.is_initialized():
@@ -130,7 +130,7 @@ class Rollout(Operation):
                     next_obs, _ = self.env.reset(indices=reset_idx)
                 self.agent.reset(reset_idx)
                 self.obs = next_obs
-        return ctx, {}
+        return ctx, info
 
     def __repr__(self):
         """ """
@@ -151,6 +151,7 @@ class OptimizeLoop(Operation):
         self.pipeline = pipeline
 
     def forward(self, ctx: ExecutionContext):
+        m = {}
         for batch in self.loader:
             ctx = ctx.replace(batch=batch)
             ctx, m = self.pipeline(ctx)
@@ -229,16 +230,6 @@ class SplitTraj(Operation):
         return ctx, {}
 
 
-class UnpadTraj(Operation):
-    """ """
-
-    def __init__(self, name="split_traj"):
-        super().__init__(name)
-
-    def forward(self, ctx: ExecutionContext):
-        return ctx, {}
-
-
 class StaticSplitTraj(Operation):
     """ """
 
@@ -281,6 +272,16 @@ class StaticSplitTraj(Operation):
 
         ctx.batch = tree_map(_transform_leaf, ctx.batch)
         ctx.batch = ctx.batch.replace(mask=mask[idxs])
+        return ctx, {}
+
+
+class UnpadTraj(Operation):
+    """ """
+
+    def __init__(self, name="unpad_traj"):
+        super().__init__(name)
+
+    def forward(self, ctx: ExecutionContext):
         return ctx, {}
 
 

@@ -4,3 +4,4 @@ from .buffer import *
 from .critic import *
 from .functional import *
 from .operations import *
+from .utils import *

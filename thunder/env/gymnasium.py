@@ -30,7 +30,7 @@ class GymnasiumAdaptor(ObservationWrapper):
 
 @register_loader("gymnasium")
 def load_gym(spec: EnvLoaderSpec | GymnasiumLoaderSpec) -> GymnasiumAdaptor:
-    spec = ArgParser.transform(spec, GymnasiumLoaderSpec)
+    spec: GymnasiumLoaderSpec = ArgParser.transform(spec, GymnasiumLoaderSpec)
     if spec.num_envs > 1:
         env = gym.make_vec(
             spec.task,

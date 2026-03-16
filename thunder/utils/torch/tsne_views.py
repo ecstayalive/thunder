@@ -35,7 +35,7 @@ class TrajectoryView(TSNEView):
     def __init__(
         self,
         independent: bool = False,
-        plot_nums: int = 16,
+        plot_nums: int = 4,
         plot_connection: bool = False,
         seed=0,
         **kwargs,

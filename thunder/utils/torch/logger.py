@@ -1,8 +1,8 @@
+from __future__ import annotations
+
 import atexit
-import datetime
 import math
 import os
-import pathlib
 import signal
 import sys
 import threading
@@ -10,7 +10,6 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union, final
 
-import coolname
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -18,38 +17,22 @@ import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
 
 from .tsne_views import VIEW_REGISTRY, TSNEView
+from .workspace import Workspace
 
 if TYPE_CHECKING:
     from thunder.core import ExecutionContext
 
 
-class Workspace:
-    """
-    Args:
-        ...
-    """
-
-    def __init__(self, root: str, project: str, run_name: str = None, timestamp: bool = False):
-        self.root = pathlib.Path(root)
-        self.project = project
-        self.run_name = run_name if run_name else coolname.generate_slug(2)
-        if timestamp:
-            time_stamp = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-            self.run_name = f"{time_stamp}-{self.run_name}"
-        self.run_dir = self.root / project / self.run_name
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-
-    def __repr__(self):
-        return f"Workspace(run_dir={self.run_dir})"
-
-
 class Logger(ABC):
-    def __init__(self, workspace: Workspace):
+    def __init__(self, workspace: Workspace, enable: bool = True):
         self.workspace = workspace
         self.initialized = False
+        self.enable = enable
 
     @final
     def log(self, metrics: Dict[str, Any], step: int):
+        if not self.enable:
+            return
         if not self.initialized:
             self.init()
         self.log_impl(metrics, step)
@@ -57,6 +40,8 @@ class Logger(ABC):
     @final
     def init(self):
         """ """
+        if not self.workspace.run_dir.exists():
+            self.workspace.mkdir()
         self.init_impl()
         self.initialized = True
 
@@ -86,6 +71,8 @@ class TensorBoardLogger(Logger):
                 self._logger.add_scalar(k, v.cpu().item(), global_step=step)
             elif isinstance(v, (int, float)):
                 self._logger.add_scalar(k, v, global_step=step)
+            elif isinstance(v, dict):
+                self.log_impl({f"{k}/{sub_k}": sub_v for sub_k, sub_v in v.items()}, step)
 
     def close(self):
         if self._logger is not None:
@@ -129,14 +116,14 @@ class SwanLabLogger(Logger):
     def init_impl(self):
         import swanlab
 
-    def log_impl(self, metrics, step):
+    def log_impl(self, metrics: Dict[str, Any], step: int):
         pass
 
     def close(self):
         pass
 
 
-class CumlTSNELogger(Logger):
+class CuTSNELogger(Logger):
     def __init__(
         self,
         workspace: Workspace,
@@ -149,9 +136,9 @@ class CumlTSNELogger(Logger):
         perplexity: int = 30,
         max_iter: int = 1000,
         interval: int = 20,
-        save: bool = True,
+        enable: bool = True,
     ):
-        super().__init__(workspace)
+        super().__init__(workspace, enable=enable)
         # TSNE config
         self.perplexity = perplexity
         self.max_iter = max_iter
@@ -164,14 +151,11 @@ class CumlTSNELogger(Logger):
         n = len(self.views)
         self.cols = math.ceil(math.sqrt(n))
         self.rows = math.ceil(n / self.cols)
-        # Save Config
-        self.save = save
-        self.save_dir = self.workspace.run_dir / "tsne"
-        self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self._tsne = None
         self._fig = None
         self._axes = None
+        self.save_dir = self.workspace.run_dir / "tsne"
 
     def _create_view(self, v):
         if isinstance(v, str):
@@ -190,6 +174,8 @@ class CumlTSNELogger(Logger):
             raise ValueError(f"Invalid view format: {v}")
 
     def init_impl(self):
+        if self.enable:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         from cuml.manifold import TSNE as cumlTSNE
 
         self._tsne = cumlTSNE(
@@ -212,17 +198,17 @@ class CumlTSNELogger(Logger):
 
     def log_impl(self, metrics: Dict[str, Any], step: int):
         ctx: ExecutionContext = metrics["execution_context"]
-        embeddings = ctx.batch["embeddings"]
+        embedding = ctx.batch["embedding"]
         mask = ctx.batch.mask
         if step % self.interval != 0:
             return
-        if embeddings is None or mask is None:
+        if embedding is None or mask is None:
             return
         mask_bool = mask.bool()
         traj_lengths = mask_bool.sum(dim=1)
         keep_indices = traj_lengths > 1
         valid_mask = mask_bool & keep_indices.unsqueeze(1)
-        valid_embeddings = embeddings[valid_mask]
+        valid_embeddings = embedding[valid_mask]
         valid_lengths: torch.Tensor = traj_lengths[keep_indices]
         offsets = torch.zeros(
             valid_lengths.size(0) + 1, dtype=torch.long, device=valid_lengths.device
@@ -301,9 +287,12 @@ def _logger_worker_entry(queue: mp.Queue, backends: List[Logger]):
 class AsyncLogger:
     """ """
 
-    def __init__(self, backends: List[Logger], queue_size: int = 1000):
+    def __init__(self, backends: List[Logger], queue_size: int = 1000, enable: bool = True):
         self.backends = backends
         self.queue_size = queue_size
+        self.enable = enable
+        for logger in backends:
+            logger.enable = enable
         self._process = None
         self._queue = None
         self._owner_pid = os.getpid()
@@ -328,6 +317,8 @@ class AsyncLogger:
         self._process.start()
 
     def log(self, metrics: Dict[str, Any], step: int):
+        if not self.enable:
+            return
         if os.getpid() != self._owner_pid:
             return
         if self._process is None:

@@ -20,5 +20,5 @@ def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderEnvWrapp
     import gymnasium as gym
     import mani_skill.envs
 
-    spec = ArgParser.transform(spec, ManiSkillLoaderSpec)
+    spec: ManiSkillLoaderSpec = ArgParser.transform(spec, ManiSkillLoaderSpec)
     return gym.make(spec.task, num_envs=spec.num_envs, obs_mode=spec.obs_mode)

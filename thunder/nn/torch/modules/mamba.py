@@ -220,7 +220,7 @@ class Mamba2Block(nn.Module):
         dt_init_floor: float = 1e-4,
         bias: bool = False,
         conv_bias: bool = True,
-        official_ops: bool = False,
+        official_ops: bool = True,
         rmsnorm: bool = True,
         activation: str = "silu",
         device=None,

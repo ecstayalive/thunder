@@ -169,6 +169,23 @@ class _ContextRef:
         self._compiled_fn = self._jit_compile()
         return self._compiled_fn(ctx)
 
+    def __eq__(self, other):
+        if not isinstance(other, _ContextRef):
+            return False
+        return self._path == other._path
+
+    def __hash__(self):
+        return hash(self._path)
+
+    def __str__(self):
+        res = "ctx"
+        for op, key in self._path:
+            if op == 0:
+                res += f".{key}"
+            else:
+                res += f"[{repr(key)}]"
+        return res
+
     def _jit_compile(self):
         """ """
         expr = "ctx"
