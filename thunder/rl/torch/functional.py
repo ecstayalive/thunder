@@ -5,7 +5,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 
-def all_reduce(tensor, op="AVG"):
+def all_reduce(tensor: torch.Tensor, op="AVG"):
     if dist.is_available() and dist.is_initialized():
         if op == "AVG":
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)

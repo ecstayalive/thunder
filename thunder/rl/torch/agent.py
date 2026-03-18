@@ -7,8 +7,7 @@ from thunder.core import Algorithm, Executor, ModelPack, Operation, Pipeline
 from .buffer import Buffer
 
 if TYPE_CHECKING:
-    from .actor import Actor
-    from .operations import Rollout
+    ...
 
 
 class Agent(Algorithm):

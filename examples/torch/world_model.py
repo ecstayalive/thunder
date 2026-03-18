@@ -7,12 +7,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from thunder.core import Batch, ModelPack, OptimizeOp, Pipeline
+import torch.nn.functional as F
+
+from thunder.core import OptimizeOp, Pipeline
 from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
-from thunder.nn.torch import *
+from thunder.nn.torch import LinearBlock, Mamba2Block, NeuralNormal
 from thunder.rl.torch import *
 from thunder.utils import ArgOpt, ArgParser
-from thunder.utils.torch import AsyncLogger, TensorBoardLogger, Workspace
+from thunder.utils.torch import AsyncLogger, CuTSNELogger, TensorBoardLogger, Workspace
 
 
 @dataclass
@@ -28,6 +30,7 @@ class ExperimentSpec:
     iteration: int = 10000
     project: str = "experiment"
     run_name: str = None
+    disable_logger: bool = False
 
     def __post_init__(self):
         self._workspace = None
@@ -35,36 +38,33 @@ class ExperimentSpec:
     @property
     def workspace(self) -> Workspace:
         if self._workspace is None:
-            self._workspace = Workspace("./logs", self.project, self.run_name)
+            self._workspace = Workspace("./logs", self.project, self.run_name, True)
         return self._workspace
 
 
-class Represent(nn.Module):
+class RepresentModel(nn.Module):
+    """ """
+
     def __init__(
         self, in_features: int, d_model: int, d_state: int = 4, d_expand: int = 2, d_conv: int = 4
     ):
         super().__init__()
-        self.in_proj = nn.Linear(in_features, d_model)
+        self.in_proj = LinearBlock(in_features, d_model, activate_output=True)
         self.d_model = d_model
         self.d_state = d_state
         self.d_expand = d_expand
         self.d_conv = d_conv
-        self.layer_norm = nn.LayerNorm(d_model)
         self.enc = Mamba2Block(d_model, d_state=d_state, d_conv=d_conv, expand=d_expand)
 
     def forward(self, obs, carry=None):
         input = self.in_proj(obs)
-        embedding, carry = self.enc(self.layer_norm(input), carry)
+        embedding, carry = self.enc(input, carry)
         return embedding, carry
 
-
-class Transition(nn.Module):
-    def __init__(self, action_dim: int, d_model: int, hidden_features: Tuple[int] = [256, 256]):
-        super().__init__()
-        self.transition = LinearBlock(action_dim + d_model, d_model, hidden_features)
-
-    def forward(self, embedding: torch.Tensor, actions: torch.Tensor):
-        return self.transition(torch.cat((embedding, actions), dim=-1))
+    def step(self, obs, carry=None):
+        input = self.in_proj(obs)
+        embedding, carry = self.enc.step(input, carry)
+        return embedding, carry
 
 
 class RepresentOp(Operation):
@@ -76,38 +76,157 @@ class RepresentOp(Operation):
     def forward(self, ctx: ExecutionContext):
         batch: Batch = ctx.batch
         models: ModelPack = ctx.models
-        carry = tree_map(lambda x: x[:, 0], batch["represent_carry"])
-        obs = batch.obs["policy"]
-        embeddings: torch.Tensor
-        embeddings, carry = models.represent(obs, carry=carry)
-        ctx.batch = ctx.batch.replace(embeddings=embeddings)
+        obs: torch.Tensor = batch.obs["policy"]
+        carry = pytree.tree_map(lambda x: x[:, 0], batch["represent_carry"])
+        t_carry = pytree.tree_map(lambda x: x[:, 1], batch["represent_carry"])
+        L = obs.size(1)
+        threshold = torch.rand(1, L, 1, device=obs.device)
+        noise_mask = (torch.rand(obs.size(0), L, 1, device=obs.device) < threshold).float()
+        noise = torch.randn_like(noise_mask) * 0.1
+        mask_obs = obs * noise_mask + noise * (1 - noise_mask)
+        embedding, _ = models.represent(obs, carry=carry)
+        noise_embedding, _ = models.represent(mask_obs, carry=carry)
+        next_embedding, _ = models.represent(obs[:, 1:], carry=t_carry)
+        ctx.batch = ctx.batch.replace(
+            embedding=embedding, noise_embedding=noise_embedding, next_embedding=next_embedding
+        )
         return ctx, {}
 
 
-class PredictionObj(Objective):
+class JepaPredictObj(Objective):
     class Models:
-        transition: Transition
-        represent: Represent
+        transition: LinearBlock
+        reward_model: LinearBlock
+        continue_model: LinearBlock
+        represent: RepresentModel
         actor: NeuralNormal
 
-    def __init__(self, name="predict", weight=1.0):
-        super().__init__(name, weight)
+    def __init__(self, weight=1.0, name="jepa_predict"):
+        super().__init__(weight, name)
 
     def compute(self, batch: Batch, models: Models):
-        z_curr = batch["embeddings"][:, :-1]
-        a_curr = batch.actions[:, :-1]
-        z_target = batch["embeddings"][:, 1:].detach()
-        z_pred = models.transition(z_curr, a_curr)
-        pred_loss = F.mse_loss(z_pred, z_target, reduction="none")
-        pred_loss = pred_loss[batch.mask[:, 1:]].mean()
-        return pred_loss, {}
+        embedding: torch.Tensor = batch["embedding"]
+        noise_embedding: torch.Tensor = batch["noise_embedding"]
+        next_embedding: torch.Tensor = batch["next_embedding"]
+        mask: torch.Tensor = batch.mask
+        mask_next: torch.Tensor = batch.mask[:, 1:]
+        a_t = batch.actions[:, :-1]
+        z_t = embedding[:, :-1]
+        z_pred = models.transition(torch.cat((z_t, a_t), dim=-1))
+        predict_loss = F.mse_loss(z_pred[mask_next], next_embedding[mask_next].detach())
+        consistent_loss = F.mse_loss(noise_embedding[mask], embedding[mask])
+        r_pred = models.reward_model(embedding).squeeze()
+        r_loss = F.mse_loss(r_pred[mask], batch.rewards[mask])
+        target_c = 1.0 - batch.dones[mask].float()
+        c_pred = models.continue_model(embedding).squeeze()
+        c_loss = F.binary_cross_entropy_with_logits(c_pred[mask], target_c)
+        pred_loss = predict_loss + consistent_loss + r_loss + c_loss
+        metrics = {
+            f"{self._prefix}dynamic_loss": predict_loss,
+            f"{self._prefix}consistent_loss": consistent_loss,
+            f"{self._prefix}reward_loss": r_loss,
+            f"{self._prefix}continue_loss": c_loss,
+        }
+        return pred_loss, metrics
+
+
+class ImagineOp(Operation):
+
+    def __init__(self, horizon=16, gamma=0.99, lambda_=0.95, name="imagine_op"):
+        super().__init__(name)
+        self.horizon = horizon
+        self.gamma = gamma
+        self.lambda_ = lambda_
+
+    def forward(self, ctx):
+        models = ctx.models
+        batch = ctx.batch
+        embedding: torch.Tensor = batch["embedding"]
+        z_t: torch.Tensor = embedding[:, 0, :].detach()
+        z_seq, a_seq, r_seq, c_seq, entropy_seq = [], [], [], [], []
+        for _ in range(self.horizon):
+            dist = models.actor(z_t)
+            a_t = dist.rsample()
+            entropy = dist.entropy().unsqueeze(-1)
+            r_t = models.reward_model(z_t)
+            c_t = torch.sigmoid(models.continue_model(z_t))
+            z_seq.append(z_t)
+            a_seq.append(a_t)
+            r_seq.append(r_t)
+            c_seq.append(c_t)
+            entropy_seq.append(entropy)
+            z_t = models.transition(torch.cat((z_t, a_t), dim=-1))
+        z_seq.append(z_t)
+        z_seq = torch.stack(z_seq)  # [H+1, B*T, DModel+ActionDim]
+        a_seq = torch.stack(a_seq)  # [H, B*T, ActionDim]
+        r_seq = torch.stack(r_seq)  # [H, B*T, 1]
+        c_seq = torch.stack(c_seq)  # [H, B*T, 1]
+        entropy_seq = torch.stack(entropy_seq)  # [H, B*T, 1]
+        lambda_values = compute_lambda_returns(
+            r_seq, models.v(z_seq), c_seq, gamma=self.gamma, lambda_=self.lambda_
+        )
+        ctx.batch = ctx.batch.replace(
+            imagined_z=z_seq,
+            imagined_a=a_seq,
+            imagined_r=r_seq,
+            imagined_c=c_seq,
+            imagined_entropy=entropy_seq,
+            imagined_lambda_v=lambda_values,
+        )
+        return ctx, {
+            f"{self._prefix}z_seq_norm": z_seq.norm(dim=-1).mean(),
+            f"{self._prefix}entropy": entropy_seq.mean(),
+            f"{self._prefix}imagined_reward": r_seq.mean(),
+            f"{self._prefix}lambda_value": lambda_values.mean(),
+        }
+
+
+class ActorObj(Objective):
+    class Models:
+        transition: LinearBlock
+        reward_model: LinearBlock
+        continue_model: LinearBlock
+        v: LinearBlock
+        actor: NeuralNormal
+
+    def __init__(self, weight=1.0, name="actor_obj", entropy_coef=1e-4, **kwargs):
+        super().__init__(weight, name, **kwargs)
+        self.entropy_coef = entropy_coef
+
+    def compute(self, batch: Batch, models: Models):
+        entropy = batch.imagined_entropy
+        lambda_values = batch.imagined_lambda_v
+        actor_loss = -lambda_values.mean()
+        # - self.entropy_coef * entropy.mean()
+        return actor_loss, {}
+
+
+class CriticObj(Objective):
+    class Models:
+        transition: LinearBlock
+        reward_model: LinearBlock
+        continue_model: LinearBlock
+        v: LinearBlock
+        actor: NeuralNormal
+
+    def __init__(self, weight=1.0, name="critic_obj", entropy_coef=1e-4, **kwargs):
+        super().__init__(weight, name, **kwargs)
+        self.entropy_coef = entropy_coef
+
+    def compute(self, batch: Batch, models: Models):
+        z = batch.imagined_z
+        lambda_values = batch.imagined_lambda_v
+        critic_loss = F.mse_loss(models.v(z[:-1].detach()), lambda_values.detach())
+        return critic_loss, {}
 
 
 class AliveAgent(Agent):
     class Models:
-        transition: Transition
-        represent: Represent
-        actor: Actor
+        transition: LinearBlock
+        represent: RepresentModel
+        reward_model: LinearBlock
+        v: LinearBlock
+        actor: NeuralNormal
 
     def __init__(self, models, buffer=None, executor=None, optim_config=None, pipeline=None):
         super().__init__(models, buffer, executor, optim_config, pipeline)
@@ -151,34 +270,52 @@ class AliveAgent(Agent):
         models = ModelPack()
         obs_shape = env.observation_space["policy"].shape[-1]
         action_dim = env.action_space.shape[-1]
-        represent = Represent(obs_shape, spec.d_model)
-        transition = Transition(action_dim, spec.d_model)
-        actor = NeuralNormal(spec.d_model, action_dim, [256, 256], init_std=0.5)
-        models = ModelPack(represent=represent, transition=transition, actor=actor)
+        represent = RepresentModel(obs_shape, spec.d_model)
+        transition = LinearBlock(spec.d_model + action_dim, spec.d_model, [256, 256])
+        reward_model = LinearBlock(spec.d_model, 1, [256, 256])
+        continue_model = LinearBlock(spec.d_model, 1, [256, 256])
+        actor = NeuralNormal(spec.d_model, action_dim, [256, 256], init_std=0.25)
+        v = LinearBlock(spec.d_model, 1, [256, 256])
+        models = ModelPack(
+            represent=represent,
+            transition=transition,
+            reward_model=reward_model,
+            continue_model=continue_model,
+            v=v,
+            actor=actor,
+        )
         optim_config = {
-            "wm_opt": {"targets": ["represent", "transition"], "lr": 1e-4},
-            "action_opt": {"targets": ["actor"], "lr": 1e-4},
+            "wm_opt": {
+                "targets": ["represent", "transition", "reward_model", "continue_model"],
+                "lr": 1e-4,
+            },
+            "critic_opt": {"targets": ["v"], "lr": 1e-4},
+            "actor_opt": {"targets": ["actor"], "lr": 1e-4},
         }
         buffer = Buffer(capacity=spec.buffer_capacity)
         executor = Executor(precision=spec.precision, compile=False)
         agent = cls(models=models, executor=executor, optim_config=optim_config, buffer=buffer)
         pipeline = [
-            Rollout(env, agent),
+            Rollout(env, agent, step=32),
             OptimizeLoop(
                 BufferLoader(
                     buffer,
-                    ChunkBufferSampler(buffer, batch_size=32, chunk_len=32, num_batches=10),
+                    ChunkBufferSampler(buffer, batch_size=256, chunk_len=32, num_batches=10),
                 ),
                 Pipeline(
                     [
                         SplitTraj(),
                         RepresentOp(),
-                        OptimizeOp("wm_opt", [PredictionObj(), SIGRegObj(weight=0.05)]),
+                        OptimizeOp("wm_opt", [JepaPredictObj(0.95), SIGRegObj(0.05)]),
+                        ImagineOp(horizon=16),
+                        OptimizeOp("actor_opt", [ActorObj()]),
+                        OptimizeOp("critic_opt", [CriticObj()]),
                     ],
                     jit=False,
                 ),
+                name="opt_loop",
             ),
-            SaveModels(interval=500, path=f"{spec.workspace.run_dir}/models"),
+            # SaveModels(interval=500, path=f"{spec.workspace.run_dir}/models"),
         ]
         agent.setup_pipeline(pipeline)
         return agent
@@ -209,7 +346,10 @@ if __name__ == "__main__":
 
     env = make_env(spec.env)
     agent = AliveAgent.from_env(env, spec)
-    logger = AsyncLogger([TensorBoardLogger(spec.workspace)])
+    logger = AsyncLogger(
+        [TensorBoardLogger(spec.workspace), CuTSNELogger(spec.workspace)],
+        enable=not spec.disable_logger,
+    )
     with Live(console=console, refresh_per_second=1) as live:
         for _ in range(spec.iteration):
             start = time.time()
@@ -217,6 +357,6 @@ if __name__ == "__main__":
             end = time.time()
             duration = end - start
             logger.log(metrics, agent.ctx.step)
-            panel = generate_step_panel(agent.ctx.step - 1, spec.iteration, duration, metrics)
-            live.update(panel)
-            live.update(panel)
+            panel = generate_step_panel(agent.ctx.step, spec.iteration, duration, metrics)
+            console.print(panel)
+            # live.update(panel)

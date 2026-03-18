@@ -10,7 +10,7 @@ from torch.distributions import Normal
 from thunder.nn.torch import LinearBlock
 
 
-class Represent(nn.Module):
+class RepresentModel(nn.Module):
     """_summary_
 
     Args:
@@ -23,7 +23,7 @@ class Represent(nn.Module):
     def forward(self, embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None): ...
 
 
-class Transition(nn.Module):
+class TransitionModel(nn.Module):
     """_summary_
 
     Args:
@@ -41,7 +41,7 @@ class Transition(nn.Module):
         return torch.zeros(batch_size, self.state_size).to(self.factory_kwargs["device"])
 
 
-class EnsembleTransition(nn.Module):
+class EnsembleTransitionModel(nn.Module):
     def __init__(self, state_size: int, k_head: int = 5, dtype=None, device=None):
         super().__init__()
         self.factory_kwargs = {"device": device, "dtype": dtype}

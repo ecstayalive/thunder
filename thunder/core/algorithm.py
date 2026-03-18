@@ -73,6 +73,7 @@ class Algorithm(ABC):
         with self.ctx.manager:
             self.ctx, metrics = self.pipeline(self.ctx)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
+        metrics.update({"execution_context": self.ctx})
         return metrics
 
     def __repr__(self):

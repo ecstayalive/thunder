@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from thunder.core import ThunderModule
 from thunder.nn.torch.distributions import NeuralDistribution
-from thunder.nn.torch.models import Represent
+from thunder.nn.torch.models import RepresentModel
 
 from ..types import ActorStep
 
@@ -13,7 +13,7 @@ from ..types import ActorStep
 class Actor(ThunderModule):
     """ """
 
-    def __init__(self, represent: Represent, decoder: NeuralDistribution):
+    def __init__(self, represent: RepresentModel, decoder: NeuralDistribution):
         super().__init__()
         self.represent = represent
         self.decoder = decoder

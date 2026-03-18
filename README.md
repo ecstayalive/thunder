@@ -58,12 +58,11 @@ For example, we want to implement a basic PPO algorithm.
   ```python
   # For demonstration, we've simplified the creation process.
   models = ModelPack(actor=actor, critic=critic)
-  buffer = Buffer()
   ```
 - Then we create the algorithm class and define the optimizer.
   ```python
   # For demonstration, we've simplified the creation process.
-  agent = Agent(models, buffer=buffer)
+  agent = Agent(models, buffer = Buffer(1000))
   agent.build({"opt":{"targets": ["actor", "critic"], "class": "Adam ", "lr": 1e-4}})
   ```
 - Then setup the pipeline

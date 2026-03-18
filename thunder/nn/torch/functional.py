@@ -2,7 +2,17 @@ import torch
 from torch import Tensor
 
 
-@torch.compile(mode="reduce-overhead", fullgraph=True)
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """Compresses values to prevent exploding gradients."""
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """Reverses the symlog transformation."""
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+@torch.compile
 def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     r"""Non-Linear activation function used in Capsule Network
 
@@ -26,7 +36,7 @@ def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
     return scale * input
 
 
-@torch.compile(mode="reduce-overhead", fullgraph=True)
+@torch.compile
 def inverse_softplus(input: Tensor) -> Tensor:
     r"""Inverse softplus function
     For details: https://github.com/pytorch/pytorch/issues/72759

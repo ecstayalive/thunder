@@ -37,11 +37,12 @@ def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnvWrapper
     """ """
     from isaaclab.app import AppLauncher
 
-    spec = ArgParser.transform(spec, IsaacLabLoaderSpec)
+    spec: IsaacLabLoaderSpec = ArgParser.transform(spec, IsaacLabLoaderSpec)
     app_launcher = AppLauncher(ArgParser.as_dict(spec))
     import gymnasium
     import isaaclab_tasks
-    import isaaclab_tasks_experimental
+
+    # import isaaclab_tasks_experimental
     from isaaclab.utils.timer import Timer
     from isaaclab_tasks.utils import parse_env_cfg
 

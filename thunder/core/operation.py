@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 from .executor import Executor
 
@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 class Operation(ABC):
     """ """
+
+    Requires: Set
+    Provides: Set
 
     def __init__(self, name: str = "operation", **kwargs):
         self.name = name
@@ -32,6 +35,16 @@ class Operation(ABC):
         pass
 
 
+class NullOperation(Operation):
+    """ """
+
+    def __init__(self, name: str = "null", **kwargs):
+        super().__init__(name=name, **kwargs)
+
+    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
+        return ctx, {}
+
+
 class Objective(Operation):
     """Objective is a special read-only Operation.
     When executed directly within a Pipeline. It functions as
@@ -43,7 +56,7 @@ class Objective(Operation):
 
     """
 
-    def __init__(self, name: str = "objective", weight: float = 1.0, **kwargs):
+    def __init__(self, weight: float = 1.0, name: str = "objective", **kwargs):
         super().__init__(name=name, **kwargs)
         self.weight = weight
 
@@ -145,10 +158,10 @@ class OptimizeOp(Operation):
         opt: str,
         objectives: Iterable[Objective],
         max_grad_norm: float = 1.0,
-        name: str = "optimize",
+        name: Optional[str] = None,
     ):
-        super().__init__(name=name)
         self.opt = opt
+        super().__init__(name=name if name is not None else opt)
         self.objectives = tuple(objectives)
         self.max_grad_norm = max_grad_norm
 
