@@ -1,5 +1,7 @@
 <div align="center">
-<img src="docs/thunder.svg" width = "200" alt="logo"></img>
+<img src="docs/thunder.svg" width = "240" alt="logo"></img>
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ecstayalive/thunder)
 </div>
 
 <!-- # Thunder -->
