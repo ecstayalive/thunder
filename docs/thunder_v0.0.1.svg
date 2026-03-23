@@ -4,15 +4,15 @@
    height="464.04184"
    viewBox="0 0 694.76379 464.04184"
    version="1.1"
-   id="svg35"
-   sodipodi:docname="thunder_v0.0.3.svg"
+   id="svg31"
+   sodipodi:docname="thunder.svg"
    inkscape:version="1.2.2 (b0a8486541, 2022-12-01)"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns="http://www.w3.org/2000/svg"
    xmlns:svg="http://www.w3.org/2000/svg">
   <sodipodi:namedview
-     id="namedview37"
+     id="namedview33"
      pagecolor="#ffffff"
      bordercolor="#000000"
      borderopacity="0.25"
@@ -22,14 +22,14 @@
      inkscape:deskcolor="#d1d1d1"
      showgrid="false"
      inkscape:zoom="0.921875"
-     inkscape:cx="309.15254"
-     inkscape:cy="296.67797"
+     inkscape:cx="1040.2712"
+     inkscape:cy="94.915254"
      inkscape:window-width="2048"
      inkscape:window-height="1243"
      inkscape:window-x="0"
      inkscape:window-y="0"
      inkscape:window-maximized="1"
-     inkscape:current-layer="svg35" />
+     inkscape:current-layer="svg31" />
   <defs
      id="defs4">
     <style
@@ -45,79 +45,63 @@
   <g
      id="left"
      transform="translate(-420.61811,-224.98356)">
-    <!-- yellow: rebuilt as two stroke paths, no ellipse, no bottom crossover -->
     <path
        class="yl"
-       d="m 492,355 c -40,-1 -67,24 -63,66 4,47 41,86 113,97 22,3 38,-1 53,-8"
+       d="m 595,510 c -15,7 -31,11 -53,8 -72,-11 -109,-50 -113,-97 -4,-42 23,-67 63,-66 21,1 38,1 64,4 31,6 68,20 126,48"
        id="path6" />
     <circle
        class="doty"
        cx="682"
        cy="407"
        r="19"
-       id="circle10" />
-    <!-- light blue -->
+       id="circle8" />
     <path
        class="lb"
        d="m 448,467 c 46,-9 69,-46 92,-113 29,-79 63,-122 138,-121 49,1 74,32 64,71"
-       id="path12" />
-    <!-- dark blue -->
-    <path
-       class="yl"
-       d="m 496.95621,354.73587 c 75.10594,-0.27728 120.2711,11.75683 183.88419,51.10453"
-       id="path8"
-       sodipodi:nodetypes="cc"
-       style="display:inline" />
+       id="path10" />
     <path
        class="db"
        d="m 742,494 c -22,34 -86,34 -140,5 -84,-46 -132,-108 -113,-179 18,-67 92,-67 152,-38 34,17 58,32 69,38"
-       id="path14" />
+       id="path12" />
     <circle
        class="dotb"
        cx="710"
        cy="320"
        r="19"
-       id="circle16" />
+       id="circle14" />
   </g>
   <g
      transform="matrix(-1,0,0,1,1115.3819,-224.98356)"
-     id="g31">
+     id="g27">
     <path
        class="yl"
-       d="m 492,355 c -40,-1 -67,24 -63,66 4,47 41,86 113,97 22,3 38,-1 53,-8"
-       id="path19" />
+       d="m 595,510 c -15,7 -31,11 -53,8 -72,-11 -109,-50 -113,-97 -4,-42 23,-67 63,-66 21,1 38,1 64,4 31,6 68,20 126,48"
+       id="path17" />
     <circle
        class="doty"
        cx="682"
        cy="407"
        r="19"
-       id="circle23" />
+       id="circle19" />
     <path
        class="lb"
        d="m 448,467 c 46,-9 69,-46 92,-113 29,-79 63,-122 138,-121 49,1 74,32 64,71"
-       id="path25" />
-    <path
-       class="yl"
-       d="M 494.71186,354.52942 C 562.09601,353.25391 628.61816,366.89766 682,407"
-       id="path21"
-       sodipodi:nodetypes="cc"
-       style="display:inline"
-       inkscape:label="path21" />
+       id="path21" />
     <path
        class="db"
        d="m 742,494 c -22,34 -86,34 -140,5 -84,-46 -132,-108 -113,-179 18,-67 92,-67 152,-38 34,17 58,32 69,38"
-       id="path27" />
+       id="path23" />
     <circle
        class="dotb"
        cx="710"
        cy="320"
        r="19"
-       id="circle29" />
+       id="circle25" />
   </g>
   <text
      class="word"
      x="347.3819"
      y="463.01645"
      text-anchor="middle"
-     id="text33">THUNDER</text>
+     id="text29">THUNDER</text>
 </svg>

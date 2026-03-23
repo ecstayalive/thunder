@@ -34,7 +34,7 @@ import thunder.core.data as data_mod
 import thunder.core.executor as exec_mod
 import thunder.core.module as module_mod
 import thunder.core.operation as op_mod
-from thunder.rl.torch.buffer import Buffer, Transition
+from thunder.rl.torch.buffer import Buffer
 
 
 class TestBuffer:
@@ -62,7 +62,7 @@ class TestBuffer:
             # Add explicit done at index 5 and 15 for Env 0 for segmentation tests
             if i == 5 or i == 15:
                 dones[0] = 1.0
-            t = Transition(
+            t = data_mod.Batch(
                 obs=obs,
                 next_obs=next_obs,
                 actions=actions,
