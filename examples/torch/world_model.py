@@ -21,7 +21,7 @@ from thunder.utils.torch import AsyncLogger, CuTSNELogger, TensorBoardLogger, Wo
 class ExperimentSpec:
     env: EnvLoaderSpec = ArgOpt(
         factory=lambda: EnvLoaderSpec(
-            framework="isaaclab", task="Isaac-Velocity-Flat-G1-v1", num_envs=4096
+            framework="isaaclab", task="Isaac-Velocity-Flat-G1-v0", num_envs=4096
         )
     )
     d_model: int = 128
@@ -263,7 +263,7 @@ class AliveAgent(Agent):
             hidden_state = hidden_state.index_fill(0, indices, 0.0)
             return hidden_state
 
-        tree_map(_reset_leaf, self.represent_carry)
+        self.represent_carry = tree_map(_reset_leaf, self.represent_carry)
 
     @classmethod
     def from_env(cls, env: ThunderEnvWrapper, spec: ExperimentSpec) -> AliveAgent:

@@ -1,33 +1,7 @@
-import copy
-import importlib
-import os
-import sys
-from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from unittest.mock import patch
 
 import pytest
-
-
-@pytest.fixture(scope="module", autouse=True)
-def setup_torch_env():
-    os.environ["THUNDER_BACKEND"] = "torch"
-    modules_to_reload = [
-        "thunder.core.context",
-        "thunder.core.data",
-        "thunder.core.module",
-        "thunder.core.executor",
-        "thunder.core.algorithm",
-        "thunder.core.operation",
-    ]
-    for mod_name in modules_to_reload:
-        if mod_name in sys.modules:
-            importlib.reload(sys.modules[mod_name])
-        else:
-            importlib.import_module(mod_name)
-    yield
-
-
 import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
@@ -105,6 +79,25 @@ class TorchCounterOp(op_mod.Operation):
         return ctx, {"count": self.count}
 
 
+class DeclaredProvideOp(op_mod.Operation):
+    Provides = ("cache['embedding']",)
+
+    def forward(
+        self, ctx: ctx_mod.ExecutionContext
+    ) -> Tuple[ctx_mod.ExecutionContext, Dict[str, Any]]:
+        ctx.cache["embedding"] = True
+        return ctx, {}
+
+
+class DeclaredRequireOp(op_mod.Operation):
+    Requires = ("cache['embedding']",)
+
+    def forward(
+        self, ctx: ctx_mod.ExecutionContext
+    ) -> Tuple[ctx_mod.ExecutionContext, Dict[str, Any]]:
+        return ctx, {"embedding": ctx.cache["embedding"]}
+
+
 @pytest.fixture
 def device():
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -139,12 +132,12 @@ def test_torch_executor_optimization_flow(device, tensor_batch_3d):
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     old_w = native_net.net.weight.clone()
-    obj = MSEObjective("test")
+    obj = MSEObjective(1.0, "test")
     op = op_mod.OptimizeOp("opt", [obj])
     new_ctx, metrics = op(ctx)
 
     assert torch.any(native_net.net.weight != old_w)
-    assert "optimize/test/loss" in metrics
+    assert "opt/test/loss" in metrics
 
 
 import copy
@@ -160,7 +153,7 @@ def test_torch_multi_net_joint_update(device, tensor_batch_3d):
     ctx = ctx.replace(batch=tensor_batch_3d)
     w1_old = net1.net.weight.clone()
     w2_old = net2.net.weight.clone()
-    obj = MultiNetObjective("joint")
+    obj = MultiNetObjective(name="joint")
     op = op_mod.OptimizeOp("joint_opt", [obj])
     ctx, metrics = op(ctx)
     assert not torch.equal(ctx.models.net1.net.weight.clone(), w1_old)
@@ -182,11 +175,30 @@ def test_torch_pipeline_scheduling(device, tensor_batch_3d):
     assert interval_op.count == 2
 
 
+def test_operation_requires_provides_normalization():
+    assert DeclaredProvideOp.provides == frozenset({ctx_mod.Ref("cache['embedding']")})
+    assert DeclaredRequireOp.requires == frozenset({ctx_mod.Ref("cache['embedding']")})
+
+
+def test_pipeline_validation_success():
+    pipeline = op_mod.Pipeline(
+        [DeclaredProvideOp(name="provide"), DeclaredRequireOp(name="require")],
+        validate="error",
+    )
+    assert pipeline.requires == frozenset()
+    assert ctx_mod.Ref("cache['embedding']") in pipeline.provides
+
+
+def test_pipeline_validation_failure():
+    with pytest.raises(op_mod.PipelineValidationError, match="Missing requirements"):
+        op_mod.Pipeline([DeclaredRequireOp(name="require")], validate="error")
+
+
 def test_torch_objective_standalone(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor()
-    obj = MSEObjective("eval")
+    obj = MSEObjective(1.0, "eval")
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
 
     metrics = algo.step(tensor_batch_3d)
@@ -215,10 +227,10 @@ def test_torch_gradient_clipping(device, tensor_batch_3d):
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
-    obj = MSEObjective("test")
+    obj = MSEObjective(name="test")
     op_no_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=999.0)
     _, metrics_large = op_no_clip(ctx)
-    raw_norm = metrics_large["optimize/total_loss"]
+    raw_norm = metrics_large["opt/total_loss"]
     native_net.net.weight.grad.zero_()
     clip_threshold = 0.01
     op_clip = op_mod.OptimizeOp("opt", [obj], max_grad_norm=clip_threshold)
@@ -236,7 +248,7 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
         return {"hook": True}
 
     algo.setup_pipeline(
-        [op_mod.CallableOp(modify_ctx_hook, ctx=ctx_mod.CtxRef), MSEObjective("mse")]
+        [op_mod.CallableOp(modify_ctx_hook, ctx=ctx_mod.CtxRef), MSEObjective(1.0, "mse")]
     )
     algo.build({})
     m = algo.step(tensor_batch_3d)
@@ -246,16 +258,16 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
 def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
     executor = exec_mod.Executor()
-    obj1 = MSEObjective("m1", weight=1.0)
-    obj2 = MSEObjective("m2", weight=2.0)
+    obj1 = MSEObjective(1.0, "m1")
+    obj2 = MSEObjective(2.0, "m2")
 
     op = op_mod.OptimizeOp("opt", [obj1, obj2])
     algo = algo_mod.Algorithm(model, executor, {"opt": {"targets": ["net"], "class": "SGD"}}, [op])
 
     metrics = algo.step(tensor_batch_3d)
-    l1 = metrics["algorithm/optimize/m1/loss"]
-    l2 = metrics["algorithm/optimize/m2/loss"]
-    total = metrics["algorithm/optimize/total_loss"]
+    l1 = metrics["algorithm/opt/m1/loss"]
+    l2 = metrics["algorithm/opt/m2/loss"]
+    total = metrics["algorithm/opt/total_loss"]
     assert torch.isclose(total, l1 * 1.0 + l2 * 2.0)
 
 
@@ -337,7 +349,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
-    obj = MSEObjective("amp_test")
+    obj = MSEObjective(1.0, "amp_test")
     op = op_mod.OptimizeOp("opt", [obj])
     w_init = native_net.net.weight.clone()
     success = False
@@ -351,7 +363,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     assert (
         success
     ), f"Weights failed to update after {max_attempts} iterations. Scaler may be stuck."
-    assert "optimize/amp_test/loss" in metrics
+    assert "opt/amp_test/loss" in metrics
     assert native_net.net.weight.dtype == torch.float32
     assert native_net.net.weight.grad is not None
 
@@ -359,7 +371,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
 def test_torch_algorithm_serialization(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
     executor = exec_mod.Executor(compile=False)
-    op = op_mod.OptimizeOp("opt", [MSEObjective("mse")])
+    op = op_mod.OptimizeOp("opt", [MSEObjective(1.0, "mse")])
     algo = algo_mod.Algorithm(
         model, executor, {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}, [op]
     )
@@ -499,7 +511,7 @@ def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
             ) * 100, {}
 
     clip_val = 0.01
-    op = op_mod.OptimizeOp("joint", [HighLossObj("high")], max_grad_norm=clip_val)
+    op = op_mod.OptimizeOp("joint", [HighLossObj(name="high")], max_grad_norm=clip_val)
     op.forward(ctx)
 
     params = [p for g in ctx.opt_groups["joint"].optimizer.param_groups for p in g["params"]]
@@ -521,7 +533,7 @@ def test_torch_context_meta_update(device, tensor_batch_3d):
 def test_torch_objective_standalone_eval(device, tensor_batch_3d):
     model = module_mod.ModelPack(net=Simple3DNet().to(device))
     executor = exec_mod.Executor()
-    obj = MSEObjective("eval_only")
+    obj = MSEObjective(1.0, "eval_only")
     algo = algo_mod.Algorithm(model, executor, {}, [obj])
     metrics = algo.step(tensor_batch_3d)
     assert "algorithm/eval_only/loss" in metrics
@@ -555,7 +567,7 @@ def test_torch_optimizer_zero_grad_behavior(device, tensor_batch_3d):
     for p in net.parameters():
         p.grad = torch.ones_like(p.data)
 
-    obj = MSEObjective("test")
+    obj = MSEObjective(name="test")
     executor.optimize(ctx, "opt", [obj])
 
     # After optimize, zero_grad(set_to_none=True) was called,
@@ -601,8 +613,8 @@ def test_torch_multi_step_optimization(device, tensor_batch_3d):
         "opt_c": {"targets": ["net2"], "class": "SGD", "lr": 0.1},
     }
     pipeline = [
-        op_mod.OptimizeOp("opt_a", [MSEObjective("net1_loss", net="net1")]),
-        op_mod.OptimizeOp("opt_c", [MSEObjective("net2_loss", net="net2")]),
+        op_mod.OptimizeOp("opt_a", [MSEObjective(1.0, "net1_loss", net="net1")]),
+        op_mod.OptimizeOp("opt_c", [MSEObjective(1.0, "net2_loss", net="net2")]),
     ]
 
     algo = algo_mod.Algorithm(model, executor, optim_config, pipeline)
@@ -612,8 +624,8 @@ def test_torch_multi_step_optimization(device, tensor_batch_3d):
 
     metrics = algo.step(tensor_batch_3d)
 
-    assert "algorithm/optimize/net1_loss/loss" in metrics
-    assert "algorithm/optimize/net2_loss/loss" in metrics
+    assert "algorithm/opt_a/net1_loss/loss" in metrics
+    assert "algorithm/opt_c/net2_loss/loss" in metrics
     assert not torch.equal(algo.ctx.models.net1.net.weight, wa_before)
     assert not torch.equal(algo.ctx.models.net2.net.weight, wc_before)
 
@@ -641,7 +653,7 @@ def test_torch_gradient_accumulation_simulation(device, tensor_batch_3d):
     optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
-    obj = MSEObjective("test")
+    obj = MSEObjective(1.0, "test")
     optimizer = ctx.opt_groups["opt"].optimizer
     optimizer.zero_grad(set_to_none=True)
     loss_single, _ = executor._forward((obj,), ctx.batch, ctx.models)
@@ -679,9 +691,7 @@ def test_torch_batch_mask_broadcasting(device):
 
     net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=net)
-    obj = MSEObjective("test")
+    obj = MSEObjective(1.0, "test")
 
     loss, metrics = obj.compute(batch, model)
-    assert loss.shape == ()  # Scalar
-    assert loss.shape == ()  # Scalar
     assert loss.shape == ()  # Scalar

@@ -7,13 +7,15 @@ import torch.nn.functional as F
 # @torch.compile(mode="max-autotune")
 def _segsum(x: torch.Tensor) -> torch.Tensor:
     """
-    Naive segment sum
+    Stable segment sum matching the official SSD reference implementation.
     x: (..., T)
     return: (..., T, T), [i, j] = sum_{k=j..i} x[..., k] (i >= j), otherwise: -inf
     """
     T = x.size(-1)
-    x_cumsum = torch.cumsum(x, dim=-1)  # (..., T)
-    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]  # (..., T, T)
+    x = x.unsqueeze(-1).expand(*x.shape, T)
+    strict_lower = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=-1)
+    x = x.masked_fill(~strict_lower, 0)
+    x_segsum = torch.cumsum(x, dim=-2)
     mask = torch.tril(
         torch.ones(T, T, device=x.device, dtype=torch.bool),
         diagonal=0,
@@ -37,8 +39,8 @@ def ssd_minimal(
     Args:
         X (torch.Tensor): (B, L ,H, P)
         A (torch.Tensor): (B, L, H)
-        B (torch.Tensor): (B, L, H, N)
-        C (torch.Tensor): (B, L, H, N)
+        B (torch.Tensor): (B, L, G, N) or (B, L, H, N)
+        C (torch.Tensor): (B, L, G, N) or (B, L, H, N)
         block_len:
         initial_states: (B, H, P, N)
 
@@ -47,6 +49,7 @@ def ssd_minimal(
         last_state: (B, H, P, N)
     """
     Bsz, L, H, P = X.shape
+    G = B.size(-2)
     N = B.size(-1)
 
     # `L` must be dividable by `block_len`, so auto padding
@@ -71,8 +74,14 @@ def ssd_minimal(
     # A: (b, L_pad, h) -> (b, c, l, h)
     A = A.view(Bsz, n_chunks, block_len, H)  # (b, c, l, h)
     # B/C: (b, L_pad, h, n) -> (b, c, l, h, n)
-    B = B.view(Bsz, n_chunks, block_len, H, N)  # (b, c, l, h, n)
-    C = C.view(Bsz, n_chunks, block_len, H, N)  # (b, c, l, h, n)
+    B = B.view(Bsz, n_chunks, block_len, G, N)  # (b, c, l, g, n)
+    C = C.view(Bsz, n_chunks, block_len, G, N)  # (b, c, l, g, n)
+    if G != H:
+        if H % G != 0:
+            raise ValueError(f"Expected nheads ({H}) to be divisible by groups ({G})")
+        repeat_factor = H // G
+        B = B.repeat_interleave(repeat_factor, dim=3)
+        C = C.repeat_interleave(repeat_factor, dim=3)
 
     # A: (b, h, c, l)
     A_h = A.permute(0, 3, 1, 2)  # (b, h, c, l)

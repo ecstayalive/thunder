@@ -109,7 +109,7 @@ def selective_scan(
     # D skip: D: (ED,) -> (1, ED, 1)
     y = y + D.view(1, ED, 1) * x  # (B, ED, L)
     if z is not None:
-        y = y * z  # (B, ED, L)
+        y = y * F.silu(z)  # (B, ED, L)
     # state: (B, ED, N)
     last_state = s_all[..., -1]  # (B, ED, N)
     return y, last_state

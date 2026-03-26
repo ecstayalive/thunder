@@ -2,13 +2,64 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar
 
 if TYPE_CHECKING:
     from .executor.interface import Executor
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
 TBatch = TypeVar("TBatch", bound="Batch")
+
+
+@dataclass(slots=True)
+class Cache:
+    data: Dict[str, Any] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        data = object.__getattribute__(self, "data")
+        try:
+            return data[name]
+        except KeyError:
+            raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "data" or name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            object.__getattribute__(self, "data")[name] = value
+
+    def __getitem__(self, key: str) -> Any:
+        return self.data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def get(self, key: str, default=None) -> Any:
+        return self.data.get(key, default)
+
+    def update(self, **kwargs) -> None:
+        self.data.update(kwargs)
+
+    def replace(self, **kwargs) -> "Cache":
+        new_data = self.data.copy()
+        new_data.update(kwargs)
+        return Cache(data=new_data)
+
+    def __dir__(self):
+        return ["data"] + list(self.data.keys())
+
+    def __repr__(self) -> str:
+        def _fmt(v):
+            if hasattr(v, "shape"):
+                return f"Arr{tuple(v.shape)}"
+            if isinstance(v, dict):
+                return f"Dict[{len(v)}]"
+            if isinstance(v, (list, tuple)):
+                return f"{type(v).__name__}[{len(v)}]"
+            return str(v)
+
+        items = [f"{k}={_fmt(v)}" for k, v in self.data.items()]
+        return f"Cache({', '.join(items)})"
 
 
 @dataclass(slots=True)
@@ -92,6 +143,18 @@ class Batch:
 if _BACKEND == "torch":
     import torch.utils._pytree as pytree
 
+    def _flatten_cache(cache: Cache):
+        data_keys = sorted(cache.data.keys())
+        data_values = [cache.data[k] for k in data_keys]
+        children = tuple(data_values)
+        aux_data = tuple(data_keys)
+        return children, aux_data
+
+    def _unflatten_cache(children, aux_data):
+        return Cache(data=dict(zip(aux_data, children)))
+
+    pytree.register_pytree_node(Cache, _flatten_cache, _unflatten_cache)
+
     def _flatten_batch(batch: Batch):
         core_fields = [f.name for f in fields(batch) if f.name != "extra"]
         core_values = [getattr(batch, f) for f in core_fields]
@@ -115,6 +178,18 @@ if _BACKEND == "torch":
 if _BACKEND == "jax":
     import jax
 
+    def _flatten_cache(cache: Cache):
+        data_keys = sorted(cache.data.keys())
+        data_values = [cache.data[k] for k in data_keys]
+        children = tuple(data_values)
+        aux_data = tuple(data_keys)
+        return children, aux_data
+
+    def _unflatten_cache(aux_data, children):
+        return Cache(data=dict(zip(aux_data, children)))
+
+    jax.tree_util.register_pytree_node(Cache, _flatten_cache, _unflatten_cache)
+
     def _flatten_batch(batch: Batch):
         core_fields = [f.name for f in fields(batch) if f.name != "extra"]
         core_values = [getattr(batch, f) for f in core_fields]
@@ -136,4 +211,4 @@ if _BACKEND == "jax":
     jax.tree_util.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)
 
 
-__all__ = ["Batch"]
+__all__ = ["Cache", "Batch"]

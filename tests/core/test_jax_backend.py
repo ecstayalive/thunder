@@ -1,33 +1,9 @@
-import importlib
-import os
-import sys
 from typing import Any, Dict, Tuple
 
-import pytest
-
-
-@pytest.fixture(scope="module", autouse=True)
-def setup_jax_env():
-    os.environ["THUNDER_BACKEND"] = "jax"
-    modules_to_reload = [
-        "thunder.core.context",
-        "thunder.core.data",
-        "thunder.core.module",
-        "thunder.core.executor",
-        "thunder.core.algorithm",
-        "thunder.core.operation",
-    ]
-    for mod_name in modules_to_reload:
-        if mod_name in sys.modules:
-            importlib.reload(sys.modules[mod_name])
-        else:
-            importlib.import_module(mod_name)
-    yield
-
-
-import jax
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
+import pytest
 
 import thunder.core.algorithm as algo_mod
 import thunder.core.context as ctx_mod
@@ -153,12 +129,12 @@ def test_jax_nnx_optimization_step(jax_batch_3d):
     executor = exec_mod.Executor(donate=False)
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
     ctx.batch = jax_batch_3d
-    initial_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), ctx.models.net.net.kernel.value)
-    obj = JaxMSEObjective("test")
+    initial_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), ctx.models.net.net.kernel[...])
+    obj = JaxMSEObjective(1.0, "test")
     op = op_mod.OptimizeOp("opt", [obj])
     new_ctx, metrics = op(ctx)
-    current_params = new_ctx.models.net.net.kernel.value
-    assert "optimize/test/loss" in metrics
+    current_params = new_ctx.models.net.net.kernel[...]
+    assert "opt/test/loss" in metrics
     assert not jnp.array_equal(initial_params, current_params)
     assert jnp.all(current_params > 0)
 
@@ -172,11 +148,11 @@ def test_jax_multi_net_optimization(jax_batch_3d):
     optim_config = {"joint": {"targets": ["net1", "net2"], "class": "sgd", "lr": 0.5}}
     ctx = executor.init(models, optim_config)
     ctx.batch = jax_batch_3d
-    obj = MultiNetObjective("m")
+    obj = MultiNetObjective(name="m")
     op = op_mod.OptimizeOp("joint", [obj])
     ctx, _ = op(ctx)
-    assert jnp.any(ctx.models.net1.net.kernel.value != 0.0)
-    assert jnp.any(ctx.models.net2.net.kernel.value != 0.0)
+    assert jnp.any(ctx.models.net1.net.kernel[...] != 0.0)
+    assert jnp.any(ctx.models.net2.net.kernel[...] != 0.0)
 
 
 def test_jax_rnn_carry_and_state_flow(jax_batch_3d):
@@ -199,16 +175,16 @@ def test_jax_gradient_clipping_logic(jax_batch_3d):
     executor = exec_mod.Executor()
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
     ctx.batch = jax_batch_3d
-    obj = JaxMSEObjective("test")
+    obj = JaxMSEObjective(1.0, "test")
     op_large = op_mod.OptimizeOp("opt", [obj], max_grad_norm=1e6)
     _, m_large = op_large(ctx)
-    raw_norm = m_large["optimize/grad_norm"]
-    ctx.models.net.net.kernel.value = jnp.zeros_like(ctx.models.net.net.kernel.value)
+    raw_norm = m_large["opt/grad_norm"]
+    ctx.models.net.net.kernel.value = jnp.zeros_like(ctx.models.net.net.kernel[...])
     clip_val = 0.01
     op_small = op_mod.OptimizeOp("opt", [obj], max_grad_norm=clip_val)
     ctx, m_small = op_small(ctx)
-    assert jnp.isclose(m_small["optimize/grad_norm"], clip_val)
-    update_norm = jnp.linalg.norm(ctx.models.net.net.kernel.value)
+    assert jnp.isclose(m_small["opt/grad_norm"], clip_val)
+    update_norm = jnp.linalg.norm(ctx.models.net.net.kernel[...])
     assert jnp.isclose(update_norm, clip_val, atol=1e-5)
 
 
@@ -224,7 +200,7 @@ def test_jax_multi_op(jax_batch_3d):
 
     rngs = nnx.Rngs(4)
     net1 = Simple3DFlaxNet(4, 2, rngs)
-    net1.net.kernel.value = jnp.ones_like(net1.net.kernel.value)
+    net1.net.kernel.value = jnp.ones_like(net1.net.kernel[...])
     net2 = Simple3DFlaxNet(4, 2, rngs)
     models = module_mod.ModelPack(net1=net1, net2=net2)
     executor = exec_mod.Executor()
@@ -237,8 +213,8 @@ def test_jax_multi_op(jax_batch_3d):
     update_op = op_mod.CallableOp(
         soft_update,
         name="soft_update",
-        source=ctx_mod.CtxRef.models.net1,
-        target=ctx_mod.CtxRef.models.net2,
+        source=ctx_mod.Ref("models.net1"),
+        target=ctx_mod.Ref("models.net2"),
         tau=0.1,
     )
     pipeline = [update_op, counter]
@@ -329,21 +305,22 @@ def test_jax_mixed_precision_bf16(jax_batch_3d):
         forward_op = ForwardOp()
         ctx, _ = forward_op(ctx)
         assert ctx.batch["y"].dtype == jnp.bfloat16
-        obj = JaxMSEObjective("mse")
+        assert ctx.models.net.net.kernel[...].dtype == jnp.float32
+        obj = JaxMSEObjective(name="mse")
         op = op_mod.OptimizeOp("opt", [obj])
         ctx, _ = op(ctx)
-        assert native.net.kernel.value.dtype == jnp.float32
+        assert ctx.models.net.net.kernel[...].dtype == jnp.float32
 
 
 def test_jax_objective_standalone_eval(jax_batch_3d):
     rngs = nnx.Rngs(6)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
-    obj = JaxMSEObjective("eval")
+    obj = JaxMSEObjective(name="eval")
     algo = algo_mod.Algorithm(models, executor, {}, [obj])
     m = algo.step(jax_batch_3d)
     assert "algorithm/eval/loss" in m
-    assert jnp.all(models.net.net.kernel.value == 0.0)
+    assert jnp.all(models.net.net.kernel[...] == 0.0)
 
 
 def test_jax_serialization_state_retrieval():
@@ -358,7 +335,7 @@ def test_jax_serialization_state_retrieval():
     new_models = module_mod.ModelPack(net=new_native)
     new_algo = algo_mod.Algorithm(new_models, executor, {}, [])
     # new_algo.load_state_dict(sd)
-    assert jnp.all(new_native.net.kernel.value == 0.0)
+    assert jnp.all(new_native.net.kernel[...] == 0.0)
 
 
 def test_jax_complex_pytree_nesting():
@@ -427,7 +404,7 @@ def test_jax_objective_extra_kwargs_injection(jax_batch_3d):
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
 
-    obj = KwargObjective("test", alpha=0.5)
+    obj = KwargObjective(name="test", alpha=0.5)
     ctx = executor.init(models, {})
     ctx.batch = jax_batch_3d
 
@@ -453,8 +430,8 @@ def test_jax_multi_objective_complex_pipeline(jax_batch_3d):
         net1=Simple3DFlaxNet(4, 2, rngs), net2=Simple3DFlaxNet(4, 2, rngs)
     )
     executor = exec_mod.Executor()
-    obj1 = JaxMSEObjective("m1", weight=0.1, net="net1")
-    obj2 = JaxMSEObjective("m2", weight=0.9, net="net2")
+    obj1 = JaxMSEObjective(weight=0.1, name="m1", net="net1")
+    obj2 = JaxMSEObjective(weight=0.9, name="m2", net="net2")
 
     pipeline = [op_mod.OptimizeOp("opt1", [obj1]), op_mod.OptimizeOp("opt2", [obj2])]
     optim_config = {
@@ -463,8 +440,8 @@ def test_jax_multi_objective_complex_pipeline(jax_batch_3d):
     }
     algo = algo_mod.Algorithm(models, executor, optim_config, pipeline)
     metrics = algo.step(jax_batch_3d)
-    assert "algorithm/optimize/m1/loss" in metrics
-    assert "algorithm/optimize/m2/loss" in metrics
+    assert "algorithm/opt1/m1/loss" in metrics
+    assert "algorithm/opt2/m2/loss" in metrics
     assert algo.ctx.step == 1
 
 
@@ -474,7 +451,7 @@ def test_jax_model_pack_getattr_proxy():
             self.v = nnx.Variable(jnp.array([1.0]))
 
         def get_val(self):
-            return self.v.value
+            return self.v[...]
 
     m = CustomNet(nnx.Rngs(0))
     pack = module_mod.ModelPack(net=m)
@@ -492,7 +469,7 @@ def test_jax_nan_inf_handling_in_optimize(jax_batch_3d):
     executor = exec_mod.Executor()
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam"}})
     ctx.batch = jax_batch_3d
-    metrics = executor.optimize(ctx, "opt", (NanObjective("nan"),))
+    metrics = executor.optimize(ctx, "opt", (NanObjective(name="nan"),))
     assert jnp.isnan(metrics["nan/loss"])
 
 

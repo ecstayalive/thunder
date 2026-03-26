@@ -232,7 +232,7 @@ class CuTSNELogger(Logger):
         # Hide unused subplots
         for i in range(len(self.views), len(self._axes)):
             self._axes[i].axis("off")
-        if self.save:
+        if self.enable:
             plt.savefig(f"{self.save_dir}/tsne-{step}.pdf")
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()

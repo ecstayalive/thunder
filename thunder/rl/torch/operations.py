@@ -17,6 +17,7 @@ from thunder.core import (
     Objective,
     Operation,
     Pipeline,
+    Ref,
 )
 from thunder.env.loader import ThunderEnvWrapper
 
@@ -55,6 +56,9 @@ class SIGRegObj(Objective):
         self.integration_weights = weights * self.phi
         self.global_step = torch.zeros((), device=self.device, dtype=torch.long)
         self._generator = None
+
+        self.requires = frozenset({Ref(f"batch[{key!r}]"), Ref("batch.mask")})
+        self.provides = frozenset()
 
     def _get_generator(self, device, seed):
         if self._generator is None:

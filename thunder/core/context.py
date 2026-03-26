@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import os
 import sys
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, ContextManager, Dict, Optional, Tuple
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, ContextManager, Dict, Hashable, Optional, Tuple
+
+from .data import Cache
 
 if TYPE_CHECKING:
     from .data import Batch
@@ -103,15 +107,17 @@ class ExecutionContext:
         opt_groups:
         executor:
         model:
+        cache:
         meta:
     """
 
     step: int
-    batch: Optional[Batch]
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
     executor: Executor
     manager: ExecutionContextManager
+    batch: Optional[Batch] = None
+    cache: Cache = field(default_factory=Cache)
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def replace(self, **changes) -> ExecutionContext:
@@ -121,7 +127,7 @@ class ExecutionContext:
         """ """
         try:
             return getattr(self.models, key)
-        except KeyError:
+        except AttributeError:
             raise ValueError(
                 f"Model '{key}' not found in Context. "
                 f"Available models: {list(self.models.keys())}"
@@ -140,87 +146,161 @@ class ExecutionContext:
         opt_groups: Dict[str, OptimGroup],
     ) -> ExecutionContext:
         """ """
-        return cls(
-            step=0,
-            batch=None,
-            models=models,
-            opt_groups=opt_groups,
-            executor=executor,
-            manager=manager,
-        )
+        return cls(step=0, models=models, opt_groups=opt_groups, executor=executor, manager=manager)
 
 
-class _ContextRef:
+@dataclass(frozen=True, slots=True)
+class _RefAttr:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RefKey:
+    key: Hashable
+
+
+_RefPath = Tuple[_RefAttr | _RefKey, ...]
+
+
+class Ref:
+
     __slots__ = ("_path", "_compiled_fn")
 
-    def __init__(self, path=()):
-        self._path = path
-        self._compiled_fn = None
-
-    def __getattr__(self, name: str):
-        return _ContextRef(self._path + ((0, name),))
-
-    def __getitem__(self, key: str):
-        return _ContextRef(self._path + ((1, key),))
+    def __init__(self, path: str | _RefPath):
+        self._path = self._parse_expr(path) if isinstance(path, str) else tuple(path)
+        self._compiled_fn = _compile_ref_accessor(self._path)
 
     def __call__(self, ctx: ExecutionContext):
-        if self._compiled_fn:
-            return self._compiled_fn(ctx)
-        self._compiled_fn = self._jit_compile()
         return self._compiled_fn(ctx)
 
     def __eq__(self, other):
-        if not isinstance(other, _ContextRef):
+        if not isinstance(other, Ref):
             return False
         return self._path == other._path
 
     def __hash__(self):
         return hash(self._path)
 
+    @property
+    def path(self) -> _RefPath:
+        return self._path
+
     def __str__(self):
-        res = "ctx"
-        for op, key in self._path:
-            if op == 0:
-                res += f".{key}"
+        if not self._path:
+            return "ctx"
+        parts = []
+        for step in self._path:
+            if isinstance(step, _RefAttr):
+                parts.append(step.name if not parts else f".{step.name}")
             else:
-                res += f"[{repr(key)}]"
-        return res
+                parts.append(f"[{repr(step.key)}]")
+        return "".join(parts)
 
-    def _jit_compile(self):
-        """ """
-        expr = "ctx"
-        safe_locals = {}
-        for i, (op, key) in enumerate(self._path):
-            if op == 0:
-                expr += f".{key}"
-            else:
-                if isinstance(key, (str, int)):
-                    expr += f"[{repr(key)}]"
-                else:
-                    var_name = f"_k{i}"
-                    safe_locals[var_name] = key
-                    expr += f"[{var_name}]"
-        if not safe_locals:
-            code = f"lambda ctx: {expr}"
-            return eval(code)
+    def __repr__(self):
+        if not self._path:
+            return "CtxRef"
+        return f'Ref("{self}")'
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _parse_expr(expr: str) -> _RefPath:
+        expr = expr.strip()
+        if not expr:
+            return ()
+        node = ast.parse(expr, mode="eval").body
+        return Ref._parse_node(node)
+
+    @classmethod
+    def _parse_node(cls, node: ast.AST) -> _RefPath:
+        if isinstance(node, ast.Name):
+            return () if node.id == "ctx" else (_RefAttr(name=node.id),)
+        if isinstance(node, ast.Attribute):
+            return cls._parse_node(node.value) + (_RefAttr(node.attr),)
+        if isinstance(node, ast.Subscript):
+            return cls._parse_node(node.value) + (_RefKey(cls._parse_key(node.slice)),)
+        raise ValueError(
+            "Ref only supports attribute and subscript access, "
+            f"got unsupported expression: {ast.dump(node)}"
+        )
+
+    @staticmethod
+    def _parse_key(node: ast.AST) -> Hashable:
+        try:
+            key = ast.literal_eval(node)
+        except Exception as exc:
+            raise ValueError(
+                "Ref subscript keys must be Python literals, "
+                f"got unsupported expression: {ast.dump(node)}"
+            ) from exc
+        if not isinstance(key, Hashable):
+            raise ValueError(f"Ref subscript key must be hashable, got: {type(key).__name__}")
+        return key
+
+
+@lru_cache(maxsize=None)
+def _compile_ref_accessor(path: _RefPath):
+    expr = "ctx"
+    safe_locals = {}
+    for i, step in enumerate(path):
+        if isinstance(step, _RefAttr):
+            expr += f".{step.name}"
         else:
-            args = ", ".join(safe_locals.keys())
-            code = f"lambda {args}: lambda ctx: {expr}"
-            factory = eval(code)
-            return factory(**safe_locals)
+            key = step.key
+            if isinstance(key, (str, int)):
+                expr += f"[{repr(key)}]"
+            else:
+                var_name = f"_k{i}"
+                safe_locals[var_name] = key
+                expr += f"[{var_name}]"
+    if not safe_locals:
+        return eval(f"lambda ctx: {expr}")
+    args = ", ".join(safe_locals.keys())
+    factory = eval(f"lambda {args}: lambda ctx: {expr}")
+    return factory(**safe_locals)
 
 
-CtxRef = _ContextRef()
+def replace_ref_path(root: Any, path: _RefPath, value: Any) -> Any:
+    if not path:
+        return value
+    step, rest = path[0], path[1:]
+    if isinstance(step, _RefAttr):
+        child = getattr(root, step.name)
+        new_child = replace_ref_path(child, rest, value)
+        return replace(root, **{step.name: new_child})
+
+    child = root[step.key]
+    new_child = replace_ref_path(child, rest, value)
+    if isinstance(root, dict):
+        updated = root.copy()
+        updated[step.key] = new_child
+        return updated
+    if isinstance(root, list):
+        updated = list(root)
+        updated[step.key] = new_child
+        return updated
+    if isinstance(root, tuple):
+        updated = list(root)
+        updated[step.key] = new_child
+        if hasattr(root, "_fields"):
+            return type(root)(*updated)
+        return tuple(updated)
+    raise TypeError(
+        "Ref path updates only support dataclass attributes, dicts, lists, and tuples. "
+        f"Cannot update key {step.key!r} on {type(root).__name__}."
+    )
+
+
+CtxRef = Ref(())
 
 if _BACKEND == "torch":
     import torch.utils._pytree as pytree
 
-    def _optim_group_flatten(obj: OptimGroup):
+    def _flatten_optim_group(obj: OptimGroup):
         children = [obj.optimizer, obj.scaler_state]
         aux_data = (obj.name, obj.targets, obj.scheduler, obj.scaler)
         return children, aux_data
 
-    def _optim_group_unflatten(children, aux_data):
+    def _unflatten_optim_group(children, aux_data):
         return OptimGroup(
             name=aux_data[0],
             targets=aux_data[1],
@@ -230,9 +310,9 @@ if _BACKEND == "torch":
             scaler_state=children[1],
         )
 
-    pytree.register_pytree_node(OptimGroup, _optim_group_flatten, _optim_group_unflatten)
+    pytree.register_pytree_node(OptimGroup, _flatten_optim_group, _unflatten_optim_group)
 
-    def _manager_flatten(obj: ExecutionContextManager):
+    def _flatten_manager(obj: ExecutionContextManager):
         children = []
         aux_data = (
             obj._context_manager,
@@ -245,7 +325,7 @@ if _BACKEND == "torch":
         )
         return children, aux_data
 
-    def _manager_unflatten(children, aux_data):
+    def _unflatten_manager(children, aux_data):
         return ExecutionContextManager(
             _context_manager=aux_data[0],
             compute_dtype=aux_data[1],
@@ -256,21 +336,22 @@ if _BACKEND == "torch":
             mesh=aux_data[6],
         )
 
-    pytree.register_pytree_node(ExecutionContextManager, _manager_flatten, _manager_unflatten)
+    pytree.register_pytree_node(ExecutionContextManager, _flatten_manager, _unflatten_manager)
 
-    def _context_flatten(obj: ExecutionContext):
-        children = [obj.models, obj.opt_groups, obj.step, obj.batch, obj.meta]
+    def _flatten_context(obj: ExecutionContext):
+        children = [obj.models, obj.opt_groups, obj.step, obj.batch, obj.cache, obj.meta]
         aux_data = (obj.executor, obj.manager)
 
         return children, aux_data
 
-    def _context_unflatten(children, aux_data):
+    def _unflatten_context(children, aux_data):
         executor, manager = aux_data
-        models, opt_groups, step, batch, meta = children
+        models, opt_groups, step, batch, cache, meta = children
 
         return ExecutionContext(
             step=step,
             batch=batch,
+            cache=cache,
             models=models,
             opt_groups=opt_groups,
             executor=executor,
@@ -278,18 +359,18 @@ if _BACKEND == "torch":
             meta=meta,
         )
 
-    pytree.register_pytree_node(ExecutionContext, _context_flatten, _context_unflatten)
+    pytree.register_pytree_node(ExecutionContext, _flatten_context, _unflatten_context)
 
 if _BACKEND == "jax":
     import flax.nnx as nnx
     import jax.tree_util as jtu
 
-    def _optim_group_flatten(obj: OptimGroup):
+    def _flatten_optim_group(obj: OptimGroup):
         children = (obj.optimizer, obj.scaler_state)
         aux_data = (obj.name, obj.targets, obj.scheduler, obj.scaler)
         return children, aux_data
 
-    def _optim_group_unflatten(aux_data, children):
+    def _unflatten_optim_group(aux_data, children):
         return OptimGroup(
             name=aux_data[0],
             targets=aux_data[1],
@@ -299,9 +380,9 @@ if _BACKEND == "jax":
             scaler_state=children[1],
         )
 
-    jtu.register_pytree_node(OptimGroup, _optim_group_flatten, _optim_group_unflatten)
+    jtu.register_pytree_node(OptimGroup, _flatten_optim_group, _unflatten_optim_group)
 
-    def _manager_flatten(obj: ExecutionContextManager):
+    def _flatten_manager(obj: ExecutionContextManager):
         children = []
         aux_data = (
             obj._context_manager,
@@ -314,7 +395,7 @@ if _BACKEND == "jax":
         )
         return children, aux_data
 
-    def _manager_unflatten(aux_data, children):
+    def _unflatten_manager(aux_data, children):
         return ExecutionContextManager(
             _context_manager=aux_data[0],
             compute_dtype=aux_data[1],
@@ -325,24 +406,25 @@ if _BACKEND == "jax":
             mesh=aux_data[6],
         )
 
-    jtu.register_pytree_node(ExecutionContextManager, _manager_flatten, _manager_unflatten)
+    jtu.register_pytree_node(ExecutionContextManager, _flatten_manager, _unflatten_manager)
 
-    def _context_flatten(obj: ExecutionContext):
+    def _flatten_context(obj: ExecutionContext):
         """ """
         nnx_containers = (obj.models, obj.opt_groups)
         graphdef, state = nnx.split(nnx_containers)
-        children = (obj.step, obj.batch, state, obj.meta)
+        children = (obj.step, obj.batch, obj.cache, state, obj.meta)
         aux_data = (obj.executor, graphdef, obj.manager)
 
         return children, aux_data
 
-    def _context_unflatten(aux_data, children):
+    def _unflatten_context(aux_data, children):
         executor, graphdef, manager = aux_data
-        step, batch, state, meta = children
+        step, batch, cache, state, meta = children
         models, opt_groups = nnx.merge(graphdef, state)
         return ExecutionContext(
             step=step,
             batch=batch,
+            cache=cache,
             models=models,
             opt_groups=opt_groups,
             executor=executor,
@@ -350,7 +432,7 @@ if _BACKEND == "jax":
             manager=manager,
         )
 
-    jtu.register_pytree_node(ExecutionContext, _context_flatten, _context_unflatten)
+    jtu.register_pytree_node(ExecutionContext, _flatten_context, _unflatten_context)
 
 __all__ = [
     "ComposedContextManager",
@@ -358,4 +440,5 @@ __all__ = [
     "ExecutionContextManager",
     "ExecutionContext",
     "CtxRef",
+    "Ref",
 ]

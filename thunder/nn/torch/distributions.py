@@ -50,32 +50,12 @@ class Normal(Distribution):
         return self.mean + self.std * torch.randn_like(self.mean)
 
 
-class NeuralDistribution(LinearBlock):
-    def __init__(
-        self,
-        in_features: int,
-        params_size: int,
-        hidden_features: Iterable[int] = None,
-        activation: str = "mish",
-        device=None,
-        dtype=None,
-    ):
-        super().__init__(
-            in_features=in_features,
-            out_features=params_size,
-            hidden_features=hidden_features,
-            activation=activation,
-            activate_output=False,
-            device=device,
-            dtype=dtype,
-        )
-        self.params_size = params_size
-
+class DistributionHead(nn.Module):
     def forward(self, *args, **kwargs) -> Distribution:
         raise NotImplementedError
 
 
-class NeuralNormal(NeuralDistribution):
+class NeuralNormal(DistributionHead):
     def __init__(
         self,
         in_features: int,
@@ -88,22 +68,24 @@ class NeuralNormal(NeuralDistribution):
         device=None,
         dtype=None,
     ):
-        super().__init__(
-            in_features=in_features,
-            params_size=2 * out_size,
-            hidden_features=hidden_features,
-            activation=activation,
-            device=device,
-            dtype=dtype,
-        )
+        super().__init__()
         self.out_size = out_size
         self.init_std = init_std
         self.min_std = min_std
         self.max_std = max_std
+        self.ffn = LinearBlock(
+            in_features=in_features,
+            out_features=2 * out_size,
+            hidden_features=hidden_features,
+            activation=activation,
+            activate_output=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.reset_parameters()
 
     def reset_parameters(self, gain: float = 2.0):
-        super().reset_parameters(gain=gain)
-        last_layer: nn.Linear = self.linear_block[-1]
+        last_layer: nn.Linear = self.ffn.linear_block[-1]
         with torch.no_grad():
             nn.init.orthogonal_(last_layer.weight[: self.out_size], gain=math.sqrt(gain))
             nn.init.orthogonal_(last_layer.weight[self.out_size :], gain=0.01 * math.sqrt(gain))
@@ -122,7 +104,7 @@ class NeuralNormal(NeuralDistribution):
         return distributions.Normal(mean, std)
 
 
-class NeuralTransformedDist(NeuralDistribution):
+class NeuralTransformedDist(DistributionHead):
     def __init__(
         self,
         in_features: int,
@@ -132,11 +114,13 @@ class NeuralTransformedDist(NeuralDistribution):
         device=None,
         dtype=None,
     ):
-        super().__init__(
+        super().__init__()
+        self.ffn = LinearBlock(
             in_features=in_features,
-            params_size=out_size,
+            out_features=out_size,
             hidden_features=hidden_features,
             activation=activation,
+            activate_output=False,
             device=device,
             dtype=dtype,
         )
@@ -145,7 +129,7 @@ class NeuralTransformedDist(NeuralDistribution):
         pass
 
 
-class NeuralConsistentNormal(NeuralDistribution):
+class NeuralConsistentNormal(DistributionHead):
     def __init__(
         self,
         in_features: int,
@@ -158,25 +142,29 @@ class NeuralConsistentNormal(NeuralDistribution):
         device=None,
         dtype=None,
     ):
-        self.inv_std = nn.Parameter(
-            torch.ones(out_size, device=device, dtype=dtype) * math.log(init_std)
-        )
-        super().__init__(
-            in_features=in_features,
-            params_size=out_size,
-            hidden_features=hidden_features,
-            activation=activation,
-            device=device,
-            dtype=dtype,
-        )
+        super().__init__()
         self.init_std = init_std
         self.min_std = min_std
         self.max_std = max_std
+        self.ffn = LinearBlock(
+            in_features=in_features,
+            out_features=out_size,
+            hidden_features=hidden_features,
+            activation=activation,
+            activate_output=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.inv_std = nn.Parameter(
+            torch.ones(out_size, device=device, dtype=dtype) * math.log(init_std)
+        )
+        self.reset_parameters()
 
     def reset_parameters(self, gain: float = 2.0):
-        super().reset_parameters(gain)
         out_std = max(self.init_std - self.min_std, 0.01)
-        std_bias = inverse_softplus(torch.tensor(out_std, device=self.device, dtype=self.dtype))
+        std_bias = inverse_softplus(
+            torch.tensor(out_std, device=self.inv_std.device, dtype=self.inv_std.dtype)
+        )
         with torch.no_grad():
             self.inv_std.fill_(std_bias)
 

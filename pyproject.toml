@@ -10,15 +10,7 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3"]
-dependencies = [
-    "numpy",
-    "gymnasium",
-    "tqdm",
-    "rich",
-    "rich_argparse",
-    "pytest",
-    "coolname",
-]
+dependencies = ["tqdm", "rich", "rich_argparse", "coolname"]
 
 
 [project.urls]
@@ -29,7 +21,7 @@ dependencies = [
 [project.scripts]
 
 [project.optional-dependencies]
-torch = ["torch>=2.1.0", "mamba-ssm"]
-jax = ["jax[cuda12]>=0.4.0", "flax", "optax"]
+torch = ["torch<=2.10", "mamba-ssm<=2.3.1"]
+jax = ["jax[cuda12]<=0.6", "flax<=0.11", "optax<=0.3"]
 warp = ["warp-lang"]
 all = ["thunder[torch,jax,warp]"]

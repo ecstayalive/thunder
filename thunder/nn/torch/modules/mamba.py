@@ -1,15 +1,111 @@
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+except ImportError:
+    selective_scan_fn = None
+
+try:
+    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as _OfficialRMSNormGated
+except ImportError:
+    _OfficialRMSNormGated = None
+
+try:
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+except ImportError:
+    mamba_chunk_scan_combined = None
 
 import thunder.nn.torch.ops as ops
 from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
+
+
+class RMSNormGated(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-5,
+        norm_before_gate: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.norm_before_gate = norm_before_gate
+        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+
+    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+        x_dtype = x.dtype
+        x_float = x.float()
+        rms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + self.eps)
+        return (x_float * rms).to(dtype=x_dtype)
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        if self.norm_before_gate:
+            y = self._rms_norm(x) * F.silu(z)
+        else:
+            y = self._rms_norm(x * F.silu(z))
+        return y * self.weight
+
+
+if _OfficialRMSNormGated is not None:
+    RMSNormGated = _OfficialRMSNormGated
+
+
+def _depthwise_causal_conv1d_chunk(
+    x: torch.Tensor,
+    conv1d: nn.Conv1d,
+    conv_state: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Chunked causal depthwise Conv1d with explicit streaming state."""
+    batch, channels, seqlen = x.shape
+    kernel_size = conv1d.kernel_size[0]
+
+    if kernel_size <= 1:
+        y = conv1d(x)[..., :seqlen]
+        return y, x.new_zeros(batch, channels, 0)
+
+    weight = conv1d.weight
+    bias = conv1d.bias
+    if conv_state is None:
+        y_full = conv1d(x)
+        y = y_full[..., :seqlen]
+        if seqlen >= kernel_size - 1:
+            last_conv_state = x[..., -(kernel_size - 1) :]
+        else:
+            pad_len = (kernel_size - 1) - seqlen
+            last_conv_state = torch.cat([x.new_zeros(batch, channels, pad_len), x], dim=-1)
+    else:
+        x_full = torch.cat([conv_state, x], dim=-1)
+        y = F.conv1d(
+            x_full,
+            weight=weight,
+            bias=bias,
+            stride=1,
+            padding=0,
+            groups=conv1d.groups,
+        )
+        last_conv_state = x_full[..., -(kernel_size - 1) :]
+
+    return y, last_conv_state
+
+
+def _is_triton_kernel_failure(exc: BaseException) -> bool:
+    msg = str(exc)
+    markers = (
+        "computeCapability not supported",
+        "PassManager::run failed",
+        "Triton",
+        "MLIR",
+        "tritongpu",
+        "ssd_chunk_state",
+    )
+    return any(marker in msg for marker in markers)
 
 
 class MambaBlock(nn.Module):
@@ -127,7 +223,7 @@ class MambaBlock(nn.Module):
         Process a single time step (or a length-1 segment).
         Returns:
             output_t: (B, D)
-            new_state: (ssm_state, conv_state)
+            new_state: (conv_state, ssm_state)
         """
         if input_t.dim() == 2:
             input_t = input_t.unsqueeze(1)  # (B, 1, D)
@@ -137,61 +233,46 @@ class MambaBlock(nn.Module):
     def _conv_forward(
         self, x: torch.Tensor, conv_state: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply depthwise causal conv with correct streaming semantics.
-        Returns:
-            y: (B, ED, L)  - conv output for the *new* L tokens
-            new_conv_state: (B, ED, k-1)
-        """
-        B, ED, L = x.shape
-        k = self.d_conv
-        if k <= 1:
-            y = self.conv1d(x)[..., :L]
-            new_state = x.new_zeros(B, ED, 0)
-            return y, new_state
-        weight = self.conv1d.weight
-        bias = self.conv1d.bias
-        if conv_state is None:
-            y_full = self.conv1d(x)  # (B, ED, L + k - 1)
-            y = y_full[..., :L]  # causal outputs for this chunk
-            if L >= k - 1:
-                last_conv_state = x[..., -(k - 1) :]
-            else:
-                pad_len = (k - 1) - L
-                zero_pad = x.new_zeros(B, ED, pad_len)
-                last_conv_state = torch.cat([zero_pad, x], dim=-1)
-        else:
-            # x_full: (B, ED, k-1 + L)
-            x_full = torch.cat([conv_state, x], dim=-1)
-            # Conv with padding=0: output length is (k-1+L) - k + 1 = L
-            y = F.conv1d(
-                x_full, weight=weight, bias=bias, stride=1, padding=0, groups=self.d_inner
-            )  # (B, ED, L)
-            # update conv_state to last k-1 pre-conv inputs
-            last_conv_state = x_full[..., -(k - 1) :]
-
-        return y, last_conv_state
+        return _depthwise_causal_conv1d_chunk(x, self.conv1d, conv_state)
 
     def ssm(
         self, x: torch.Tensor, z: torch.Tensor, state: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ """
-        A = -torch.exp(self.A_log)  # (ED, N)
-        # D = self.D  # (ED,)
-        deltaBC = self.x_proj(x)  # (B, L, dt_rank+2*N)
+        A = -torch.exp(self.A_log.float())
+        deltaBC = self.x_proj(x)
         delta, B, C = torch.split(deltaBC, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        # NB: delta, B, C may need RMSLayerNorm
-        #
-        delta = self.dt_proj.weight @ delta.transpose(
-            1, 2
-        )  # (ED, dt_rank)@(B, dt_rank, L)->(B, ED, L)
+
+        delta = self.dt_proj.weight @ delta.transpose(1, 2)
         x = x.transpose(1, 2)
-        B = B.transpose(1, 2)
-        C = C.transpose(1, 2)
+        B = B.transpose(1, 2).contiguous()
+        C = C.transpose(1, 2).contiguous()
         z = z.transpose(1, 2)
-        y, last_state = ops.selective_scan(
-            x, delta, A, B, C, self.D, z, self.dt_proj.bias.float(), state, delta_softplus=True
-        )
+        if self.official_ops and selective_scan_fn is not None and state is None:
+            y, last_state = selective_scan_fn(
+                x,
+                delta,
+                A,
+                B,
+                C,
+                self.D.float(),
+                z=z,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+                return_last_state=True,
+            )
+        else:
+            y, last_state = ops.selective_scan(
+                x,
+                delta,
+                A,
+                B,
+                C,
+                self.D.float(),
+                z,
+                self.dt_proj.bias.float(),
+                state,
+                delta_softplus=True,
+            )
         y = y.transpose(1, 2)  # (B, L, ED)
         return y, last_state
 
@@ -220,7 +301,7 @@ class Mamba2Block(nn.Module):
         dt_init_floor: float = 1e-4,
         bias: bool = False,
         conv_bias: bool = True,
-        official_ops: bool = True,
+        official_ops: bool = False,
         rmsnorm: bool = True,
         activation: str = "silu",
         device=None,
@@ -235,51 +316,46 @@ class Mamba2Block(nn.Module):
         self.d_inner = int(expand * d_model)
         self.headdim = headdim
         self.block_len = block_len
+        self.ngroups = 1
+        self._official_ops_disabled = False
 
         assert (
             self.d_inner % self.headdim == 0
         ), f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}"
         self.nheads = self.d_inner // self.headdim  # H
         self.rmsnorm = rmsnorm
-        self.in_proj = nn.Linear(self.d_model, 2 * self.d_inner, bias=bias, **factory_kwargs)
+        self.in_proj = nn.Linear(
+            self.d_model,
+            2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads,
+            bias=bias,
+            **factory_kwargs,
+        )
 
-        # depthwise causal conv
+        conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
+            in_channels=conv_dim,
+            out_channels=conv_dim,
             kernel_size=d_conv,
             padding=d_conv - 1,
-            groups=self.d_inner,
+            groups=conv_dim,
             bias=conv_bias,
             **factory_kwargs,
         )
-        # activate layer
         act_cls = getattr(nn, ACTIVATION_CLS_NAME.get(activation, "SiLU"))
         self.activate_layer = act_cls()
-        #  dt:   (B, L, nheads)
-        #  B,C:  (B, L, nheads, d_state)
-        self.ssm_proj = nn.Linear(
-            self.d_inner,
-            self.nheads + 2 * self.nheads * self.d_state,
-            bias=False,
-            **factory_kwargs,
-        )
-        # dt bias initialization：softplus(dt_bias) belong to [dt_min, dt_max]
         dt = torch.exp(
             torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
         inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)  # (H,)
+        self.dt_bias = nn.Parameter(inv_dt)
         self.dt_bias._no_weight_decay = True
-        # A matrix initialization
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
         A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
-        self.A_log = nn.Parameter(A_log)  # (H,)
+        self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
-        # D skip per head
         self.D = nn.Parameter(torch.ones(self.nheads, device=device))
         self.D._no_weight_decay = True
         if self.rmsnorm:
@@ -298,16 +374,16 @@ class Mamba2Block(nn.Module):
             conv_state, ssm_state = None, None
         else:
             conv_state, ssm_state = state
-        # _, L, _ = input.shape
-        xz = self.in_proj(input)  # (B, L, 2*ED)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
-        x = x.transpose(1, 2)  # (B, ED, L)
-        x, last_conv_state = self._conv_forward(x, conv_state)
-        x = x.transpose(1, 2)  # (B, L, ED)
-        x = self.activate_layer(x)  # (B, L, ED)
-        # if self.rmsnorm:
-        #     x = self.norm(x)
-        y, last_ssm_state = self._ssm_mamba2(x, ssm_state)  # (B, L, ED)
+        zxbcdt = self.in_proj(input)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads],
+            dim=-1,
+        )
+        xBC = xBC.transpose(1, 2)
+        xBC, last_conv_state = self._conv_forward(xBC, conv_state)
+        xBC = self.activate_layer(xBC.transpose(1, 2))
+        y, last_ssm_state = self._ssm_mamba2(xBC, dt, ssm_state)
         if self.rmsnorm:
             y = self.norm(y, z)
         else:
@@ -318,83 +394,80 @@ class Mamba2Block(nn.Module):
     def _conv_forward(
         self, x: torch.Tensor, conv_state: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply depthwise causal conv with correct streaming semantics.
-        Returns:
-            y: (B, ED, L)  - conv output for the *new* L tokens
-            new_conv_state: (B, ED, k-1)
-        """
-        B, ED, L = x.shape
-        k = self.d_conv
-        if k <= 1:
-            y = self.conv1d(x)[..., :L]
-            new_state = x.new_zeros(B, ED, 0)
-            return y, new_state
-        weight = self.conv1d.weight
-        bias = self.conv1d.bias
-        if conv_state is None:
-            y_full = self.conv1d(x)  # (B, ED, L + k - 1)
-            y = y_full[..., :L]  # causal outputs for this chunk
-            if L >= k - 1:
-                last_conv_state = x[..., -(k - 1) :]
-            else:
-                pad_len = (k - 1) - L
-                zero_pad = x.new_zeros(B, ED, pad_len)
-                last_conv_state = torch.cat([zero_pad, x], dim=-1)
-        else:
-            # x_full: (B, ED, k-1 + L)
-            x_full = torch.cat([conv_state, x], dim=-1)
-            # Conv with padding=0: output length is (k-1+L) - k + 1 = L
-            y = F.conv1d(
-                x_full, weight=weight, bias=bias, stride=1, padding=0, groups=self.d_inner
-            )  # (B, ED, L)
+        return _depthwise_causal_conv1d_chunk(x, self.conv1d, conv_state)
 
-            # update conv_state to last k-1 pre-conv inputs
-            last_conv_state = x_full[..., -(k - 1) :]
-
-        return y, last_conv_state
-
-    def _ssm_mamba2(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _ssm_mamba2(
+        self,
+        xBC: torch.Tensor,
+        dt: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Project dt, B, C from x. Construct discrete SSM parameters A_t, X_t
+        Mamba-2 non-fused path with chunked state support.
         """
-        Bsz, L, ED = x.shape
+        Bsz, L, _ = xBC.shape
         H = self.nheads
         P = self.headdim
         N = self.d_state
-        # dt_raw, B, C
-        ssm_params = self.ssm_proj(x)  # (B, L, H + 2*H*N)
-        dt_raw, B_raw, C_raw = torch.split(
-            ssm_params,
-            [H, H * N, H * N],
+        dt = F.softplus(dt + self.dt_bias.view(1, 1, H))
+        x, B_raw, C_raw = torch.split(
+            xBC,
+            [self.d_inner, self.ngroups * N, self.ngroups * N],
             dim=-1,
         )
-        dt = F.softplus(dt_raw + self.dt_bias.view(1, 1, H))  # (B, L, H)
-        B_mat = B_raw.view(Bsz, L, H, N)  # (B, L, H, N)
-        C_mat = C_raw.view(Bsz, L, H, N)  # (B, L, H, N)
-        X = x.view(Bsz, L, H, P)  # (B, L, H, P)
-        # A -> A_t
-        A_cont = -torch.exp(self.A_log)  # (H,)
-        A_t = dt * A_cont.view(1, 1, H)  # (B, L, H)
-        X_disc = X * dt.unsqueeze(-1)  # (B, L, H, P)
-        A_disc = A_t  # (B, L, H)
-        # SSD + initial_states
-        if self.official_ops:
-            Y_heads, last_state = mamba_chunk_scan_combined(
-                X_disc, dt, A_cont, B_mat, C_mat, self.block_len, return_final_states=True
-            )
+        X = x.view(Bsz, L, H, P)
+        B_mat = B_raw.view(Bsz, L, self.ngroups, N)
+        C_mat = C_raw.view(Bsz, L, self.ngroups, N)
+        A = -torch.exp(self.A_log.float())
+        if (
+            self.official_ops
+            and not self._official_ops_disabled
+            and mamba_chunk_scan_combined is not None
+        ):
+            try:
+                Y_heads, last_state = mamba_chunk_scan_combined(
+                    X,
+                    dt,
+                    A,
+                    B_mat,
+                    C_mat,
+                    self.block_len,
+                    D=self.D.float(),
+                    z=None,
+                    dt_bias=None,
+                    initial_states=state,
+                    dt_softplus=False,
+                    return_final_states=True,
+                )
+            except RuntimeError as exc:
+                if not _is_triton_kernel_failure(exc):
+                    raise
+                self._official_ops_disabled = True
+                warnings.warn(
+                    "Falling back to the local Mamba-2 SSD implementation because the official "
+                    f"Triton kernel failed to compile or launch on this device: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                Y_heads = None
+                last_state = None
         else:
+            Y_heads = None
+            last_state = None
+
+        if Y_heads is None:
+            A_disc = dt * A.view(1, 1, H)
+            X_disc = X * dt.unsqueeze(-1)
             Y_heads, last_state = ops.ssd_minimal(
                 X_disc,
-                A_disc,
+                A_disc.contiguous(),
                 B_mat,
                 C_mat,
                 self.block_len,
-                initial_states=state,  # (B, H, P, N) or None
-            )  # Y_heads: (B, L, H, P)
-        # final_state: (B, H, P, N)
-        Y_heads = Y_heads + self.D.view(1, 1, H, 1) * X
-        y = Y_heads.reshape(Bsz, L, ED)  # (B, L, ED)
+                initial_states=state,
+            )
+            Y_heads = Y_heads + self.D.view(1, 1, H, 1) * X
+        y = Y_heads.reshape(Bsz, L, self.d_inner)  # (B, L, d_inner)
         return y, last_state
 
     def step(
@@ -406,7 +479,7 @@ class Mamba2Block(nn.Module):
         Single-timestep / step-wise inference.
         Returns:
             output_t: (B, D)
-            new_state: (ssm_state, conv_state)
+            new_state: (conv_state, ssm_state)
         """
         if input_t.dim() == 2:
             input_t = input_t.unsqueeze(1)  # (B, 1, D)

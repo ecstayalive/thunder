@@ -271,7 +271,7 @@ class JaxExecutor:
             cls_name = cfg.pop("class", "adam").lower()
             lr = cfg.pop("lr", 3e-4)
             tx = getattr(optax, cls_name)(learning_rate=lr, **cfg)
-            nnx_opt = nnx.Optimizer(target_modules, tx)
+            nnx_opt = nnx.Optimizer(nnx.Dict(target_modules), tx)
             opt_groups[opt_key] = OptimGroup(
                 name=opt_key,
                 targets=target_names,
@@ -351,18 +351,20 @@ class JaxExecutor:
     ) -> Tuple[ScaleState, Dict[str, Any]]:
         full_graphdef, full_state = nnx.split(models)
         optim_names = set(optimizer.model.keys())
-        trainable_state, frozen_state = nnx.split_state(
-            full_state, lambda path, var: path[0] in optim_names, ...
-        )
+        _, frozen_state = nnx.split_state(full_state, lambda path, var: path[0] in optim_names, ...)
 
-        def loss_fn(tracked_state: nnx.State):
+        def loss_fn(opt_state: nnx.State):
             """ """
-            local_models = nnx.merge(full_graphdef, frozen_state, tracked_state)
             if compute_dtype != jnp.float32:
-                cast_state = jax.tree_util.tree_map(
-                    lambda x: x.astype(compute_dtype), nnx.state(local_models)
+                cast_opt_state = jax.tree_util.tree_map(
+                    lambda x: x.astype(compute_dtype), opt_state
                 )
-                nnx.update(local_models, cast_state)
+                cast_frozen_state = jax.tree_util.tree_map(
+                    lambda x: x.astype(compute_dtype), frozen_state
+                )
+                local_models = nnx.merge(full_graphdef, cast_frozen_state, cast_opt_state)
+            else:
+                local_models = nnx.merge(full_graphdef, frozen_state, opt_state)
             total_loss = 0.0
             metrics = {}
             for obj in objectives:
@@ -372,21 +374,20 @@ class JaxExecutor:
             scaled_loss = scaler.scale(jnp.asarray(total_loss, dtype=jnp.float32), scaler_state)
             return scaled_loss, metrics
 
-        with _precision_scope(jnp.float32):
-            tracked_state = nnx.state(optimizer.model)
-            grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-            (loss, metrics), grads = grad_fn(tracked_state)
-            grads = scaler.unscale(grads, scaler_state)
-            grad_norm = optax.global_norm(grads)
-            # scale = jnp.where(
-            #     max_grad_norm > 0, jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6)), 1.0
-            # )
-            scale = jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6))
-            grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
-            scaler.step(optimizer, grads)
-            new_scaler_state = scaler.update(scaler_state, grads)
+        opt_state = nnx.state(optimizer.model)
+        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+        (loss, metrics), grads = grad_fn(opt_state)
+        grads = scaler.unscale(grads, scaler_state)
+        grad_norm = optax.tree.norm(grads)
+        # scale = jnp.where(
+        #     max_grad_norm > 0, jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6)), 1.0
+        # )
+        scale = jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6))
+        grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
+        scaler.step(optimizer, grads)
+        new_scaler_state = scaler.update(scaler_state, grads)
         # nnx.update(models, nnx.state(optimizer.model))
-        metrics["grad_norm"] = optax.global_norm(grads)
+        metrics["grad_norm"] = optax.tree.norm(grads)
         metrics["loss_total"] = loss
         return new_scaler_state, metrics
 
@@ -406,7 +407,7 @@ class JaxExecutor:
         return jax.devices(backend)
 
     @staticmethod
-    def default_device(device: Optional[jax.Device | str] = None):
+    def default_device(device: Optional[Any | str] = None):
         if isinstance(device, jax.Device):
             return device
         try:
@@ -415,7 +416,7 @@ class JaxExecutor:
             return jax.devices()[0]
 
     @staticmethod
-    def to_device(data: Any, device: Optional[jax.Device | str] = None):
+    def to_device(data: Any, device: Optional[Any | str] = None):
         return jax.device_put(data, JaxExecutor.default_device(device))
 
     @staticmethod
