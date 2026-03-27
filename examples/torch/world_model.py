@@ -70,6 +70,9 @@ class RepresentModel(nn.Module):
 class RepresentOp(Operation):
     """ """
 
+    requires = ("models", "batch.obs.policy")
+    provides = ("batch.embedding", "batch.noise_embedding", "batch.next_embedding")
+
     def __init__(self, name="represent_op"):
         super().__init__(name)
 
@@ -114,16 +117,16 @@ class JepaPredictObj(Objective):
         z_t = embedding[:, :-1]
         z_pred = models.transition(torch.cat((z_t, a_t), dim=-1))
         predict_loss = F.mse_loss(z_pred[mask_next], next_embedding[mask_next].detach())
-        consistent_loss = F.mse_loss(noise_embedding[mask], embedding[mask])
+        # consistent_loss = F.mse_loss(noise_embedding[mask], embedding[mask])
         r_pred = models.reward_model(embedding).squeeze()
         r_loss = F.mse_loss(r_pred[mask], batch.rewards[mask])
         target_c = 1.0 - batch.dones[mask].float()
         c_pred = models.continue_model(embedding).squeeze()
         c_loss = F.binary_cross_entropy_with_logits(c_pred[mask], target_c)
-        pred_loss = predict_loss + consistent_loss + r_loss + c_loss
+        pred_loss = predict_loss + r_loss + c_loss
         metrics = {
             f"{self._prefix}dynamic_loss": predict_loss,
-            f"{self._prefix}consistent_loss": consistent_loss,
+            # f"{self._prefix}consistent_loss": consistent_loss,
             f"{self._prefix}reward_loss": r_loss,
             f"{self._prefix}continue_loss": c_loss,
         }
@@ -142,12 +145,37 @@ class ImagineOp(Operation):
         models = ctx.models
         batch = ctx.batch
         embedding: torch.Tensor = batch["embedding"]
-        z_t: torch.Tensor = embedding[:, 0, :].detach()
+        start_mask = batch.mask.bool()
+        if batch.dones is not None:
+            dones = batch.dones
+            if dones.dim() == 3 and dones.size(-1) == 1:
+                dones = dones.squeeze(-1)
+            start_mask = start_mask & (~dones.bool())
+        z_t: torch.Tensor = embedding[start_mask].reshape(-1, embedding.size(-1)).detach()
+        if z_t.numel() == 0:
+            empty_z = embedding.new_empty((0, embedding.size(-1)))
+            empty_a = embedding.new_empty((0, batch.actions.size(-1)))
+            empty_scalar = embedding.new_empty((0, 1))
+            ctx.batch = ctx.batch.replace(
+                imagined_z=empty_z.unsqueeze(0),
+                imagined_a=empty_a.unsqueeze(0),
+                imagined_r=empty_scalar.unsqueeze(0),
+                imagined_c=empty_scalar.unsqueeze(0),
+                imagined_entropy=empty_scalar.unsqueeze(0),
+                imagined_lambda_v=empty_scalar.unsqueeze(0),
+            )
+            zero = embedding.new_zeros(())
+            return ctx, {
+                f"{self._prefix}z_seq_norm": zero,
+                f"{self._prefix}entropy": zero,
+                f"{self._prefix}imagined_reward": zero,
+                f"{self._prefix}lambda_value": zero,
+            }
         z_seq, a_seq, r_seq, c_seq, entropy_seq = [], [], [], [], []
         for _ in range(self.horizon):
             dist = models.actor(z_t)
             a_t = dist.rsample()
-            entropy = dist.entropy().unsqueeze(-1)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
             r_t = models.reward_model(z_t)
             c_t = torch.sigmoid(models.continue_model(z_t))
             z_seq.append(z_t)
@@ -157,13 +185,17 @@ class ImagineOp(Operation):
             entropy_seq.append(entropy)
             z_t = models.transition(torch.cat((z_t, a_t), dim=-1))
         z_seq.append(z_t)
-        z_seq = torch.stack(z_seq)  # [H+1, B*T, DModel+ActionDim]
-        a_seq = torch.stack(a_seq)  # [H, B*T, ActionDim]
-        r_seq = torch.stack(r_seq)  # [H, B*T, 1]
-        c_seq = torch.stack(c_seq)  # [H, B*T, 1]
-        entropy_seq = torch.stack(entropy_seq)  # [H, B*T, 1]
+        z_seq = torch.stack(z_seq)  # [H+1, N, D]
+        a_seq = torch.stack(a_seq)  # [H, N, ActionDim]
+        r_seq = torch.stack(r_seq)  # [H, N, 1]
+        c_seq = torch.stack(c_seq)  # [H, N, 1]
+        entropy_seq = torch.stack(entropy_seq)  # [H, N, 1]
         lambda_values = compute_lambda_returns(
             r_seq, models.v(z_seq), c_seq, gamma=self.gamma, lambda_=self.lambda_
+        )
+        discounts = (self.gamma * c_seq).detach()
+        weights = torch.cumprod(
+            torch.cat((torch.ones_like(discounts[:1]), discounts[:-1]), dim=0), dim=0
         )
         ctx.batch = ctx.batch.replace(
             imagined_z=z_seq,
@@ -172,6 +204,7 @@ class ImagineOp(Operation):
             imagined_c=c_seq,
             imagined_entropy=entropy_seq,
             imagined_lambda_v=lambda_values,
+            imagined_weight=weights,
         )
         return ctx, {
             f"{self._prefix}z_seq_norm": z_seq.norm(dim=-1).mean(),
@@ -196,8 +229,12 @@ class ActorObj(Objective):
     def compute(self, batch: Batch, models: Models):
         entropy = batch.imagined_entropy
         lambda_values = batch.imagined_lambda_v
-        actor_loss = -lambda_values.mean()
-        # - self.entropy_coef * entropy.mean()
+        weights = batch.imagined_weight
+        if lambda_values.numel() == 0:
+            return lambda_values.new_zeros(()), {}
+        normalizer = weights.sum().clamp_min(1.0)
+        actor_loss = -(weights * lambda_values).sum() / normalizer
+        actor_loss = actor_loss - self.entropy_coef * (weights * entropy).sum() / normalizer
         return actor_loss, {}
 
 
@@ -216,7 +253,13 @@ class CriticObj(Objective):
     def compute(self, batch: Batch, models: Models):
         z = batch.imagined_z
         lambda_values = batch.imagined_lambda_v
-        critic_loss = F.mse_loss(models.v(z[:-1].detach()), lambda_values.detach())
+        weights = batch.imagined_weight
+        if lambda_values.numel() == 0:
+            return z.new_zeros(()), {}
+        value_error = F.mse_loss(
+            models.v(z[:-1].detach()), lambda_values.detach(), reduction="none"
+        )
+        critic_loss = (weights * value_error).sum() / weights.sum().clamp_min(1.0)
         return critic_loss, {}
 
 
@@ -306,7 +349,7 @@ class AliveAgent(Agent):
                     [
                         SplitTraj(),
                         RepresentOp(),
-                        OptimizeOp("wm_opt", [JepaPredictObj(0.95), SIGRegObj(0.05)]),
+                        OptimizeOp("wm_opt", [JepaPredictObj(), SIGRegObj(0.1)]),
                         ImagineOp(horizon=16),
                         OptimizeOp("actor_opt", [ActorObj()]),
                         OptimizeOp("critic_opt", [CriticObj()]),

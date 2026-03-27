@@ -53,10 +53,11 @@ _SYSTEM_EXACT_REFS = _normalize_refs(
         "step",
         "batch",
         "cache",
-        "meta",
+        "models",
         "executor",
         "manager",
         "opt_groups",
+        "meta",
     )
 )
 
@@ -122,8 +123,8 @@ class Operation(ABC):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        cls.requires = _normalize_refs(getattr(cls, "Requires", ()))
-        cls.provides = _normalize_refs(getattr(cls, "Provides", ()))
+        cls.requires = _normalize_refs(getattr(cls, "requires", ()))
+        cls.provides = _normalize_refs(getattr(cls, "provides", ()))
 
     def __init__(self, name: str = "operation", **kwargs):
         self.name = name

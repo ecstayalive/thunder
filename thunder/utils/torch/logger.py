@@ -16,6 +16,8 @@ import torch
 import torch.multiprocessing as mp
 import torch.utils._pytree as pytree
 
+from thunder.core import Ref
+
 from .tsne_views import VIEW_REGISTRY, TSNEView
 from .workspace import Workspace
 
@@ -127,6 +129,7 @@ class CuTSNELogger(Logger):
     def __init__(
         self,
         workspace: Workspace,
+        target_ref: Ref = Ref("batch.embedding"),
         views: List[Union[str, Tuple[str, Dict], TSNEView]] = [
             "traj",
             ("traj", {"plot_connection": True}),
@@ -139,6 +142,7 @@ class CuTSNELogger(Logger):
         enable: bool = True,
     ):
         super().__init__(workspace, enable=enable)
+        self.target_ref = target_ref
         # TSNE config
         self.perplexity = perplexity
         self.max_iter = max_iter
@@ -198,7 +202,7 @@ class CuTSNELogger(Logger):
 
     def log_impl(self, metrics: Dict[str, Any], step: int):
         ctx: ExecutionContext = metrics["execution_context"]
-        embedding = ctx.batch["embedding"]
+        embedding = self.target_ref(ctx)
         mask = ctx.batch.mask
         if step % self.interval != 0:
             return

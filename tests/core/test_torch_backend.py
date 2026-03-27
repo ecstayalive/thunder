@@ -1,3 +1,4 @@
+import pickle
 from typing import Any, Dict, Tuple
 from unittest.mock import patch
 
@@ -180,6 +181,26 @@ def test_operation_requires_provides_normalization():
     assert DeclaredRequireOp.requires == frozenset({ctx_mod.Ref("cache['embedding']")})
 
 
+def test_batch_ref_attr_and_key_access_are_equivalent():
+    assert ctx_mod.Ref("batch.embedding") == ctx_mod.Ref("batch['embedding']")
+    assert ctx_mod.Ref("batch.obs") == ctx_mod.Ref("batch['obs']")
+
+
+def test_cache_ref_attr_and_key_access_are_equivalent():
+    assert ctx_mod.Ref("cache.embedding") == ctx_mod.Ref("cache['embedding']")
+
+
+def test_ref_is_pickleable_and_rebuilds_accessor():
+    ref = ctx_mod.Ref("batch['embedding']")
+    restored = pickle.loads(pickle.dumps(ref))
+    batch = data_mod.Batch()
+    batch["embedding"] = torch.tensor([[1.0, 2.0]])
+    ctx = type("DummyCtx", (), {"batch": batch})()
+
+    assert restored == ref
+    assert torch.equal(restored(ctx), batch["embedding"])
+
+
 def test_pipeline_validation_success():
     pipeline = op_mod.Pipeline(
         [DeclaredProvideOp(name="provide"), DeclaredRequireOp(name="require")],
@@ -187,6 +208,24 @@ def test_pipeline_validation_success():
     )
     assert pipeline.requires == frozenset()
     assert ctx_mod.Ref("cache['embedding']") in pipeline.provides
+
+
+def test_pipeline_validation_accepts_mixed_batch_ref_styles():
+    class ProvideEmbedding(op_mod.Operation):
+        provides = ("batch.embedding",)
+
+        def forward(self, ctx):
+            return ctx, {}
+
+    class RequireEmbedding(op_mod.Operation):
+        requires = (ctx_mod.Ref("batch['embedding']"),)
+
+        def forward(self, ctx):
+            return ctx, {}
+
+    pipeline = op_mod.Pipeline([ProvideEmbedding(name="provide"), RequireEmbedding(name="require")])
+    assert pipeline.requires == frozenset()
+    assert ctx_mod.Ref("batch.embedding") in pipeline.provides
 
 
 def test_pipeline_validation_failure():

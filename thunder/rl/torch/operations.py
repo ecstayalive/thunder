@@ -21,7 +21,7 @@ from thunder.core import (
 )
 from thunder.env.loader import ThunderEnvWrapper
 
-from .functional import all_reduce, get_trajectory_lengths
+from .functional import get_trajectory_lengths
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -69,10 +69,8 @@ class SIGRegObj(Objective):
     def compute(self, batch: Batch, model: ModelPack):
         embeddings: torch.Tensor = batch[self.key]  # [B, L ,D]
         mask: torch.Tensor = batch.mask  # [B, L]
-        B, L, D = embeddings.shape
-        x = embeddings[mask].reshape(-1, embeddings.size(-1))
-        N_local = x.size(0)
-        device = x.device
+        _, L, D = embeddings.shape
+        device = embeddings.device
         with torch.no_grad():
             if dist.is_available() and dist.is_initialized():
                 seed_tensor = self.global_step.clone()
@@ -85,28 +83,35 @@ class SIGRegObj(Objective):
             A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-6)
             self.global_step.add_(1)
 
-        # x_proj: [N, K]
-        # x_proj(i,k) represents the projected value of the (i)th sample in the (k)th random direction.
-        x_proj = x @ A
-        # x_t: [N, K, T] = [N, K, 1] * [T]
-        # The projected value of sample `i` in direction `k`` is multiplied by `t`
-        x_t = x_proj.unsqueeze(-1) * self.t
+        # Apply the regularizer across the batch axis for each time index,
+        # then average the per-time losses over valid time steps.
+        x_proj = embeddings @ A  # [B, L, K]
+        x_t = x_proj.unsqueeze(-1) * self.t  # [B, L, K, T]
         cos_vals = torch.cos(x_t)
         sin_vals = torch.sin(x_t)
-        cos_mean = cos_vals.mean(dim=0)
-        sin_mean = sin_vals.mean(dim=0)
+
+        stats_mask = mask.to(dtype=cos_vals.dtype).unsqueeze(-1).unsqueeze(-1)
+        cos_sum = (cos_vals * stats_mask).sum(dim=0)  # [L, K, T]
+        sin_sum = (sin_vals * stats_mask).sum(dim=0)  # [L, K, T]
+        counts = mask.to(dtype=cos_vals.dtype).sum(dim=0)  # [L]
 
         if dist.is_available() and dist.is_initialized():
-            cos_mean = all_reduce(cos_mean, "AVG")
-            sin_mean = all_reduce(sin_mean, "AVG")
+            dist.all_reduce(cos_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(sin_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+        valid_times = counts > 0
+        if not valid_times.any():
+            return embeddings.new_zeros(()), {}
+
+        safe_counts = counts.clamp_min(1.0).view(L, 1, 1)
+        cos_mean = cos_sum / safe_counts
+        sin_mean = sin_sum / safe_counts
 
         err_sq = (cos_mean - self.phi).square() + sin_mean.square()
         # The trapezoidal rule integrals
-        loss_per_slice = err_sq @ self.integration_weights
-        total_N = N_local
-        if dist.is_available() and dist.is_initialized():
-            total_N = total_N * dist.get_world_size()
-        loss = loss_per_slice.mean() * total_N
+        loss_per_time = (err_sq @ self.integration_weights).mean(dim=-1) * counts
+        loss = loss_per_time[valid_times].mean()
         return loss, {}
 
 

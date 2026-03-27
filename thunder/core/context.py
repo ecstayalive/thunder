@@ -167,7 +167,8 @@ class Ref:
     __slots__ = ("_path", "_compiled_fn")
 
     def __init__(self, path: str | _RefPath):
-        self._path = self._parse_expr(path) if isinstance(path, str) else tuple(path)
+        raw_path = self._parse_expr(path) if isinstance(path, str) else tuple(path)
+        self._path = self._normalize_path(raw_path)
         self._compiled_fn = _compile_ref_accessor(self._path)
 
     def __call__(self, ctx: ExecutionContext):
@@ -180,6 +181,11 @@ class Ref:
 
     def __hash__(self):
         return hash(self._path)
+
+    def __reduce__(self):
+        # Rebuild from the canonical path so pickling does not try to serialize
+        # the cached accessor lambda created by `_compile_ref_accessor`.
+        return (type(self), (self._path,))
 
     @property
     def path(self) -> _RefPath:
@@ -236,6 +242,28 @@ class Ref:
             raise ValueError(f"Ref subscript key must be hashable, got: {type(key).__name__}")
         return key
 
+    @staticmethod
+    def _normalize_path(path: _RefPath) -> _RefPath:
+        """Normalize equivalent access patterns for Thunder containers.
+
+        `Batch` and `Cache` support both attribute access and string-key access
+        for their first-level entries. Canonicalizing these paths avoids false
+        negatives during contract validation, e.g. `batch.embedding` versus
+        `batch["embedding"]`.
+        """
+        if len(path) < 2:
+            return path
+        root, first_child = path[0], path[1]
+        if (
+            isinstance(root, _RefAttr)
+            and root.name in {"batch", "cache"}
+            and isinstance(first_child, _RefKey)
+            and isinstance(first_child.key, str)
+            and first_child.key.isidentifier()
+        ):
+            return (root, _RefAttr(first_child.key), *path[2:])
+        return path
+
 
 @lru_cache(maxsize=None)
 def _compile_ref_accessor(path: _RefPath):
@@ -266,10 +294,14 @@ def replace_ref_path(root: Any, path: _RefPath, value: Any) -> Any:
     if isinstance(step, _RefAttr):
         child = getattr(root, step.name)
         new_child = replace_ref_path(child, rest, value)
+        if hasattr(root, "replace") and callable(root.replace):
+            return root.replace(**{step.name: new_child})
         return replace(root, **{step.name: new_child})
 
     child = root[step.key]
     new_child = replace_ref_path(child, rest, value)
+    if hasattr(root, "replace") and callable(root.replace) and isinstance(step.key, str):
+        return root.replace(**{step.key: new_child})
     if isinstance(root, dict):
         updated = root.copy()
         updated[step.key] = new_child

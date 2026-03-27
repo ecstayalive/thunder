@@ -12,6 +12,9 @@ requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = ["tqdm", "rich", "rich_argparse", "coolname"]
 
+[tool.setuptools]
+packages = ["thunder"]
+
 
 [project.urls]
 "Homepage" = "https://github.com/ecstayalive/thunder"
