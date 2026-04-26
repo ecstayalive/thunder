@@ -1,5 +1,5 @@
 """
-An example of a world model-based agent using Thunder.
+An example of a world model based agent using Thunder.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from thunder.core import OptimizeOp, Pipeline
 from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
-from thunder.nn.torch import LinearBlock, Mamba2Block, NeuralNormal
+from thunder.nn.torch import LinearBlock, Mamba2Block, NormalHead
 from thunder.rl.torch import *
 from thunder.utils import ArgOpt, ArgParser
 from thunder.utils.torch import AsyncLogger, CuTSNELogger, TensorBoardLogger, Workspace
@@ -102,7 +102,7 @@ class JepaPredictObj(Objective):
         reward_model: LinearBlock
         continue_model: LinearBlock
         represent: RepresentModel
-        actor: NeuralNormal
+        actor: NormalHead
 
     def __init__(self, weight=1.0, name="jepa_predict"):
         super().__init__(weight, name)
@@ -220,7 +220,7 @@ class ActorObj(Objective):
         reward_model: LinearBlock
         continue_model: LinearBlock
         v: LinearBlock
-        actor: NeuralNormal
+        actor: NormalHead
 
     def __init__(self, weight=1.0, name="actor_obj", entropy_coef=1e-4, **kwargs):
         super().__init__(weight, name, **kwargs)
@@ -244,7 +244,7 @@ class CriticObj(Objective):
         reward_model: LinearBlock
         continue_model: LinearBlock
         v: LinearBlock
-        actor: NeuralNormal
+        actor: NormalHead
 
     def __init__(self, weight=1.0, name="critic_obj", entropy_coef=1e-4, **kwargs):
         super().__init__(weight, name, **kwargs)
@@ -269,7 +269,7 @@ class AliveAgent(Agent):
         represent: RepresentModel
         reward_model: LinearBlock
         v: LinearBlock
-        actor: NeuralNormal
+        actor: NormalHead
 
     def __init__(self, models, buffer=None, executor=None, optim_config=None, pipeline=None):
         super().__init__(models, buffer, executor, optim_config, pipeline)
@@ -317,7 +317,7 @@ class AliveAgent(Agent):
         transition = LinearBlock(spec.d_model + action_dim, spec.d_model, [256, 256])
         reward_model = LinearBlock(spec.d_model, 1, [256, 256])
         continue_model = LinearBlock(spec.d_model, 1, [256, 256])
-        actor = NeuralNormal(spec.d_model, action_dim, [256, 256], init_std=0.25)
+        actor = NormalHead(spec.d_model, action_dim, [256, 256], init_std=0.25)
         v = LinearBlock(spec.d_model, 1, [256, 256])
         models = ModelPack(
             represent=represent,

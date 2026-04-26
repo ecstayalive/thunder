@@ -8,10 +8,9 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, ContextManager, Dict, Hashable, Optional, Tuple
 
-from .data import Cache
+from .data import Batch, Cache
 
 if TYPE_CHECKING:
-    from .data import Batch
     from .executor.interface import Executor
     from .module import ModelPack, ThunderModule
 
@@ -112,13 +111,15 @@ class ExecutionContext:
     """
 
     step: int
+    # Runtime
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
     executor: Executor
     manager: ExecutionContextManager
-    batch: Optional[Batch] = None
-    cache: Cache = field(default_factory=Cache)
     meta: Dict[str, Any] = field(default_factory=dict)
+    # Artifact
+    cache: Cache = field(default_factory=Cache)
+    batch: Optional[Batch] = None
 
     def replace(self, **changes) -> ExecutionContext:
         return replace(self, **changes)

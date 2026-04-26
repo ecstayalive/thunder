@@ -1,110 +1,61 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar
-
-if TYPE_CHECKING:
-    from .executor.interface import Executor
+from dataclasses import dataclass, field, fields, is_dataclass
+from functools import wraps
+from typing import Any, Dict, Optional, TypeVar
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
+TAttrData = TypeVar("TAttrData", bound="AttrData")
 TBatch = TypeVar("TBatch", bound="Batch")
+_REGISTERED_ATTRDATA_TYPES: set[type] = set()
 
 
-@dataclass(slots=True)
-class Cache:
-    data: Dict[str, Any] = field(default_factory=dict)
+@dataclass(slots=True, init=False, repr=False)
+class AttrData:
+    """Dataclass container with attribute-style access to dynamic fields.
+
+    `AttrData` is the common base type for Thunder data containers. Explicit
+    dataclass fields describe the stable structure, while `_data` stores
+    dynamically attached attributes.
+
+    Only dataclass subclasses are supported as pytree nodes. Use
+    `@attr_dataclass(...)` for concrete subclasses so Torch/JAX can
+    reconstruct the exact runtime type during unflatten.
+    """
+
+    _data: Dict[str, Any] = field(default_factory=dict, init=False)
+
+    def __init__(self, _data: Optional[Dict[str, Any]] = None, **kwargs):
+        base_data = {} if _data is None else dict(_data)
+        base_data.update(kwargs)
+        object.__setattr__(self, "_data", base_data)
 
     def __getattr__(self, name: str) -> Any:
-        data = object.__getattribute__(self, "data")
         try:
+            data = object.__getattribute__(self, "_data")
             return data[name]
-        except KeyError:
-            raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+        except (AttributeError, KeyError) as exc:
+            raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'") from exc
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name == "data" or name.startswith("_"):
+        if name in self.__class__.__dataclass_fields__ or name.startswith("_"):
             object.__setattr__(self, name, value)
-        else:
-            object.__getattribute__(self, "data")[name] = value
+            return
+        data = object.__getattribute__(self, "_data")
+        data[name] = value
 
     def __getitem__(self, key: str) -> Any:
-        return self.data[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.data[key] = value
-
-    def get(self, key: str, default=None) -> Any:
-        return self.data.get(key, default)
-
-    def update(self, **kwargs) -> None:
-        self.data.update(kwargs)
-
-    def replace(self, **kwargs) -> "Cache":
-        new_data = self.data.copy()
-        new_data.update(kwargs)
-        return Cache(data=new_data)
-
-    def __dir__(self):
-        return ["data"] + list(self.data.keys())
-
-    def __repr__(self) -> str:
-        def _fmt(v):
-            if hasattr(v, "shape"):
-                return f"Arr{tuple(v.shape)}"
-            if isinstance(v, dict):
-                return f"Dict[{len(v)}]"
-            if isinstance(v, (list, tuple)):
-                return f"{type(v).__name__}[{len(v)}]"
-            return str(v)
-
-        items = [f"{k}={_fmt(v)}" for k, v in self.data.items()]
-        return f"Cache({', '.join(items)})"
-
-
-@dataclass(slots=True)
-class Batch:
-    obs: Dict[str, Any] = None
-    actions: Optional[Any] = None
-    rewards: Optional[Any] = None
-    dones: Optional[Any] = None
-    timeouts: Optional[Any] = None
-    mask: Optional[Any] = None
-    next_obs: Optional[Dict[str, Any]] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-    def __getattr__(self, name: str) -> Any:
-        """ """
-        try:
-            extra = object.__getattribute__(self, "extra")
-            return extra[name]
-        except (AttributeError, KeyError):
-            raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        """
-        WARNING: In JAX loops (scan/while_loop), adding NEW keys dynamically
-        changes the Pytree structure and will cause compilation errors.
-        """
-        if name in self.__class__.__dataclass_fields__:
-            object.__setattr__(self, name, value)
-        else:
-            self.extra[name] = value
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        """ """
-        setattr(self, key, value)
-
-    def __getitem__(self, key: str) -> Any:
-        """ """
         return getattr(self, key)
 
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
     def __dir__(self):
-        """ """
-        return list(self.__class__.__dataclass_fields__.keys()) + list(self.extra.keys())
+        return list(self.__class__.__dataclass_fields__.keys()) + list(self._data.keys())
 
     def __repr__(self) -> str:
-        def _fmt(v):
+        def _fmt(v: Any) -> str:
             if hasattr(v, "shape"):
                 return f"Arr{tuple(v.shape)}"
             if isinstance(v, dict):
@@ -114,101 +65,143 @@ class Batch:
             return str(v)
 
         core = []
-        for f in fields(self):
-            if f.name == "extra":
-                continue
-            val = getattr(self, f.name)
+        for name in type(self).__attrdata_field_names__:
+            val = getattr(self, name)
             if val is not None:
-                core.append(f"{f.name}={_fmt(val)}")
-        extra_items = [f"{k}={_fmt(v)}" for k, v in self.extra.items()]
-        return f"Batch({', '.join(core + extra_items)})"
+                core.append(f"{name}={_fmt(val)}")
+        dynamic_items = [f"{k}={_fmt(v)}" for k, v in self._data.items()]
+        return f"{type(self).__name__}({', '.join(core + dynamic_items)})"
 
-    def replace(self: TBatch, **kwargs) -> TBatch:
-        core_changes = {}
-        extra_updates = {}
-        valid_fields = self.__class__.__dataclass_fields__
-        for k, v in kwargs.items():
-            if k in valid_fields:
-                core_changes[k] = v
-            else:
-                extra_updates[k] = v
-        if extra_updates:
-            base_extra = core_changes.get("extra", self.extra)
-            new_extra = base_extra.copy()
-            new_extra.update(extra_updates)
-            core_changes["extra"] = new_extra
-        return replace(self, **core_changes)
+    def get(self, key: str, default=None) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            return default
 
+    def update(self, **kwargs) -> None:
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
-if _BACKEND == "torch":
-    import torch.utils._pytree as pytree
+    def replace(self: TAttrData, **kwargs) -> TAttrData:
+        explicit_data = kwargs.pop("_data", None)
+        base_data = dict(self._data if explicit_data is None else explicit_data)
 
-    def _flatten_cache(cache: Cache):
-        data_keys = sorted(cache.data.keys())
-        data_values = [cache.data[k] for k in data_keys]
-        children = tuple(data_values)
-        aux_data = tuple(data_keys)
-        return children, aux_data
+        init_kwargs = {}
+        for name in type(self).__attrdata_field_names__:
+            init_kwargs[name] = kwargs.pop(name, getattr(self, name))
 
-    def _unflatten_cache(children, aux_data):
-        return Cache(data=dict(zip(aux_data, children)))
-
-    pytree.register_pytree_node(Cache, _flatten_cache, _unflatten_cache)
-
-    def _flatten_batch(batch: Batch):
-        core_fields = [f.name for f in fields(batch) if f.name != "extra"]
-        core_values = [getattr(batch, f) for f in core_fields]
-        extra_keys = sorted(batch.extra.keys())
-        extra_values = [batch.extra[k] for k in extra_keys]
-        children = tuple(core_values + extra_values)
-        aux_data = (tuple(core_fields), tuple(extra_keys))
-        return children, aux_data
-
-    def _unflatten_batch(children, aux_data):
-        core_names, extra_keys = aux_data
-        n_core = len(core_names)
-        core_vals = children[:n_core]
-        extra_vals = children[n_core:]
-        init_kwargs = dict(zip(core_names, core_vals))
-        extra_dict = dict(zip(extra_keys, extra_vals))
-        return Batch(extra=extra_dict, **init_kwargs)
-
-    pytree.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)
-
-if _BACKEND == "jax":
-    import jax
-
-    def _flatten_cache(cache: Cache):
-        data_keys = sorted(cache.data.keys())
-        data_values = [cache.data[k] for k in data_keys]
-        children = tuple(data_values)
-        aux_data = tuple(data_keys)
-        return children, aux_data
-
-    def _unflatten_cache(aux_data, children):
-        return Cache(data=dict(zip(aux_data, children)))
-
-    jax.tree_util.register_pytree_node(Cache, _flatten_cache, _unflatten_cache)
-
-    def _flatten_batch(batch: Batch):
-        core_fields = [f.name for f in fields(batch) if f.name != "extra"]
-        core_values = [getattr(batch, f) for f in core_fields]
-        extra_keys = sorted(batch.extra.keys())
-        extra_values = [batch.extra[k] for k in extra_keys]
-        children = tuple(core_values + extra_values)
-        aux_data = (tuple(core_fields), tuple(extra_keys))
-        return children, aux_data
-
-    def _unflatten_batch(aux_data, children):
-        core_names, extra_keys = aux_data
-        n_core = len(core_names)
-        core_vals = children[:n_core]
-        extra_vals = children[n_core:]
-        init_kwargs = dict(zip(core_names, core_vals))
-        extra_dict = dict(zip(extra_keys, extra_vals))
-        return Batch(extra=extra_dict, **init_kwargs)
-
-    jax.tree_util.register_pytree_node(Batch, _flatten_batch, _unflatten_batch)
+        base_data.update(kwargs)
+        return type(self)(_data=base_data, **init_kwargs)
 
 
-__all__ = ["Cache", "Batch"]
+def _flatten_attrdata_instance(data: AttrData):
+    core_fields = type(data).__attrdata_field_names__
+    core_values = tuple(getattr(data, name) for name in core_fields)
+    data_keys = tuple(sorted(data._data.keys()))
+    data_values = tuple(data._data[key] for key in data_keys)
+    children = core_values + data_values
+    aux_data = (type(data), core_fields, data_keys)
+    return children, aux_data
+
+
+def _torch_unflatten_attrdata(children, aux_data):
+    cls, core_fields, data_keys = aux_data
+    n_core = len(core_fields)
+    core_vals = children[:n_core]
+    data_vals = children[n_core:]
+    init_kwargs = dict(zip(core_fields, core_vals))
+    data_dict = dict(zip(data_keys, data_vals))
+    return cls(_data=data_dict, **init_kwargs)
+
+
+def _jax_unflatten_attrdata(aux_data, children):
+    cls, core_fields, data_keys = aux_data
+    n_core = len(core_fields)
+    core_vals = children[:n_core]
+    data_vals = children[n_core:]
+    init_kwargs = dict(zip(core_fields, core_vals))
+    data_dict = dict(zip(data_keys, data_vals))
+    return cls(_data=data_dict, **init_kwargs)
+
+
+def register_attrdata_type(cls: type[TAttrData]) -> type[TAttrData]:
+    """Register a concrete AttrData dataclass as a pytree node."""
+
+    if cls in _REGISTERED_ATTRDATA_TYPES:
+        return cls
+    if not is_dataclass(cls):
+        raise TypeError(f"{cls.__name__} must be a dataclass before pytree registration.")
+    if not issubclass(cls, AttrData):
+        raise TypeError(f"{cls.__name__} must inherit from AttrData.")
+
+    cls.__attrdata_field_names__ = tuple(f.name for f in fields(cls) if f.name != "_data")
+    cls.__attrdata_field_name_set__ = frozenset(cls.__attrdata_field_names__)
+
+    if _BACKEND == "torch":
+        import torch.utils._pytree as pytree
+
+        pytree.register_pytree_node(cls, _flatten_attrdata_instance, _torch_unflatten_attrdata)
+    elif _BACKEND == "jax":
+        import jax
+
+        jax.tree_util.register_pytree_node(cls, _flatten_attrdata_instance, _jax_unflatten_attrdata)
+
+    _REGISTERED_ATTRDATA_TYPES.add(cls)
+    return cls
+
+
+def attr_dataclass(_cls=None, **dataclass_kwargs):
+    """Dataclass decorator that also registers the concrete AttrData subtype."""
+
+    def wrap(cls):
+        dataclass_kwargs.setdefault("init", True)
+        dataclass_kwargs.setdefault("repr", False)
+        cls = dataclass(cls, **dataclass_kwargs)
+        original_init = cls.__init__
+        init_field_names = tuple(f.name for f in fields(cls) if f.name != "_data" and f.init)
+        field_name_set = frozenset(init_field_names)
+
+        @wraps(original_init)
+        def __init__(self, *args, _data: Optional[Dict[str, Any]] = None, **kwargs):
+            base_data = {} if _data is None else dict(_data)
+            core_kwargs = {}
+            extra_kwargs = {}
+            for key, value in kwargs.items():
+                if key in field_name_set:
+                    core_kwargs[key] = value
+                else:
+                    extra_kwargs[key] = value
+
+            consumed_names = init_field_names[: len(args)]
+            for name in init_field_names[len(consumed_names) :]:
+                if name not in core_kwargs and name in base_data:
+                    core_kwargs[name] = base_data.pop(name)
+
+            original_init(self, *args, **core_kwargs)
+            base_data.update(extra_kwargs)
+            object.__setattr__(self, "_data", base_data)
+
+        cls.__init__ = __init__
+        return register_attrdata_type(cls)
+
+    if _cls is None:
+        return wrap
+    return wrap(_cls)
+
+
+register_attrdata_type(AttrData)
+Cache = AttrData
+
+
+@attr_dataclass(slots=True)
+class Batch(AttrData):
+    obs: Optional[Dict[str, Any]] = None
+    actions: Optional[Any] = None
+    rewards: Optional[Any] = None
+    dones: Optional[Any] = None
+    timeouts: Optional[Any] = None
+    mask: Optional[Any] = None
+    next_obs: Optional[Dict[str, Any]] = None
+
+
+__all__ = ["AttrData", "Cache", "Batch", "attr_dataclass", "register_attrdata_type"]

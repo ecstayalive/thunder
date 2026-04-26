@@ -38,7 +38,7 @@ class SIGRegObj(Objective):
     def __init__(
         self,
         weight=1.0,
-        key: str = "embedding",
+        key: str = "states",
         name="sigreg",
         num_slices=128,
         t_points=17,
@@ -159,6 +159,9 @@ class OptimizeLoop(Operation):
         self.loader = loader
         self.pipeline = pipeline
 
+        self.requires = self.pipeline.requires
+        self.provides = self.pipeline.provides
+
     def forward(self, ctx: ExecutionContext):
         m = {}
         for batch in self.loader:
@@ -175,6 +178,9 @@ class SoftUpdate(Operation):
         self.source = source
         self.target = target
         self.tau = tau
+
+        self.requires = frozenset({Ref(f"models[{source!r}]"), Ref(f"models[{target!r}]")})
+        self.provides = frozenset()
 
     def forward(self, ctx: ExecutionContext):
         with torch.inference_mode():

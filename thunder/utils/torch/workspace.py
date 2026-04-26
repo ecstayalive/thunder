@@ -31,3 +31,5 @@ class Workspace:
             pathlib.Path.mkdir(self.run_dir, parents=True, exist_ok=True)
         else:
             pathlib.Path.mkdir(path, parents=True, exist_ok=True)
+
+    def rm(self): ...

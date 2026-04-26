@@ -120,6 +120,7 @@ class Operation(ABC):
 
     requires: ClassVar[frozenset[Ref]] = frozenset()
     provides: ClassVar[frozenset[Ref]] = frozenset()
+    # distributed: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

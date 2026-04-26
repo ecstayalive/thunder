@@ -125,6 +125,20 @@ class SwanLabLogger(Logger):
         pass
 
 
+class RerunLogger(Logger):
+    def __init__(self):
+        super().__init__()
+
+    def init_impl(self):
+        import rerun as rr
+
+    def log_impl(self, metrics: Dict[str, Any], step: int):
+        pass
+
+    def close(self):
+        pass
+
+
 class CuTSNELogger(Logger):
     def __init__(
         self,

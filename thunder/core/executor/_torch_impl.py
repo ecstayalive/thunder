@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_map
 
 from thunder.core.context import ExecutionContext, ExecutionContextManager, OptimGroup
 
@@ -171,7 +172,7 @@ class TorchExecutor:
         ctx: ExecutionContext,
         opt: str,
         objectives: Tuple[Objective, ...],
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 42.0,
     ) -> Dict[str, Any]:
         """ """
         optim_group = ctx.opt_groups[opt]
@@ -206,17 +207,6 @@ class TorchExecutor:
         return wrapper(fn)
 
     @staticmethod
-    def _recursive_map(func, data):
-        """Applies func to every leaf in a nested structure (Dict/List/Tuple)."""
-        if isinstance(data, dict):
-            return {k: TorchExecutor._recursive_map(func, v) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [TorchExecutor._recursive_map(func, v) for v in data]
-        elif isinstance(data, tuple):
-            return tuple(TorchExecutor._recursive_map(func, v) for v in data)
-        return func(data)
-
-    @staticmethod
     def devices(backend: str):
         return (torch.device(backend),)
 
@@ -237,11 +227,11 @@ class TorchExecutor:
                 return x.to(target_device, non_blocking=True)
             return x
 
-        return TorchExecutor._recursive_map(_put_data, data)
+        return tree_map(_put_data, data)
 
     @staticmethod
     def to_numpy(data: Any) -> Any:
-        return TorchExecutor._recursive_map(lambda x: x.detach().cpu().numpy(), data)
+        return tree_map(lambda x: x.detach().cpu().numpy(), data)
 
     @staticmethod
     def to_jax(data: Any) -> Any:
@@ -249,9 +239,7 @@ class TorchExecutor:
             import jax
             from torch.utils.dlpack import to_dlpack
 
-            return TorchExecutor._recursive_map(
-                lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data
-            )
+            return tree_map(lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data)
         except ImportError:
             raise ImportError("Please install `jax` to use `to_jax` function.")
 
@@ -264,7 +252,7 @@ class TorchExecutor:
         try:
             import warp
 
-            return TorchExecutor._recursive_map(warp.from_torch, data)
+            return tree_map(warp.from_torch, data)
         except ImportError:
             raise ImportError("Please install `warp-lang` to use `to_warp` function.")
 
@@ -272,7 +260,7 @@ class TorchExecutor:
     def to_dlpack(data: Any):
         from torch.utils.dlpack import to_dlpack
 
-        return TorchExecutor._recursive_map(lambda x: to_dlpack(x), data)
+        return tree_map(lambda x: to_dlpack(x), data)
 
     @staticmethod
     def to(data: Any, target: Any, non_blocking: bool = True):
@@ -282,9 +270,7 @@ class TorchExecutor:
             return torch.as_tensor(data).to(target, non_blocking=non_blocking)
 
         if isinstance(data, (dict, list, tuple)):
-            return TorchExecutor._recursive_map(
-                lambda x: TorchExecutor.to(x, target, non_blocking), data
-            )
+            return tree_map(lambda x: TorchExecutor.to(x, target, non_blocking), data)
 
         if isinstance(target, type):
             name = target.__name__
@@ -303,7 +289,7 @@ class TorchExecutor:
 
     @staticmethod
     def from_numpy(data: Any):
-        return TorchExecutor._recursive_map(torch.as_tensor, data)
+        return tree_map(torch.as_tensor, data)
 
     @staticmethod
     def from_jax(data: Any):
@@ -311,7 +297,7 @@ class TorchExecutor:
             from jax import dlpack as jdlpack
             from torch.utils.dlpack import from_dlpack
 
-            return TorchExecutor._recursive_map(lambda x: from_dlpack(jdlpack.to_dlpack(x)), data)
+            return tree_map(lambda x: from_dlpack(jdlpack.to_dlpack(x)), data)
         except ImportError:
             raise ImportError("Please install `jax` to use `from_jax` function.")
 
@@ -320,7 +306,7 @@ class TorchExecutor:
         try:
             import warp
 
-            return TorchExecutor._recursive_map(warp.to_torch, data)
+            return tree_map(warp.to_torch, data)
         except ImportError:
             raise ImportError("Please install `warp-lang` to use `from_warp` function.")
 
@@ -328,4 +314,4 @@ class TorchExecutor:
     def from_dlpack(data: Any):
         from torch.utils.dlpack import from_dlpack
 
-        return TorchExecutor._recursive_map(from_dlpack, data)
+        return tree_map(from_dlpack, data)

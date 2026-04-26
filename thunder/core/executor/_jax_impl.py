@@ -319,7 +319,7 @@ class JaxExecutor:
         ctx: ExecutionContext,
         opt: str,
         objectives: Tuple[Objective, ...],
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = 42.0,
     ) -> Dict[str, Any]:
 
         group = ctx.opt_groups[opt]

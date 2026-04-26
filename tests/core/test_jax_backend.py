@@ -92,7 +92,7 @@ def jax_batch_3d():
             [[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]], [[2.0, 2.0], [2.0, 2.0], [0.0, 0.0]]]
         ),
         mask=jnp.array([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]]),
-        extra={"val": jnp.zeros((2, 3, 1))},
+        val=jnp.zeros((2, 3, 1)),
     )
 
 
@@ -483,5 +483,4 @@ def test_jax_executor_donate_buffers_flag():
 def test_jax_batch_extra_getattr():
     batch = data_mod.Batch(obs=jnp.zeros(1))
     batch.custom_key = 123
-    assert batch.extra["custom_key"] == 123
     assert batch.custom_key == 123

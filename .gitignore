@@ -8,4 +8,7 @@ logs
 .logs
 log
 .log
+.codex
 wandb
+.tmp
+tmp

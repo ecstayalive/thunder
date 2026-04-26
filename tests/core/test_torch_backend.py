@@ -81,7 +81,7 @@ class TorchCounterOp(op_mod.Operation):
 
 
 class DeclaredProvideOp(op_mod.Operation):
-    Provides = ("cache['embedding']",)
+    provides = ("cache['embedding']",)
 
     def forward(
         self, ctx: ctx_mod.ExecutionContext
@@ -91,7 +91,7 @@ class DeclaredProvideOp(op_mod.Operation):
 
 
 class DeclaredRequireOp(op_mod.Operation):
-    Requires = ("cache['embedding']",)
+    requires = ("cache['embedding']",)
 
     def forward(
         self, ctx: ctx_mod.ExecutionContext
@@ -121,7 +121,7 @@ def tensor_batch_3d(device):
             device=device,
         ),
         mask=torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]], device=device),
-        extra={"val": torch.zeros((2, 3, 1), device=device)},
+        val=torch.zeros((2, 3, 1), device=device),
     )
 
 

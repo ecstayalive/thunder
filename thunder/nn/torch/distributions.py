@@ -11,7 +11,7 @@ from .modules import LinearBlock
 
 
 class Distribution:
-    has_rsample = True
+    has_rsample: bool = True
 
     def __init__(
         self, batch_shape: torch.Size = torch.Size(), event_shape: torch.Size = torch.Size()
@@ -22,6 +22,11 @@ class Distribution:
         raise NotImplementedError
 
     def rsample(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized sample.
+        Returns:
+            samples:
+            log_prob:
+        """
         raise NotImplementedError
 
     def mean(self, *args, **kwargs) -> torch.Tensor:
@@ -55,7 +60,7 @@ class DistributionHead(nn.Module):
         raise NotImplementedError
 
 
-class NeuralNormal(DistributionHead):
+class NormalHead(DistributionHead):
     def __init__(
         self,
         in_features: int,
@@ -104,7 +109,7 @@ class NeuralNormal(DistributionHead):
         return distributions.Normal(mean, std)
 
 
-class NeuralTransformedDist(DistributionHead):
+class TransformedDistHead(DistributionHead):
     def __init__(
         self,
         in_features: int,
@@ -129,7 +134,7 @@ class NeuralTransformedDist(DistributionHead):
         pass
 
 
-class NeuralConsistentNormal(DistributionHead):
+class ConsistentNormalHead(DistributionHead):
     def __init__(
         self,
         in_features: int,
