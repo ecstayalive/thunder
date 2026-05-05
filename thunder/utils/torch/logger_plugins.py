@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 import math
 
 from .tsne_views import *
-from .workspace import Workspace
+from ..workspace import Workspace
 
 LOGGER_PLUGIN_REGISTRY = {}
 

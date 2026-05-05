@@ -10,7 +10,7 @@ from typing import Literal
 import torch.nn.functional as F
 
 from thunder.core import OptimizeOp, Pipeline
-from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
+from thunder.env.loader import EnvLoaderSpec, ThunderEnv, make_env
 from thunder.nn.torch import LinearBlock, Mamba2Block, NormalHead
 from thunder.rl.torch import *
 from thunder.utils import ArgOpt, ArgParser
@@ -309,7 +309,7 @@ class AliveAgent(Agent):
         self.represent_carry = tree_map(_reset_leaf, self.represent_carry)
 
     @classmethod
-    def from_env(cls, env: ThunderEnvWrapper, spec: ExperimentSpec) -> AliveAgent:
+    def from_env(cls, env: ThunderEnv, spec: ExperimentSpec) -> AliveAgent:
         models = ModelPack()
         obs_shape = env.observation_space["policy"].shape[-1]
         action_dim = env.action_space.shape[-1]

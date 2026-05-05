@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.utils._pytree import tree_map
+from torch.utils._cxx_pytree import tree_map
 
-from thunder.core.context import ExecutionContext, ExecutionContextManager, OptimGroup
+from thunder.core.context import (
+    ExecutionContext,
+    ExecutionContextManager,
+    OptimGroup,
+    OptimGroupSpec,
+)
 
 if TYPE_CHECKING:
-    from ..data import Batch
     from ..module import ModelPack
     from ..operation import Objective
 
@@ -75,15 +79,19 @@ class TorchExecutor:
             self.device.type == "cuda" and self.compute_dtype is not torch.float32
         )
         self.distributed = distributed
-        self.use_scaler = self.compute_dtype is torch.float16 and self.device.type == "cuda"
+        self.use_scaler = (
+            self.compute_dtype is torch.float16 and self.device.type == "cuda"
+        )
         self.scaler = (
-            torch.amp.GradScaler(enabled=self.use_scaler) if self.use_scaler else _IdentityScaler()
+            torch.amp.GradScaler(enabled=self.use_scaler)
+            if self.use_scaler
+            else _IdentityScaler()
         )
 
     def init(
         self,
         models: ModelPack,
-        optim_config: Dict[str, Any],
+        optim_config: Dict[str, OptimGroupSpec | Dict[str, Any]],
         distributed_strategy: Optional[Callable[[nn.Module], nn.Module]] = None,
     ) -> ExecutionContext:
         """ """
@@ -97,7 +105,9 @@ class TorchExecutor:
                 if distributed_strategy is not None:
                     model = distributed_strategy(model)
                 else:
-                    device_ids = [self.device.index] if self.device.type == "cuda" else None
+                    device_ids = (
+                        [self.device.index] if self.device.type == "cuda" else None
+                    )
                     model = torch.nn.parallel.DistributedDataParallel(
                         model, device_ids=device_ids, find_unused_parameters=True
                     )
@@ -106,26 +116,26 @@ class TorchExecutor:
 
         opt_groups = {}
         for opt_key, cfg in optim_config.items():
-            cfg = cfg.copy()
-            target_names = cfg.pop("targets")
-            if isinstance(target_names, str):
-                target_names = [target_names]
-            target_names = tuple(target_names)
+            spec = OptimGroupSpec.factory(cfg)
+            target_names = spec.target_names
             all_optimize_params = []
             for t_name in target_names:
                 if t_name not in new_model_pack:
-                    raise ValueError(f"Optimizer target '{t_name}' not found in models.")
+                    raise ValueError(
+                        f"Optimizer target '{t_name}' not found in models."
+                    )
                 target_module = new_model_pack[t_name]
                 all_optimize_params.append({"params": target_module.parameters()})
-
-            cls_name = cfg.pop("class", "Adam")
-            OptimCls = getattr(torch.optim, cls_name)
-            optimizer = OptimCls(all_optimize_params, **cfg)
+            optim_cls = spec.optimizer or "Adam"
+            if isinstance(optim_cls, str):
+                optim_cls = getattr(torch.optim, optim_cls)
+            optimizer = optim_cls(all_optimize_params, **spec.optimizer_kwargs())
+            scheduler = self._init_scheduler(spec.scheduler, optimizer)
             opt_groups[opt_key] = OptimGroup(
                 name=opt_key,
                 targets=target_names,
                 optimizer=optimizer,
-                scheduler=None,
+                scheduler=scheduler,
                 scaler=self.scaler,
                 scaler_state=None,
             )
@@ -136,6 +146,18 @@ class TorchExecutor:
             opt_groups=opt_groups,
         )
         return ctx
+
+    @staticmethod
+    def _init_scheduler(scheduler_spec: Any, optimizer: torch.optim.Optimizer) -> Any:
+        if scheduler_spec is None:
+            return None
+        cls = getattr(scheduler_spec, "cls", None)
+        if cls is not None:
+            return cls.factory(optimizer, scheduler_spec)
+        raise TypeError(
+            "Torch scheduler spec must define scheduler_cls with a factory method, "
+            f"got {type(scheduler_spec).__name__}."
+        )
 
     def init_manager(self) -> ExecutionContextManager:
         device_type = self.device.type
@@ -155,14 +177,14 @@ class TorchExecutor:
             mesh=None,
         )
 
-    def _forward(
-        self, objectives: Tuple[Objective, ...], batch: Batch, models: ModelPack
+    def _jit_optimize(
+        self, objectives: Tuple[Objective, ...], ctx: ExecutionContext
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """ """
         total_loss = torch.zeros((), device=self.device)
         metrics = {}
         for obj in objectives:
-            loss, m = obj.forward(batch, models)
+            loss, m = obj.evaluate(ctx)
             total_loss = total_loss + loss
             metrics.update(m)
         return total_loss, metrics
@@ -172,24 +194,33 @@ class TorchExecutor:
         ctx: ExecutionContext,
         opt: str,
         objectives: Tuple[Objective, ...],
-        max_grad_norm: float = 42.0,
-    ) -> Dict[str, Any]:
+        max_grad_norm: float = 1.0,
+    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
-        optim_group = ctx.opt_groups[opt]
+        optim_group: OptimGroup = ctx.opt_groups[opt]
         optimizer: torch.optim.Optimizer = optim_group.optimizer
+        loss, metrics = self._jit_optimize(objectives, ctx)
+        metrics["total_loss"] = loss.detach()
+        if optim_group.scheduler is not None:
+            exports = {}
+            for obj in objectives:
+                exports.update(obj.export())
+            scheduler_metrics = optim_group.scheduler.step(exports)
+            if scheduler_metrics:
+                metrics.update(scheduler_metrics)
         optimizer.zero_grad(set_to_none=True)
-        loss, metrics = self._forward(objectives, ctx.batch, ctx.models)
-        metrics["total_loss"] = loss
-        with torch.amp.autocast(enabled=False, device_type=self.device.type, dtype=torch.float32):
+        with torch.amp.autocast(
+            enabled=False, device_type=self.device.type, dtype=torch.float32
+        ):
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(optimizer)
-            params_to_clip = [p for group in optimizer.param_groups for p in group["params"]]
+            params_to_clip = [
+                p for group in optimizer.param_groups for p in group["params"]
+            ]
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
             self.scaler.step(optimizer)
             self.scaler.update()
-        if optim_group.scheduler is not None:
-            optim_group.scheduler.step()
-        return metrics
+        return ctx, metrics
 
     @staticmethod
     def jit(fn: Callable, **kwargs):

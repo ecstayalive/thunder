@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from thunder.nn.torch import Distribution
+
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch")
 
 
@@ -12,14 +14,13 @@ class ActorStep:
     Args:
         action:
         log_prob:
-        distribution: torch.distributions for `torch` and jax.distributions for `jax`
+        distribution: `Distribution` or jax.distributions
         carry:
-        extra:
     """
 
     action: Any
     log_prob: Optional[Any] = None
-    distribution: Optional[Any] = None
+    distribution: Optional[Distribution] = None
     carry: Optional[Any] = None
     backbone_kwargs: Optional[Dict] = field(default_factory=dict)
     dist_kwargs: Optional[Dict] = field(default_factory=dict)
@@ -53,4 +54,6 @@ elif _BACKEND == "jax":
             dist_kwargs=children[5],
         )
 
-    jax.tree_util.register_pytree_node(ActorStep, _flatten_actor_step, _unflatten_actor_step)
+    jax.tree_util.register_pytree_node(
+        ActorStep, _flatten_actor_step, _unflatten_actor_step
+    )

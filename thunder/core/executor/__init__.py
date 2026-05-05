@@ -36,7 +36,7 @@ else:
         _hints = {
             "torch": "pip install thunder[torch]",
             "jax": "pip install thunder[jax]",
-            "warp": "Make sure nvidia-warp is installed.",
+            "warp": "Make sure warp-lang is installed.",
         }
         raise ImportError(
             f"Failed to load backend '{_BACKEND}'.\n"

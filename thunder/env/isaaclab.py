@@ -3,7 +3,7 @@ from typing import List, Literal
 
 from thunder.utils import ArgParser
 
-from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
+from .env import EnvLoaderSpec, ThunderEnv, register_loader
 
 
 @dataclass(kw_only=True)
@@ -33,12 +33,15 @@ class IsaacLabLoaderSpec(EnvLoaderSpec):
 
 
 @register_loader("isaaclab")
-def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnvWrapper:
+def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnv:
     """ """
     from isaaclab.app import AppLauncher
 
-    spec: IsaacLabLoaderSpec = ArgParser.transform(spec, IsaacLabLoaderSpec)
-    app_launcher = AppLauncher(ArgParser.as_dict(spec))
+    spec = ArgParser.transform(spec, IsaacLabLoaderSpec)
+    # AppLauncher follows IsaacLab's argparse/kwargs conventions.
+    # Passing the config dict as a single positional argument can bypass
+    # boolean launcher flags such as `headless`.
+    app_launcher = AppLauncher(**ArgParser.as_dict(spec))
     import gymnasium
     import isaaclab_tasks
 
@@ -55,4 +58,4 @@ def load_isaaclab(spec: EnvLoaderSpec | IsaacLabLoaderSpec) -> ThunderEnvWrapper
     if spec.distributed:
         cfg.sim.device = f"cuda:{app_launcher.local_rank}"
     env = gymnasium.make(spec.task, cfg=cfg)
-    return ThunderEnvWrapper(env)
+    return ThunderEnv(env)

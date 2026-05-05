@@ -19,7 +19,7 @@ import torch.utils._pytree as pytree
 from thunder.core import Ref
 
 from .tsne_views import VIEW_REGISTRY, TSNEView
-from .workspace import Workspace
+from ..workspace import Workspace
 
 if TYPE_CHECKING:
     from thunder.core import ExecutionContext
@@ -117,20 +117,6 @@ class SwanLabLogger(Logger):
 
     def init_impl(self):
         import swanlab
-
-    def log_impl(self, metrics: Dict[str, Any], step: int):
-        pass
-
-    def close(self):
-        pass
-
-
-class RerunLogger(Logger):
-    def __init__(self):
-        super().__init__()
-
-    def init_impl(self):
-        import rerun as rr
 
     def log_impl(self, metrics: Dict[str, Any], step: int):
         pass

@@ -6,9 +6,9 @@ import os
 import sys
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, ContextManager, Dict, Hashable, Optional, Tuple
+from typing import Any, ContextManager, Dict, Hashable, Optional, Tuple, TYPE_CHECKING
 
-from .data import Batch, Cache
+from .data import AttrData
 
 if TYPE_CHECKING:
     from .executor.interface import Executor
@@ -45,6 +45,48 @@ class ComposedContextManager(ContextManager):
 
     def __hash__(self):
         return hash(self.contexts)
+
+
+@dataclass(slots=True)
+class OptimGroupSpec:
+    """Configuration used by executors to build a runtime OptimGroup."""
+
+    targets: Tuple[str, ...] | str
+    optimizer: Any = None
+    lr: Optional[float] = None
+    scheduler: Optional[Any] = None
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def factory(cls, cfg: "OptimGroupSpec | Dict[str, Any]") -> "OptimGroupSpec":
+        if isinstance(cfg, cls):
+            return cfg
+        if isinstance(cfg, dict):
+            cfg = cfg.copy()
+            targets = cfg.pop("targets")
+            return cls(
+                targets=targets,
+                optimizer=cfg.pop("optimizer", cfg.pop("class", None)),
+                lr=cfg.pop("lr", None),
+                scheduler=cfg.pop("scheduler", None),
+                kwargs=cfg,
+            )
+        raise TypeError(
+            "optim_config values must be OptimGroupSpec or dict, "
+            f"got {type(cfg).__name__}."
+        )
+
+    @property
+    def target_names(self) -> Tuple[str, ...]:
+        if isinstance(self.targets, str):
+            return (self.targets,)
+        return tuple(self.targets)
+
+    def optimizer_kwargs(self, lr_key: str = "lr") -> Dict[str, Any]:
+        kwargs = dict(self.kwargs)
+        if self.lr is not None:
+            kwargs.setdefault(lr_key, self.lr)
+        return kwargs
 
 
 @dataclass(slots=True)
@@ -111,15 +153,15 @@ class ExecutionContext:
     """
 
     step: int
-    # Runtime
+    # Session
     models: ModelPack
     opt_groups: Dict[str, OptimGroup]
     executor: Executor
     manager: ExecutionContextManager
     meta: Dict[str, Any] = field(default_factory=dict)
-    # Artifact
-    cache: Cache = field(default_factory=Cache)
-    batch: Optional[Batch] = None
+    # Data
+    cache: Optional[AttrData] = None
+    batch: Optional[AttrData] = None
 
     def replace(self, **changes) -> ExecutionContext:
         return replace(self, **changes)
@@ -147,7 +189,13 @@ class ExecutionContext:
         opt_groups: Dict[str, OptimGroup],
     ) -> ExecutionContext:
         """ """
-        return cls(step=0, models=models, opt_groups=opt_groups, executor=executor, manager=manager)
+        return cls(
+            step=0,
+            models=models,
+            opt_groups=opt_groups,
+            executor=executor,
+            manager=manager,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +223,9 @@ class Ref:
     def __call__(self, ctx: ExecutionContext):
         return self._compiled_fn(ctx)
 
+    def exists(self, root: Any) -> bool:
+        return ref_path_exists(root, self._path)
+
     def __eq__(self, other):
         if not isinstance(other, Ref):
             return False
@@ -191,6 +242,18 @@ class Ref:
     @property
     def path(self) -> _RefPath:
         return self._path
+
+    def startswith(self, prefix: "Ref" | str) -> bool:
+        prefix = prefix if isinstance(prefix, Ref) else Ref(prefix)
+        return self._path[: len(prefix.path)] == prefix.path
+
+    def attr(self, name: str) -> "Ref":
+        if not name.isidentifier():
+            return self.key(name)
+        return Ref((*self._path, _RefAttr(name)))
+
+    def key(self, key: Hashable) -> "Ref":
+        return Ref((*self._path, _RefKey(key)))
 
     def __str__(self):
         if not self._path:
@@ -240,14 +303,16 @@ class Ref:
                 f"got unsupported expression: {ast.dump(node)}"
             ) from exc
         if not isinstance(key, Hashable):
-            raise ValueError(f"Ref subscript key must be hashable, got: {type(key).__name__}")
+            raise ValueError(
+                f"Ref subscript key must be hashable, got: {type(key).__name__}"
+            )
         return key
 
     @staticmethod
     def _normalize_path(path: _RefPath) -> _RefPath:
         """Normalize equivalent access patterns for Thunder containers.
 
-        `Batch` and `Cache` support both attribute access and string-key access
+        `Batch` and `AttrData` support both attribute access and string-key access
         for their first-level entries. Canonicalizing these paths avoids false
         negatives during contract validation, e.g. `batch.embedding` versus
         `batch["embedding"]`.
@@ -301,7 +366,11 @@ def replace_ref_path(root: Any, path: _RefPath, value: Any) -> Any:
 
     child = root[step.key]
     new_child = replace_ref_path(child, rest, value)
-    if hasattr(root, "replace") and callable(root.replace) and isinstance(step.key, str):
+    if (
+        hasattr(root, "replace")
+        and callable(root.replace)
+        and isinstance(step.key, str)
+    ):
         return root.replace(**{step.key: new_child})
     if isinstance(root, dict):
         updated = root.copy()
@@ -325,6 +394,36 @@ def replace_ref_path(root: Any, path: _RefPath, value: Any) -> Any:
 
 CtxRef = Ref(())
 
+
+def ref_path_exists(root: Any, path: _RefPath) -> bool:
+    value = root
+    for step in path:
+        if isinstance(step, _RefAttr):
+            if isinstance(value, AttrData):
+                if step.name in value.__class__.__attr_data_field_set__:
+                    value = getattr(value, step.name)
+                    if value is None:
+                        return False
+                elif step.name in value._data:
+                    value = value._data[step.name]
+                else:
+                    return False
+            elif isinstance(value, dict):
+                if step.name not in value:
+                    return False
+                value = value[step.name]
+            else:
+                if not hasattr(value, step.name):
+                    return False
+                value = getattr(value, step.name)
+        else:
+            try:
+                value = value[step.key]
+            except (IndexError, KeyError, TypeError):
+                return False
+    return True
+
+
 if _BACKEND == "torch":
     import torch.utils._pytree as pytree
 
@@ -343,7 +442,9 @@ if _BACKEND == "torch":
             scaler_state=children[1],
         )
 
-    pytree.register_pytree_node(OptimGroup, _flatten_optim_group, _unflatten_optim_group)
+    pytree.register_pytree_node(
+        OptimGroup, _flatten_optim_group, _unflatten_optim_group
+    )
 
     def _flatten_manager(obj: ExecutionContextManager):
         children = []
@@ -369,10 +470,19 @@ if _BACKEND == "torch":
             mesh=aux_data[6],
         )
 
-    pytree.register_pytree_node(ExecutionContextManager, _flatten_manager, _unflatten_manager)
+    pytree.register_pytree_node(
+        ExecutionContextManager, _flatten_manager, _unflatten_manager
+    )
 
     def _flatten_context(obj: ExecutionContext):
-        children = [obj.models, obj.opt_groups, obj.step, obj.batch, obj.cache, obj.meta]
+        children = [
+            obj.models,
+            obj.opt_groups,
+            obj.step,
+            obj.batch,
+            obj.cache,
+            obj.meta,
+        ]
         aux_data = (obj.executor, obj.manager)
 
         return children, aux_data
@@ -439,7 +549,9 @@ if _BACKEND == "jax":
             mesh=aux_data[6],
         )
 
-    jtu.register_pytree_node(ExecutionContextManager, _flatten_manager, _unflatten_manager)
+    jtu.register_pytree_node(
+        ExecutionContextManager, _flatten_manager, _unflatten_manager
+    )
 
     def _flatten_context(obj: ExecutionContext):
         """ """
@@ -469,6 +581,7 @@ if _BACKEND == "jax":
 
 __all__ = [
     "ComposedContextManager",
+    "OptimGroupSpec",
     "OptimGroup",
     "ExecutionContextManager",
     "ExecutionContext",

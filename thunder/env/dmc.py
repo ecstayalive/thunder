@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from thunder.utils import ArgParser
 
-from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
+from .env import EnvLoaderSpec, ObservationWrapper, register_loader
 
 
 @dataclass

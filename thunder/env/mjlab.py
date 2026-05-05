@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
+from .env import EnvLoaderSpec, ThunderEnv, register_loader
 
 
 @dataclass(kw_only=True)
@@ -12,4 +12,4 @@ class MjLabLoaderSpec:
 
 
 @register_loader("mjlab")
-def load_mjlab(spec: EnvLoaderSpec | MjLabLoaderSpec) -> ThunderEnvWrapper: ...
+def load_mjlab(spec: EnvLoaderSpec | MjLabLoaderSpec) -> ThunderEnv: ...

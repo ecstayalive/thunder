@@ -3,11 +3,27 @@ from typing import Iterator, Optional, Tuple
 
 import torch
 from torch import nn
-
+from typing import Sequence
 from thunder.nn.torch import LinearBlock, RunningNorm1d
 
 
-class Critic(ABC, nn.Module): ...
+class Critic(ABC):
+    def __init__(self, backbone: nn.Module):
+        self.backbone = backbone
+
+    def reset(self, indices: Optional[Sequence[int]] = None):
+        """
+        Manages the lifecycle of internal hidden states.
+        Args:
+            indices: The indices of the environments that hit 'done'.
+                     For VectorEnvs, we only clear the memory of finished agents.
+        """
+        pass
+
+    def froward(self, embedding: torch.Tensor, carry=None, backbones_kwargs=None):
+        return self.backbone(
+            embedding, carry, **backbones_kwargs if backbones_kwargs is not None else {}
+        )
 
 
 class GeneralVNet(nn.Module):

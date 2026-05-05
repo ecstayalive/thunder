@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
     Optional,
     Protocol,
-    Tuple,
     runtime_checkable,
+    Tuple,
+    TYPE_CHECKING,
 )
 
 if TYPE_CHECKING:
-    from ..context import ExecutionContext
+    from ..context import ExecutionContext, OptimGroupSpec
     from ..data import Batch
     from ..module import ModelPack
     from ..operation import Objective
@@ -27,8 +27,9 @@ class Executor(Protocol):
     def init(
         self,
         model: ModelPack,
-        optim_config: Dict[str, Any],
+        optim_config: Dict[str, OptimGroupSpec | Dict[str, Any]],
         distributed_strategy: Optional[Callable] = None,
+        device=None,
     ) -> ExecutionContext:
         """ """
         raise NotImplementedError
@@ -37,9 +38,9 @@ class Executor(Protocol):
         self,
         ctx: ExecutionContext,
         opt: str,
-        objectives: Tuple[Objective],
+        objectives: Tuple[Objective, ...],
         max_grad_norm: float = 1.0,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
         ...
 

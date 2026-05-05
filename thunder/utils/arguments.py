@@ -5,12 +5,14 @@ import re
 import sys
 import textwrap
 from dataclasses import asdict, field, fields, is_dataclass
+from types import UnionType
 from typing import (
     Any,
     Dict,
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -113,7 +115,7 @@ def ArgOpt(
     default=dataclasses.MISSING, *, help="", short=None, factory=None, external=False, **kwargs
 ):
     metadata = {"help": help, "short": short, "external": external, "argparse_kwargs": kwargs}
-    if factory:
+    if factory is not None:
         return field(default_factory=factory, metadata=metadata)
     if default is not dataclasses.MISSING:
         return field(default=default, metadata=metadata)
@@ -156,6 +158,23 @@ class DocstringResolver:
 
 class TypeReflector:
     @staticmethod
+    def is_union(t: Type) -> bool:
+        return get_origin(t) in (Union, UnionType)
+
+    @staticmethod
+    def optional_inner(t: Type) -> Type:
+        if not TypeReflector.is_union(t):
+            return t
+        valid = [x for x in get_args(t) if x is not type(None)]
+        return valid[0] if len(valid) == 1 else t
+
+    @staticmethod
+    def sequence_inner(t: Type) -> Type:
+        t = TypeReflector.optional_inner(t)
+        args = get_args(t)
+        return args[0] if args else str
+
+    @staticmethod
     def resolve_hints(cls: Type) -> Dict[str, Any]:
         """ """
         if cls not in _TYPE_CACHE:
@@ -172,11 +191,11 @@ class TypeReflector:
         origin = get_origin(t)
         args = get_args(t)
 
-        if origin is Union:
+        if TypeReflector.is_union(t):
             valid = [x for x in args if x is not type(None)]
             if len(valid) == 1:
                 return TypeReflector.unwrap(valid[0])
-        elif origin in (list, List):
+        elif origin in (list, List, tuple, Tuple):
             if args:
                 return TypeReflector.unwrap(args[0])
 
@@ -185,7 +204,7 @@ class TypeReflector:
     @staticmethod
     def get_origin_type(t: Type) -> Any:
         origin = get_origin(t)
-        if origin is Union:
+        if TypeReflector.is_union(t):
             args = get_args(t)
             valid = [x for x in args if x is not type(None)]
             if len(valid) == 1:
@@ -202,13 +221,13 @@ class TypeReflector:
             if origin is Literal:
                 return f"{{{','.join(map(str, args))}}}"
 
-            # 2. List -> list[int]
-            if origin in (list, List):
+            # 2. Sequence -> list[int] / tuple[int]
+            if origin in (list, List, tuple, Tuple):
                 inner = TypeReflector.to_str(args[0]) if args else "Any"
-                return f"list[{inner}]"
+                return f"{origin.__name__}[{inner}]"
             if isinstance(t, type) and issubclass(t, enum.Enum):
                 return t.__name__
-            if origin is Union:
+            if TypeReflector.is_union(t):
                 valid = [x for x in args if x is not type(None)]
                 if len(valid) == 1:
                     return TypeReflector.to_str(valid[0])
@@ -246,9 +265,9 @@ class ArgumentAdapter:
         if real_type is bool:
             self._handle_bool(kwargs, default)
             kwargs.pop("metavar", None)
-        elif origin in (list, List):
-            self._handle_list(kwargs, real_type, default)
-            inner_type = get_args(field_type)[0] if get_args(field_type) else str
+        elif origin in (list, List, tuple, Tuple):
+            self._handle_sequence(kwargs, real_type, default)
+            inner_type = TypeReflector.sequence_inner(field_type)
             kwargs["metavar"] = TypeReflector.to_str(inner_type).upper()
         elif origin is Literal:
             self._handle_literal(kwargs, field_type)
@@ -280,13 +299,13 @@ class ArgumentAdapter:
         kwargs["action"] = "store_false" if default is True else "store_true"
         kwargs.pop("default", None)
 
-    def _handle_list(self, kwargs, inner_type, default):
+    def _handle_sequence(self, kwargs, inner_type, default):
         kwargs["type"] = inner_type
         kwargs["nargs"] = "*" if default is not dataclasses.MISSING else "+"
 
     def _handle_literal(self, kwargs, full_type):
         args = get_args(full_type)
-        if get_origin(full_type) is Union:
+        if TypeReflector.is_union(full_type):
             args = get_args(next(t for t in get_args(full_type) if t is not type(None)))
         kwargs["choices"] = args
         kwargs["type"] = type(args[0])
@@ -319,22 +338,31 @@ class ArgumentAdapter:
 class ArgParser:
     def __init__(self, target_cls: Type[T], default_instance: Any = None):
         self.target_cls = target_cls
+        self.default_instance = default_instance
         self.parser = argparse.ArgumentParser(
             formatter_class=TyroStyleHelpFormatter, description=target_cls.__doc__
         )
         self.unknown_args = []
 
         self.adapter = ArgumentAdapter(self.parser)
-        self._build_recursive(target_cls, default_instance=default_instance)
+        self._build_recursive(
+            target_cls,
+            default_instance=default_instance,
+            skip_source_fields=default_instance is not None,
+        )
 
     def parse(self, args: Optional[List[str]] = None) -> T:
         if args is None:
             args = sys.argv[1:]
         namespace, self.unknown_args = self.parser.parse_known_args(args)
-        return self._reconstruct(self.target_cls, vars(namespace))
+        return self._reconstruct(
+            self.target_cls, vars(namespace), fallback_instance=self.default_instance
+        )
 
     @classmethod
     def transform(cls, source: Any, target_cls: Type[T], args: Optional[List[str]] = None) -> T:
+        if isinstance(source, target_cls):
+            return source
         parser = cls(target_cls, default_instance=source)
         return parser.parse(args)
 
@@ -342,7 +370,13 @@ class ArgParser:
     def as_dict(cfg: Any) -> Dict[str, Any]:
         return asdict(cfg)
 
-    def _build_recursive(self, cls: Type, prefix: str = "", default_instance: Any = None):
+    def _build_recursive(
+        self,
+        cls: Type,
+        prefix: str = "",
+        default_instance: Any = None,
+        skip_source_fields: bool = False,
+    ):
         hints = TypeReflector.resolve_hints(cls)
         docs = DocstringResolver.resolve(cls)
         for f in fields(cls):
@@ -350,17 +384,30 @@ class ArgParser:
                 continue
             f_type = hints.get(f.name, f.type)
             real_type = TypeReflector.unwrap(f_type)
-            default_val = self._get_effective_default(f, default_instance)
             if is_dataclass(real_type):
-                nested_def = default_val if is_dataclass(default_val) else None
+                nested_def = self._get_default_value(f, default_instance)
+                nested_type = self._resolve_nested_dataclass_type(real_type, nested_def)
                 self._build_recursive(
-                    real_type, prefix=f"{prefix}{f.name}.", default_instance=nested_def
+                    nested_type,
+                    prefix=f"{prefix}{f.name}.",
+                    default_instance=nested_def,
+                    skip_source_fields=skip_source_fields
+                    and self._source_has_field(default_instance, f.name),
                 )
             else:
+                if skip_source_fields and self._source_has_field(default_instance, f.name):
+                    continue
+                default_val = self._get_effective_default(f, default_instance)
                 help_text = f.metadata.get("help") or docs.get(f.name, "")
                 self.adapter.add_field(f, f_type, prefix, default_val, help_text)
 
-    def _reconstruct(self, cls: Type, data: Dict[str, Any], prefix: str = "") -> Any:
+    def _reconstruct(
+        self,
+        cls: Type,
+        data: Dict[str, Any],
+        prefix: str = "",
+        fallback_instance: Any = None,
+    ) -> Any:
         init_kwargs = {}
         hints = TypeReflector.resolve_hints(cls)
 
@@ -370,24 +417,85 @@ class ArgParser:
             real_type = TypeReflector.unwrap(f_type)
 
             if is_dataclass(real_type):
-                init_kwargs[f.name] = self._reconstruct(real_type, data, prefix=f"{full_key}.")
+                nested_fallback = self._get_default_value(f, fallback_instance)
+                nested_type = self._resolve_nested_dataclass_type(
+                    real_type, nested_fallback, data, f"{full_key}."
+                )
+                init_kwargs[f.name] = self._reconstruct(
+                    nested_type,
+                    data,
+                    prefix=f"{full_key}.",
+                    fallback_instance=nested_fallback,
+                )
             elif full_key in data:
-                val = data[full_key]
-                if isinstance(real_type, type) and issubclass(real_type, enum.Enum):
-                    val = real_type(val)
-                init_kwargs[f.name] = val
+                init_kwargs[f.name] = self._coerce_value(data[full_key], f_type, real_type)
+            elif self._source_has_field(fallback_instance, f.name):
+                init_kwargs[f.name] = self._get_source_value(fallback_instance, f.name)
 
         return cls(**init_kwargs)
 
+    def _source_has_field(self, instance: Any, name: str) -> bool:
+        if instance is None:
+            return False
+        if isinstance(instance, dict):
+            return name in instance
+        return hasattr(instance, name)
+
+    def _get_source_value(self, instance: Any, name: str) -> Any:
+        if isinstance(instance, dict):
+            return instance[name]
+        return getattr(instance, name)
+
+    def _get_default_value(self, f: dataclasses.Field, instance: Any) -> Any:
+        value = self._get_effective_default(f, instance)
+        return None if value is dataclasses.MISSING else value
+
+    def _coerce_value(self, value: Any, field_type: Type, real_type: Type) -> Any:
+        if isinstance(real_type, type) and issubclass(real_type, enum.Enum):
+            return real_type(value)
+
+        origin = TypeReflector.get_origin_type(field_type)
+        if origin in (tuple, Tuple) and isinstance(value, list):
+            return tuple(value)
+
+        return value
+
+    def _resolve_nested_dataclass_type(
+        self,
+        annotated_type: Type,
+        default_instance: Any,
+        data: Dict[str, Any] | None = None,
+        prefix: str = "",
+    ) -> Type:
+        if is_dataclass(default_instance) and isinstance(default_instance, annotated_type):
+            if type(default_instance) is not annotated_type:
+                return type(default_instance)
+
+        framework = self._get_optional_source_value(default_instance, "framework")
+        if framework is None and data is not None:
+            framework = data.get(f"{prefix}framework")
+        if framework is None or getattr(annotated_type, "__name__", None) != "EnvLoaderSpec":
+            return annotated_type
+
+        try:
+            from thunder.env.env import get_loader_spec_cls
+
+            spec_cls = get_loader_spec_cls(framework, annotated_type)
+        except Exception:
+            spec_cls = annotated_type
+        return spec_cls or annotated_type
+
+    def _get_optional_source_value(self, instance: Any, name: str) -> Any:
+        if not self._source_has_field(instance, name):
+            return None
+        return self._get_source_value(instance, name)
+
     def _get_effective_default(self, f: dataclasses.Field, instance: Any) -> Any:
-        if instance and hasattr(instance, f.name):
-            return getattr(instance, f.name)
+        if self._source_has_field(instance, f.name):
+            return self._get_source_value(instance, f.name)
 
         if f.default is not dataclasses.MISSING:
             return f.default
         if f.default_factory is not dataclasses.MISSING:
-            try:
-                return f.default_factory()
-            except:
-                pass
+            return f.default_factory()
         return dataclasses.MISSING

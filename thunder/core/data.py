@@ -1,49 +1,146 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields, is_dataclass
-from functools import wraps
+from dataclasses import dataclass, field, fields, MISSING, replace
 from typing import Any, Dict, Optional, TypeVar
 
 _BACKEND = os.getenv("THUNDER_BACKEND", "torch").lower()
+
 TAttrData = TypeVar("TAttrData", bound="AttrData")
-TBatch = TypeVar("TBatch", bound="Batch")
-_REGISTERED_ATTRDATA_TYPES: set[type] = set()
+_REGISTERED_ATTR_DATA_TYPES: set[type[Any]] = set()
+
+
+def _flatten_attr_data(
+    obj: "AttrData",
+) -> tuple[tuple[Any, ...], tuple[tuple[str, ...], tuple[str, ...]]]:
+    core_names = tuple(name for name, _, _ in type(obj).__attr_data_core_fields__)
+    data_keys = tuple(sorted(obj._data))
+    children = tuple(getattr(obj, name) for name in core_names) + tuple(
+        obj._data[key] for key in data_keys
+    )
+    return children, (core_names, data_keys)
+
+
+if _BACKEND == "torch":
+    import torch.utils._pytree as pytree
+
+    _register_pytree_node = pytree.register_pytree_node
+
+elif _BACKEND == "jax":
+    import jax.tree_util as jtu
+
+    _register_pytree_node = jtu.register_pytree_node
+
+else:
+    _register_pytree_node = None
+
+
+def _register_attr_data_type(cls: type["AttrData"]) -> None:
+    if cls in _REGISTERED_ATTR_DATA_TYPES:
+        return
+
+    if _register_pytree_node is not None:
+
+        if _BACKEND == "torch":
+
+            def _unflatten(children, aux_data):
+                core_names, data_keys = aux_data
+                n_core = len(core_names)
+                kwargs = dict(zip(core_names, children[:n_core]))
+                kwargs["_data"] = dict(zip(data_keys, children[n_core:]))
+                return cls(**kwargs)
+
+        else:
+
+            def _unflatten(aux_data, children):
+                core_names, data_keys = aux_data
+                n_core = len(core_names)
+                kwargs = dict(zip(core_names, children[:n_core]))
+                kwargs["_data"] = dict(zip(data_keys, children[n_core:]))
+                return cls(**kwargs)
+
+        _register_pytree_node(cls, _flatten_attr_data, _unflatten)
+
+    _REGISTERED_ATTR_DATA_TYPES.add(cls)
+
+
+def attr_dataclass(cls: type[TAttrData] | None = None, **dataclass_kwargs):
+    dataclass_kwargs.setdefault("slots", True)
+    dataclass_kwargs.setdefault("repr", False)
+    dataclass_kwargs["init"] = False
+
+    def wrap(cls: type[TAttrData]) -> type[TAttrData]:
+        if not issubclass(cls, AttrData):
+            raise TypeError("attr_dataclass can only be used with AttrData subclasses.")
+        if "__dataclass_fields__" not in cls.__dict__:
+            cls = dataclass(**dataclass_kwargs)(cls)
+        cls.__attr_data_core_fields__ = tuple(
+            (f.name, f.default, f.default_factory)
+            for f in fields(cls)
+            if f.name != "_data"
+        )
+        cls.__attr_data_field_set__ = frozenset(cls.__dataclass_fields__)
+
+        def __init__(self, _data=None, **kwargs):
+            if type(self) is not cls:
+                raise TypeError(
+                    f"{type(self).__name__} must be decorated with @attr_dataclass."
+                )
+
+            data = {} if _data is None else dict(_data)
+            data.update(kwargs)
+
+            for name, default, default_factory in cls.__attr_data_core_fields__:
+                if name in data:
+                    object.__setattr__(self, name, data.pop(name))
+                elif default is not MISSING:
+                    object.__setattr__(self, name, default)
+                elif default_factory is not MISSING:
+                    object.__setattr__(self, name, default_factory())
+                else:
+                    raise TypeError(f"Missing required argument: '{name}'")
+
+            object.__setattr__(self, "_data", data)
+
+        cls.__init__ = __init__
+        _register_attr_data_type(cls)
+        return cls
+
+    return wrap if cls is None else wrap(cls)
 
 
 @dataclass(slots=True, init=False, repr=False)
 class AttrData:
-    """Dataclass container with attribute-style access to dynamic fields.
+    """Base class for attribute-based data structures.
+    Supports both statically declared fields and dynamic
+    fields stored in a dictionary. Provides dict-like
+    access to dynamic fields anda custom __repr__ implementation."""
 
-    `AttrData` is the common base type for Thunder data containers. Explicit
-    dataclass fields describe the stable structure, while `_data` stores
-    dynamically attached attributes.
-
-    Only dataclass subclasses are supported as pytree nodes. Use
-    `@attr_dataclass(...)` for concrete subclasses so Torch/JAX can
-    reconstruct the exact runtime type during unflatten.
-    """
-
-    _data: Dict[str, Any] = field(default_factory=dict, init=False)
-
-    def __init__(self, _data: Optional[Dict[str, Any]] = None, **kwargs):
-        base_data = {} if _data is None else dict(_data)
-        base_data.update(kwargs)
-        object.__setattr__(self, "_data", base_data)
+    _data: Dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str) -> Any:
+        if name == "_data":
+            raise AttributeError(
+                f"'{self.__class__.__name__}' has no attribute '{name}'"
+            )
         try:
             data = object.__getattribute__(self, "_data")
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' has no attribute '{name}'"
+            ) from exc
+        try:
             return data[name]
-        except (AttributeError, KeyError) as exc:
-            raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'") from exc
+        except KeyError as exc:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' has no attribute '{name}'"
+            ) from exc
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in self.__class__.__dataclass_fields__ or name.startswith("_"):
+        if name in self.__class__.__attr_data_field_set__:
             object.__setattr__(self, name, value)
-            return
-        data = object.__getattribute__(self, "_data")
-        data[name] = value
+        else:
+            self._data[name] = value
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -51,157 +148,83 @@ class AttrData:
     def __setitem__(self, key: str, value: Any) -> None:
         setattr(self, key, value)
 
-    def __dir__(self):
-        return list(self.__class__.__dataclass_fields__.keys()) + list(self._data.keys())
-
-    def __repr__(self) -> str:
-        def _fmt(v: Any) -> str:
-            if hasattr(v, "shape"):
-                return f"Arr{tuple(v.shape)}"
-            if isinstance(v, dict):
-                return f"Dict[{len(v)}]"
-            if isinstance(v, (list, tuple)):
-                return f"{type(v).__name__}[{len(v)}]"
-            return str(v)
-
-        core = []
-        for name in type(self).__attrdata_field_names__:
-            val = getattr(self, name)
-            if val is not None:
-                core.append(f"{name}={_fmt(val)}")
-        dynamic_items = [f"{k}={_fmt(v)}" for k, v in self._data.items()]
-        return f"{type(self).__name__}({', '.join(core + dynamic_items)})"
-
     def get(self, key: str, default=None) -> Any:
-        try:
-            return getattr(self, key)
-        except AttributeError:
-            return default
+        return self._data.get(key, default)
 
     def update(self, **kwargs) -> None:
+        data = kwargs.pop("_data", None)
+        if data is not None:
+            object.__setattr__(self, "_data", data.copy())
         for key, value in kwargs.items():
-            setattr(self, key, value)
+            if key in self.__class__.__attr_data_field_set__:
+                object.__setattr__(self, key, value)
+            else:
+                self._data[key] = value
 
     def replace(self: TAttrData, **kwargs) -> TAttrData:
-        explicit_data = kwargs.pop("_data", None)
-        base_data = dict(self._data if explicit_data is None else explicit_data)
+        declared = {}
+        dynamic = {}
+        for key, value in kwargs.items():
+            if key in self.__class__.__attr_data_field_set__:
+                declared[key] = value
+            else:
+                dynamic[key] = value
+        if dynamic:
+            base_data = declared.get("_data", self._data)
+            new_data = base_data.copy()
+            new_data.update(dynamic)
+            declared["_data"] = new_data
+        return replace(self, **declared)
 
-        init_kwargs = {}
-        for name in type(self).__attrdata_field_names__:
-            init_kwargs[name] = kwargs.pop(name, getattr(self, name))
+    def __dir__(self):
+        return list(
+            dict.fromkeys([*self.__class__.__dataclass_fields__, *self._data.keys()])
+        )
 
-        base_data.update(kwargs)
-        return type(self)(_data=base_data, **init_kwargs)
+    def __repr__(self) -> str:
+        def _fmt(value: Any) -> str:
+            if hasattr(value, "shape"):
+                return f"Arr{tuple(value.shape)}"
+            if isinstance(value, dict):
+                return f"Dict[{len(value)}]"
+            if isinstance(value, (list, tuple)):
+                return f"{type(value).__name__}[{len(value)}]"
+            return str(value)
 
-
-def _flatten_attrdata_instance(data: AttrData):
-    core_fields = type(data).__attrdata_field_names__
-    core_values = tuple(getattr(data, name) for name in core_fields)
-    data_keys = tuple(sorted(data._data.keys()))
-    data_values = tuple(data._data[key] for key in data_keys)
-    children = core_values + data_values
-    aux_data = (type(data), core_fields, data_keys)
-    return children, aux_data
-
-
-def _torch_unflatten_attrdata(children, aux_data):
-    cls, core_fields, data_keys = aux_data
-    n_core = len(core_fields)
-    core_vals = children[:n_core]
-    data_vals = children[n_core:]
-    init_kwargs = dict(zip(core_fields, core_vals))
-    data_dict = dict(zip(data_keys, data_vals))
-    return cls(_data=data_dict, **init_kwargs)
-
-
-def _jax_unflatten_attrdata(aux_data, children):
-    cls, core_fields, data_keys = aux_data
-    n_core = len(core_fields)
-    core_vals = children[:n_core]
-    data_vals = children[n_core:]
-    init_kwargs = dict(zip(core_fields, core_vals))
-    data_dict = dict(zip(data_keys, data_vals))
-    return cls(_data=data_dict, **init_kwargs)
+        items = []
+        for name, _, _ in self.__class__.__attr_data_core_fields__:
+            value = getattr(self, name)
+            if value is not None:
+                items.append(f"{name}={_fmt(value)}")
+        items.extend(f"{key}={_fmt(value)}" for key, value in self._data.items())
+        return f"{self.__class__.__name__}({', '.join(items)})"
 
 
-def register_attrdata_type(cls: type[TAttrData]) -> type[TAttrData]:
-    """Register a concrete AttrData dataclass as a pytree node."""
-
-    if cls in _REGISTERED_ATTRDATA_TYPES:
-        return cls
-    if not is_dataclass(cls):
-        raise TypeError(f"{cls.__name__} must be a dataclass before pytree registration.")
-    if not issubclass(cls, AttrData):
-        raise TypeError(f"{cls.__name__} must inherit from AttrData.")
-
-    cls.__attrdata_field_names__ = tuple(f.name for f in fields(cls) if f.name != "_data")
-    cls.__attrdata_field_name_set__ = frozenset(cls.__attrdata_field_names__)
-
-    if _BACKEND == "torch":
-        import torch.utils._pytree as pytree
-
-        pytree.register_pytree_node(cls, _flatten_attrdata_instance, _torch_unflatten_attrdata)
-    elif _BACKEND == "jax":
-        import jax
-
-        jax.tree_util.register_pytree_node(cls, _flatten_attrdata_instance, _jax_unflatten_attrdata)
-
-    _REGISTERED_ATTRDATA_TYPES.add(cls)
-    return cls
-
-
-def attr_dataclass(_cls=None, **dataclass_kwargs):
-    """Dataclass decorator that also registers the concrete AttrData subtype."""
-
-    def wrap(cls):
-        dataclass_kwargs.setdefault("init", True)
-        dataclass_kwargs.setdefault("repr", False)
-        cls = dataclass(cls, **dataclass_kwargs)
-        original_init = cls.__init__
-        init_field_names = tuple(f.name for f in fields(cls) if f.name != "_data" and f.init)
-        field_name_set = frozenset(init_field_names)
-
-        @wraps(original_init)
-        def __init__(self, *args, _data: Optional[Dict[str, Any]] = None, **kwargs):
-            base_data = {} if _data is None else dict(_data)
-            core_kwargs = {}
-            extra_kwargs = {}
-            for key, value in kwargs.items():
-                if key in field_name_set:
-                    core_kwargs[key] = value
-                else:
-                    extra_kwargs[key] = value
-
-            consumed_names = init_field_names[: len(args)]
-            for name in init_field_names[len(consumed_names) :]:
-                if name not in core_kwargs and name in base_data:
-                    core_kwargs[name] = base_data.pop(name)
-
-            original_init(self, *args, **core_kwargs)
-            base_data.update(extra_kwargs)
-            object.__setattr__(self, "_data", base_data)
-
-        cls.__init__ = __init__
-        return register_attrdata_type(cls)
-
-    if _cls is None:
-        return wrap
-    return wrap(_cls)
-
-
-register_attrdata_type(AttrData)
-Cache = AttrData
+attr_dataclass(AttrData)
 
 
 @attr_dataclass(slots=True)
 class Batch(AttrData):
+    """A basic data structure for Markov Chain ,
+    with some common fields for convenience.
+    """
+
     obs: Optional[Dict[str, Any]] = None
     actions: Optional[Any] = None
     rewards: Optional[Any] = None
-    dones: Optional[Any] = None
-    timeouts: Optional[Any] = None
-    mask: Optional[Any] = None
     next_obs: Optional[Dict[str, Any]] = None
+    terminated: Optional[Any] = None
+    timeouts: Optional[Any] = None
+    # Optional
+    mask: Optional[Any] = None
+    values: Optional[Any] = None
+    next_values: Optional[Any] = None
+    advantages: Optional[Any] = None
+    returns: Optional[Any] = None
+    # Carry
+    policy_carry: Optional[Any] = None
+    critic_carry: Optional[Any] = None
+    represent_carry: Optional[Any] = None
 
 
-__all__ = ["AttrData", "Cache", "Batch", "attr_dataclass", "register_attrdata_type"]
+__all__ = ["AttrData", "Batch", "attr_dataclass"]

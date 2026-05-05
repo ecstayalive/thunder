@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from thunder.utils import ArgParser
 
-from .loader import EnvLoaderSpec, ThunderEnvWrapper, register_loader
+from .env import EnvLoaderSpec, ThunderEnv, register_loader
 
 
 @dataclass(kw_only=True)
@@ -16,7 +16,7 @@ class ManiSkillLoaderSpec(EnvLoaderSpec):
 
 
 @register_loader("maniskill")
-def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderEnvWrapper:
+def load_maniskill(spec: EnvLoaderSpec | ManiSkillLoaderSpec) -> ThunderEnv:
     import gymnasium as gym
     import mani_skill.envs
 

@@ -5,6 +5,76 @@ import torch.distributed as dist
 import torch.nn as nn
 
 
+def compute_lambda_returns(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    continues: torch.Tensor,
+    next_values: torch.Tensor,
+    gamma: float = 0.99,
+    lambda_: float = 0.95,
+) -> torch.Tensor:
+    """Compute TD(lambda) returns from rollout tensors with shape [B, L, ...]."""
+    if rewards.shape != values.shape or rewards.shape != continues.shape:
+        raise ValueError("rewards, values and continues must have same shape")
+    if next_values.shape != rewards.shape:
+        raise ValueError("next_values must have same shape as rewards")
+
+    returns = torch.empty_like(rewards)
+    last_return = next_values[:, -1]
+    for t in range(rewards.shape[1] - 1, -1, -1):
+        gamma_t = gamma * continues[:, t]
+        last_return = rewards[:, t] + gamma_t * (
+            (1.0 - lambda_) * next_values[:, t] + lambda_ * last_return
+        )
+        returns[:, t] = last_return
+
+    return returns
+
+
+def compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    next_values: torch.Tensor,
+    continues: torch.Tensor,
+    gamma: float = 0.99,
+    lambda_: float = 0.95,
+    normalize: bool = True,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute generalized advantage estimates and TD(lambda) returns.
+    Args:
+        rewards: [B, L, D_R]
+    """
+    if (
+        rewards.shape != values.shape
+        or rewards.shape != next_values.shape
+        or rewards.shape != continues.shape
+    ):
+        raise ValueError(
+            "rewards, values, next_values and continues must have same shape"
+        )
+
+    L = rewards.shape[1]
+    advantage = torch.zeros_like(rewards[:, -1])
+    returns = torch.zeros_like(rewards)
+    continues = continues * gamma
+    with torch.inference_mode():
+        for step in reversed(range(L)):
+            delta = (
+                rewards[:, step]
+                + continues[:, step] * next_values[:, step]
+                - values[:, step]
+            )
+            advantage = delta + continues[:, step] * lambda_ * advantage
+            returns[:, step] = advantage + values[:, step]
+    advantages = returns - values
+    if normalize:
+        adv_mean = advantages.mean()
+        adv_std = advantages.std(unbiased=False).clamp_min(eps)
+        advantages = (advantages - adv_mean) / adv_std
+    return advantages, returns
+
+
 def all_reduce(tensor: torch.Tensor, op="AVG"):
     if dist.is_available() and dist.is_initialized():
         if op == "AVG":
@@ -30,7 +100,8 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
 def gaussian_kl_divergence(mu1, sigma1, mu2, sigma2):
     kl = torch.sum(
         torch.log(sigma2 / sigma1 + 1.0e-5)
-        + (torch.square(sigma1) + torch.square(mu1 - mu2)) / (2.0 * torch.square(sigma2))
+        + (torch.square(sigma1) + torch.square(mu1 - mu2))
+        / (2.0 * torch.square(sigma2))
         - 0.5,
         dim=-1,
     )
@@ -89,7 +160,9 @@ def split_trajectory(
     # [NumTrajs, 1] => [NumTrajs, MaxLen]
     mask = traj_len.unsqueeze(1) > row_indices
     padded_trajectories = torch.zeros(
-        (num_trajs, max_len, embedding_dim), dtype=flat_obs.dtype, device=flat_obs.device
+        (num_trajs, max_len, embedding_dim),
+        dtype=flat_obs.dtype,
+        device=flat_obs.device,
     )
     padded_trajectories[mask] = flat_obs
     return padded_trajectories, mask

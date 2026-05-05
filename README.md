@@ -74,14 +74,12 @@ For example, we want to implement a basic PPO algorithm.
     [
       Rollout(env, agent),  # Interact with the environment to collect data
       OptimizeLoop(
-          BufferLoader(agent.buffer),
-          Pipeline(
-              [
-                SplitTraj(),
-                OptimizeOp("opt", [SurrogateLoss()])
-              ],
-              jit=True,
-          ),
+          BufferLoader(SequenceSampler(batch_size=32)),
+          [
+            SplitTraj(),
+            OptimizeOp("opt", [SurrogateLoss()])
+          ],
+          jit=True,
       ),
       ClearBuffer(agent.buffer),
     ]

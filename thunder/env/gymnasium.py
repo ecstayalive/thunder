@@ -5,7 +5,7 @@ import gymnasium as gym
 
 from thunder.utils import ArgParser
 
-from .loader import EnvLoaderSpec, ObservationWrapper, register_loader
+from .env import EnvLoaderSpec, ObservationWrapper, register_loader
 
 
 @dataclass(kw_only=True)

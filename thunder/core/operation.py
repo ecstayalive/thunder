@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import partial
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
@@ -12,6 +11,7 @@ from typing import (
     Iterable,
     Optional,
     Tuple,
+    TYPE_CHECKING,
 )
 
 from .context import Ref, replace_ref_path
@@ -42,10 +42,11 @@ _SYSTEM_PREFIX_REFS = _normalize_refs(
         "batch.obs",
         "batch.actions",
         "batch.rewards",
-        "batch.dones",
+        "batch.terminated",
         "batch.timeouts",
         "batch.mask",
         "batch.next_obs",
+        "batch.values",
     )
 )
 _SYSTEM_EXACT_REFS = _normalize_refs(
@@ -60,6 +61,8 @@ _SYSTEM_EXACT_REFS = _normalize_refs(
         "meta",
     )
 )
+SYSTEM_EXACT_REFS = _SYSTEM_EXACT_REFS
+SYSTEM_PREFIX_REFS = _SYSTEM_PREFIX_REFS
 
 
 @dataclass(slots=True)
@@ -120,19 +123,20 @@ class Operation(ABC):
 
     requires: ClassVar[frozenset[Ref]] = frozenset()
     provides: ClassVar[frozenset[Ref]] = frozenset()
-    # distributed: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         cls.requires = _normalize_refs(getattr(cls, "requires", ()))
         cls.provides = _normalize_refs(getattr(cls, "provides", ()))
 
-    def __init__(self, name: str = "operation", **kwargs):
+    def __init__(self, name: str = "", **kwargs):
         self.name = name
         self.kwargs = kwargs
         self._prefix = "" if not name else f"{name}/"
 
-    def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
+    def __call__(
+        self, ctx: ExecutionContext
+    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
         ctx, metrics = self.forward(ctx)
         metrics = {f"{self._prefix}{k}": v for k, v in metrics.items()}
@@ -144,27 +148,43 @@ class Operation(ABC):
             fields["kwargs"] = self.kwargs
         return fields
 
-    def __repr__(self):
-        parts = []
+    def _repr_children(self) -> Iterable[Tuple[str, "Operation"]]:
+        return ()
+
+    def _repr_field_items(self) -> Iterable[Tuple[str, Any]]:
         for key, value in self._repr_fields().items():
-            if value in (None, (), {}, frozenset()):
+            if value is None:
                 continue
-            parts.append(f"{key}={value!r}")
-        return f"{type(self).__name__}({', '.join(parts)})"
+            if isinstance(value, (tuple, list, dict, set, frozenset)) and not value:
+                continue
+            yield key, value
+
+    def extra_repr(self) -> str:
+        return ", ".join(f"{key}={value!r}" for key, value in self._repr_field_items())
+
+    def _repr_child_line(self, key: str, child: "Operation") -> str:
+        child_repr = repr(child).replace("\n", "\n  ")
+        return f"({key}): {child_repr}"
+
+    def _repr_lines(self) -> Tuple[list[str], bool]:
+        extra = self.extra_repr()
+        lines = extra.splitlines() if extra else []
+        children = tuple(self._repr_children())
+        lines.extend(self._repr_child_line(key, child) for key, child in children)
+        return lines, bool(children)
+
+    def __repr__(self):
+        lines, has_children = self._repr_lines()
+        if not lines:
+            return f"{type(self).__name__}()"
+        if len(lines) == 1 and not has_children:
+            return f"{type(self).__name__}({lines[0]})"
+        body = "\n  ".join(lines)
+        return f"{type(self).__name__}(\n  {body}\n)"
 
     @abstractmethod
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        pass
-
-
-class NullOperation(Operation):
-    """ """
-
-    def __init__(self, name: str = "null", **kwargs):
-        super().__init__(name=name, **kwargs)
-
-    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        return ctx, {}
+        raise NotImplementedError
 
 
 class Objective(Operation):
@@ -174,45 +194,52 @@ class Objective(Operation):
     updating the model. When it is aggregated by an OptimizeOp.
     The OptimizeOp invokes its `compute` method
     to obtain gradient signals.
-    Args:
-
     """
 
     def __init__(self, weight: float = 1.0, name: str = "objective", **kwargs):
         super().__init__(name=name, **kwargs)
         self.weight = weight
 
-    def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        loss, metrics = self.forward(ctx.batch, ctx.models)
-        return ctx, metrics
+        #
+        self.exports: Dict[str, Any] = {}
 
     def _repr_fields(self) -> Dict[str, Any]:
         fields = super()._repr_fields()
         fields["weight"] = self.weight
         return fields
 
-    def forward(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
-        loss, metrics = self.compute(batch, model)
-        weighted_loss = self.weight * loss
+    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
+        loss, metrics = self.evaluate(ctx)
+        return ctx, metrics
+
+    def evaluate(self, ctx: ExecutionContext) -> Tuple[Any, Dict[str, Any]]:
+        self.exports.clear()
+        loss, metrics = self.compute(ctx)
+        weighted_loss = self.curriculum(ctx) * self.weight * loss
         metrics = {
-            f"{self._prefix}loss": loss,
-            f"{self._prefix}weighted_loss": weighted_loss,
+            f"loss": loss,
+            f"weighted_loss": weighted_loss,
             **metrics,
         }
         return weighted_loss, metrics
 
     @abstractmethod
-    def compute(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
-        """_summary_
+    def compute(self, ctx: ExecutionContext) -> Tuple[Any, Dict[str, Any]]:
+        """
 
         Args:
-            batch (Batch): _description_
-            model (ModelPack): _description_
+            ctx (ExecutionContext):
 
         Returns:
-            Tuple[Any, Dict[str, Any]]: _description_
+            Tuple[Any, Dict[str, Any]]:
         """
-        pass
+        raise NotImplementedError
+
+    def curriculum(self, ctx: ExecutionContext) -> float:
+        return 1.0
+
+    def export(self) -> Dict[str, Any]:
+        return self.exports
 
 
 class Pipeline(Operation):
@@ -220,22 +247,33 @@ class Pipeline(Operation):
     Args:
     """
 
-    def __init__(self, pipeline: Iterable[Operation], name="pipeline", jit: bool = False, **kwargs):
+    forward_fn: callable
+
+    def __init__(
+        self,
+        pipeline: Iterable[Operation],
+        name="",
+        jit: bool = False,
+        validate: str | None = "error",
+        initial_exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
+        initial_prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
+        **kwargs,
+    ):
         super().__init__(name, **kwargs)
         self.jit = jit
         self.pipeline = list(pipeline)
+        self._validate_mode = validate
+        self._initial_exact_refs = tuple(initial_exact_refs)
+        self._initial_prefix_refs = tuple(initial_prefix_refs)
         self.setup()
 
-    def __call__(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        """ """
-        if self.jit:
-            ctx, metrics = self._jit_forward(ctx)
-        else:
-            ctx, metrics = self.forward(ctx)
-        return ctx, metrics
+    def __call__(
+        self, ctx: ExecutionContext
+    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
+        return self.forward(ctx)
 
     def forward(self, ctx: ExecutionContext):
-        return self._forward(ctx, tuple(self.pipeline), self._prefix)
+        return self.forward_fn(ctx)
 
     @staticmethod
     def _forward(ctx: ExecutionContext, pipeline: Tuple[Operation, ...], prefix: str):
@@ -247,16 +285,49 @@ class Pipeline(Operation):
         return ctx, metrics
 
     def setup(self):
+        self._pipeline = tuple(self.pipeline)
         self._refresh_contracts()
-        self.validate()
-        self._jit_forward = Executor.jit(
-            partial(self._forward, pipeline=tuple(self.pipeline), prefix=self._prefix)
+        self._validate_contract(
+            initial_exact_refs=self._initial_exact_refs,
+            initial_prefix_refs=self._initial_prefix_refs,
+            mode=self._validate_mode,
+        )
+        self.forward_fn = self._compile_forward()
+
+    def _compile_forward(self):
+        forward_fn = partial(
+            self._forward, pipeline=self._pipeline, prefix=self._prefix
+        )
+        return Executor.jit(forward_fn) if self.jit else forward_fn
+
+    def _validate_contract(
+        self,
+        initial_exact_refs: Iterable[_RefSpec],
+        initial_prefix_refs: Iterable[_RefSpec],
+        mode: str | None,
+    ) -> None:
+        if mode is None:
+            return
+        self.validate(
+            initial_exact_refs=initial_exact_refs,
+            initial_prefix_refs=initial_prefix_refs,
+            mode=mode,
         )
 
     def _refresh_contracts(self) -> None:
-        requires, provides = self._analyze_contract()
+        requires, provides = self._analyze_contract(
+            exact_refs=self._initial_exact_refs,
+            prefix_refs=self._initial_prefix_refs,
+        )
         self.requires = requires
         self.provides = provides
+
+    def analyze_contract(
+        self,
+        exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
+        prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
+    ) -> Tuple[frozenset[Ref], frozenset[Ref]]:
+        return self._analyze_contract(exact_refs=exact_refs, prefix_refs=prefix_refs)
 
     def _analyze_contract(
         self,
@@ -280,7 +351,9 @@ class Pipeline(Operation):
         initial_prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
         mode: str = "error",
     ) -> None:
-        available = RefIndex(exact_refs=initial_exact_refs, prefix_refs=initial_prefix_refs)
+        available = RefIndex(
+            exact_refs=initial_exact_refs, prefix_refs=initial_prefix_refs
+        )
         for idx, op in enumerate(self.pipeline):
             missing = tuple(ref for ref in op.requires if not available.covers(ref))
             if missing:
@@ -319,13 +392,15 @@ class Pipeline(Operation):
         self.pipeline.append(op)
         self.setup()
 
+    def extend(self, ops: Iterable[Operation]):
+        self.pipeline.extend(ops)
+        self.setup()
+
     def _repr_fields(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "jit": self.jit,
-            "size": len(self.pipeline),
-            "ops": tuple(type(op).__name__ for op in self.pipeline),
-        }
+        return {"jit": self.jit, "size": len(self.pipeline)}
+
+    def _repr_children(self) -> Iterable[Tuple[str, Operation]]:
+        return ((str(i), op) for i, op in enumerate(self.pipeline))
 
 
 class OptimizeOp(Operation):
@@ -350,18 +425,22 @@ class OptimizeOp(Operation):
         self.provides = frozenset()
 
     def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        metrics = ctx.executor.optimize(
-            ctx=ctx, opt=self.opt, objectives=self.objectives, max_grad_norm=self.max_grad_norm
+        return ctx.executor.optimize(
+            ctx=ctx,
+            opt=self.opt,
+            objectives=self.objectives,
+            max_grad_norm=self.max_grad_norm,
         )
-        return ctx, metrics
 
     def _repr_fields(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "opt": self.opt,
-            "objectives": tuple(type(obj).__name__ for obj in self.objectives),
             "max_grad_norm": self.max_grad_norm,
         }
+
+    def _repr_children(self) -> Iterable[Tuple[str, Operation]]:
+        return ((str(i), obj) for i, obj in enumerate(self.objectives))
 
 
 class CallableOp(Operation):
@@ -369,9 +448,9 @@ class CallableOp(Operation):
 
     def __init__(self, fn: Callable, name="callable_op", returns=None, **bindings):
         super().__init__(name=name)
-        self._fn = self._jit_compile(fn, bindings, returns)
+        self._fn = self._compile(fn, bindings, returns)
 
-    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict]:
+    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
         return self._fn(ctx)
 
     def _repr_fields(self) -> Dict[str, Any]:
@@ -379,76 +458,31 @@ class CallableOp(Operation):
         fields["callable"] = getattr(self._fn, "__name__", type(self._fn).__name__)
         return fields
 
-    def _jit_compile(self, fn, bindings, returns):
-        closure_vars = {"_fn": fn, "_replace_path": replace_ref_path}
-        args_code = []
-        for name, value in bindings.items():
-            var_name = f"_var_{name}"
-            closure_vars[var_name] = value
-            if isinstance(value, Ref) or callable(value):
-                args_code.append(f"{name}={var_name}(ctx)")
-            else:
-                args_code.append(f"{name}={var_name}")
-        arg_str = ", ".join(args_code)
-        body = f"res = _fn({arg_str})"
-        if returns is None:
-            body += "; return ctx, (res if isinstance(res, dict) else {})"
-        else:
-            closure_vars["_returns_path"] = returns._path
-            body += "; new_ctx = _replace_path(ctx, _returns_path, res); return new_ctx, {}"
-        factory_args = ", ".join(closure_vars.keys())
-        fn_name = f"_jit_{self.name}"
-        lines = [
-            f"def factory({factory_args}):",  # Outer Factory
-            f"    def {fn_name}(ctx):",  # Inner JIT Function
-            f"        {body}",  # The Logic
-            f"    return {fn_name}",  # Return the inner function
-        ]
+    def _compile(self, fn: Callable, bindings: Dict[str, Any], returns: Ref | None):
+        def _resolve(value, ctx):
+            if isinstance(value, Ref):
+                return value(ctx)
+            if callable(value):
+                return value(ctx)
+            return value
 
-        full_source = "\n".join(lines)
-        local_scope = {}
-        exec(full_source, globals(), local_scope)
-        factory = local_scope["factory"]
-        return factory(**closure_vars)
+        def _call(ctx):
+            kwargs = {key: _resolve(value, ctx) for key, value in bindings.items()}
+            result = fn(**kwargs)
+            if returns is not None:
+                return replace_ref_path(ctx, returns.path, result), {}
+            if isinstance(result, tuple) and len(result) == 2:
+                return result
+            return ctx, result if isinstance(result, dict) else {}
+
+        return _call
 
 
-class CallableObjective(Objective):
-    """
-    Adapts any function into a `Thunder` Objective.
-    The 'fn' can have ANY signature. You use 'bindings' to map
-    Thunder's data (ctx.batch, ctx.models) to the function's arguments.
-    """
+class NullOperation(Operation):
+    """ """
 
-    __slots__ = ("_compute_fn",)
+    def __init__(self, name: str = "null", **kwargs):
+        super().__init__(name=name, **kwargs)
 
-    def __init__(self, fn: Callable, name="callable_objective", weight=1.0, **bindings):
-        super().__init__(name, weight)
-        self._compute_fn = self._jit_compile(fn, bindings)
-
-    def compute(self, batch: Batch, model: ModelPack) -> Tuple[Any, Dict[str, Any]]:
-        return self._compute_fn(batch, model)
-
-    def _repr_fields(self) -> Dict[str, Any]:
-        fields = super()._repr_fields()
-        fields["callable"] = getattr(self._compute_fn, "__name__", type(self._compute_fn).__name__)
-        return fields
-
-    def _jit_compile(self, fn, bindings):
-        closure_vars = {"_fn": fn}
-        from collections import namedtuple
-
-        closure_vars["_CtxSim"] = namedtuple("CtxSim", ["batch", "models"])
-        args_code = []
-        for name, value in bindings.items():
-            var_name = f"_var_{name}"
-            closure_vars[var_name] = value
-            if isinstance(value, Ref) or callable(value):
-                args_code.append(f"{name}={var_name}(_CtxSim(batch, model))")
-            else:
-                args_code.append(f"{name}={var_name}")
-        arg_str = ", ".join(args_code)
-        code = f"lambda batch, model: _fn({arg_str})"
-
-        factory_args = ", ".join(closure_vars.keys())
-        full_code = f"lambda {factory_args}: {code}"
-        return eval(full_code)(**closure_vars)
+    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
+        return ctx, {}

@@ -3,14 +3,14 @@
 import torch
 
 from thunder.core import Executor, ModelPack
-from thunder.env.loader import EnvLoaderSpec, ThunderEnvWrapper, make_env
+from thunder.env.loader import EnvLoaderSpec, ThunderEnv, make_env
 from thunder.rl.torch import Agent, Rollout
 from thunder.utils import ArgParser
 
 
 class DummyAgent(Agent):
     @classmethod
-    def from_env(cls, env: ThunderEnvWrapper) -> Agent:
+    def from_env(cls, env: ThunderEnv) -> Agent:
         agent = cls(models=ModelPack(), optim_config={})
         agent.act = lambda obs: torch.zeros(
             env.action_space.shape, device=Executor.default_device()

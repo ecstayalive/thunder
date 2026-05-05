@@ -10,11 +10,21 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3"]
-dependencies = ["tqdm", "rich", "rich_argparse", "coolname"]
+dependencies = [
+    "coolname",
+    "gymnasium",
+    "numpy",
+    "rich",
+    "rich_argparse",
+    "tqdm",
+]
 
 [tool.setuptools]
-packages = ["thunder"]
+include-package-data = true
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["thunder", "thunder.*"]
 
 [project.urls]
 "Homepage" = "https://github.com/ecstayalive/thunder"
@@ -24,7 +34,15 @@ packages = ["thunder"]
 [project.scripts]
 
 [project.optional-dependencies]
-torch = ["torch<=2.10", "mamba-ssm<=2.3.1"]
+# Official prebuilt wheels (no local nvcc): https://github.com/state-spaces/mamba/releases/tag/v2.3.1
+# Match torch 2.7 + cu12 + cp311 + cxx11abiTRUE. Other platforms fall back to PyPI sdist (needs nvcc).
+torch = [
+    "torch<=2.10",
+    "optree>=0.19.0",
+    "mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "mamba-ssm==2.3.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'x86_64' and platform_machine != 'aarch64')",
+]
 jax = ["jax[cuda12]<=0.6", "flax<=0.11", "optax<=0.3"]
 warp = ["warp-lang"]
 all = ["thunder[torch,jax,warp]"]

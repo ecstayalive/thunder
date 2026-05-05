@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from dataclasses import dataclass, is_dataclass
+from types import UnionType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    get_args,
+    get_type_hints,
+    List,
+    Optional,
+    Tuple,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 import gymnasium as gym
 
@@ -14,12 +26,15 @@ if TYPE_CHECKING:
     from thunder.env.typing import ActionType, ArrayType, ObservationType
 
 _LOADER_REGISTRY: Dict[str, Callable[[Any], gym.Env]] = {}
+_LOADER_SPEC_REGISTRY: Dict[str, type] = {}
 
 
 @dataclass
 class EnvLoaderSpec:
     """
+
     Args:
+
     """
 
     framework: str
@@ -48,7 +63,7 @@ class ThunderEnv(gym.Env):
         "warp": "warp",
         "builtins": "numpy",
     }
-    autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.NEXT_STEP
+    autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.SAME_STEP
 
     def __init__(self, env: gym.Env | gym.vector.VectorEnv):
         self.env: gym.Env | gym.vector.VectorEnv = env
@@ -239,7 +254,36 @@ class ActionWrapper(ThunderEnv):
         raise NotImplementedError
 
 
-def register_loader(framework: str):
+def _iter_annotation_types(annotation: Any):
+    if annotation is None:
+        return
+    origin = getattr(annotation, "__origin__", None)
+    if origin is None:
+        origin = getattr(annotation, "__class__", None)
+    if origin is UnionType or str(origin) == "typing.Union":
+        for arg in get_args(annotation):
+            yield from _iter_annotation_types(arg)
+        return
+    yield annotation
+
+
+def _infer_loader_spec_cls(loader: Callable) -> type | None:
+    try:
+        annotation = get_type_hints(loader).get("spec")
+    except Exception:
+        annotation = getattr(loader, "__annotations__", {}).get("spec")
+
+    for candidate in _iter_annotation_types(annotation):
+        if not isinstance(candidate, type):
+            continue
+        if candidate is EnvLoaderSpec:
+            continue
+        if issubclass(candidate, EnvLoaderSpec) and is_dataclass(candidate):
+            return candidate
+    return None
+
+
+def register_loader(framework: str, spec_cls: type | None = None):
     """_summary_
 
     Args:
@@ -248,12 +292,28 @@ def register_loader(framework: str):
 
     def decorator(func: Callable):
         _LOADER_REGISTRY[framework] = func
+        resolved_spec_cls = spec_cls or _infer_loader_spec_cls(func)
+        if resolved_spec_cls is not None:
+            _LOADER_SPEC_REGISTRY[framework] = resolved_spec_cls
         return func
 
     return decorator
 
 
-def make_env(spec: EnvLoaderSpec, wrappers: Optional[List[ThunderEnv]] = None):
+def get_loader_spec_cls(framework: str, default: type | None = None) -> type | None:
+    if framework not in _LOADER_SPEC_REGISTRY:
+        import importlib
+
+        try:
+            importlib.import_module(f"thunder.env.{framework}")
+        except ModuleNotFoundError:
+            return default
+    return _LOADER_SPEC_REGISTRY.get(framework, default)
+
+
+def make_env(
+    spec: EnvLoaderSpec, wrappers: Optional[List[ThunderEnv]] = None
+) -> ThunderEnv:
     """ """
     if spec.framework not in _LOADER_REGISTRY:
         import importlib

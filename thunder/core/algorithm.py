@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, TYPE_CHECKING
 
-from .data import Cache
 from .executor import Executor
 from .operation import Pipeline
 
 if TYPE_CHECKING:
+    from .context import OptimGroupSpec
     from .data import Batch
     from .executor.interface import Executor
     from .module import ModelPack
@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 
 class Algorithm(ABC):
+    """ """
+
+    pipeline: Pipeline
 
     def __init__(
         self,
@@ -32,7 +35,7 @@ class Algorithm(ABC):
         if optim_config is not None:
             self.build(optim_config)
 
-    def build(self, optim_config: Dict[str, Any]) -> None:
+    def build(self, optim_config: Dict[str, Any] | OptimGroupSpec) -> None:
         """Build the algorithm by initializing the execution context.
         Args:
             sample_batch (Batch): _description_
@@ -73,20 +76,18 @@ class Algorithm(ABC):
             raise RuntimeError(
                 "No pipeline defined for the algorithm. Please call .setup_pipeline() first."
             )
-        changes = {"cache": Cache()}
-        if batch is not None:
-            changes["batch"] = batch
-        self.ctx = self.ctx.replace(**changes)
+        self.ctx = self.ctx.replace(batch=batch)
         with self.ctx.manager:
             self.ctx, metrics = self.pipeline(self.ctx)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
-        metrics.update({"execution_context": self.ctx})
+        metrics.update({"ExecutionContext": self.ctx})
         return metrics
 
     def __repr__(self):
-        parts = [f"name={self.name!r}"]
+        # parts = [f"name={self.name!r}"]
+        parts = []
         parts.append(f"executor={type(self.executor).__name__}()")
-        parts.append(f"models={type(self.models).__name__}()")
+        parts.append(f"models={self.models}")
         parts.append(f"built={self.ctx is not None!r}")
         if self.ctx is not None:
             parts.append(f"step={self.ctx.step!r}")

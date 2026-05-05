@@ -2,7 +2,6 @@ from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
-
 from thunder.core import ThunderModule
 from thunder.nn.torch.distributions import DistributionHead
 from thunder.nn.torch.models import RepresentModel
@@ -13,10 +12,10 @@ from ..types import ActorStep
 class Actor(ThunderModule):
     """ """
 
-    def __init__(self, represent: RepresentModel, decoder: DistributionHead):
+    def __init__(self, backbone: nn.Module, dist: DistributionHead):
         super().__init__()
-        self.represent = represent
-        self.decoder = decoder
+        self.backbone = backbone
+        self.dist = dist
 
     def reset(self, indices: Optional[Sequence[int]] = None):
         """
@@ -34,17 +33,17 @@ class Actor(ThunderModule):
         backbones_kwargs=None,
         dist_kwargs=None,
     ):
-        embedding, carry = self.represent(
+        embedding, carry = self.backbone(
             embedding, carry, **backbones_kwargs if backbones_kwargs is not None else {}
         )
-        dist = self.decoder(embedding, **dist_kwargs if dist_kwargs is not None else {})
+        dist = self.dist(embedding, **dist_kwargs if dist_kwargs is not None else {})
         return dist, carry
 
     def explore(
         self,
         embedding: torch.Tensor | Dict[str, torch.Tensor],
         carry=None,
-        backbones_kwargs=None,
+        backbone_kwargs=None,
         dist_kwargs=None,
     ) -> ActorStep:
         """
@@ -56,23 +55,22 @@ class Actor(ThunderModule):
         Raises:
             NotImplementedError: _description_
         """
-        dist, carry = self.forward(embedding, carry, backbones_kwargs, dist_kwargs)
-        action = dist.rsample()
-        log_prob = dist.log_prob(action)
+        dist, carry = self.forward(embedding, carry, backbone_kwargs, dist_kwargs)
+        action, log_prob = dist.rsample()
         return ActorStep(
             action=action,
             log_prob=log_prob,
             distribution=dist,
             carry=carry,
-            backbone_kwargs=backbones_kwargs,
+            backbone_kwargs=backbone_kwargs,
             dist_kwargs=dist_kwargs,
         )
 
-    def decision(
+    def determine(
         self,
         embedding: torch.Tensor | Dict[str, torch.Tensor],
         carry=None,
-        backbones_kwargs=None,
+        backbone_kwargs=None,
         dist_kwargs=None,
     ) -> ActorStep:
         """
@@ -84,7 +82,7 @@ class Actor(ThunderModule):
         Raises:
             NotImplementedError: _description_
         """
-        dist = self.forward(embedding, carry)
+        dist, carry = self.forward(embedding, carry, backbone_kwargs, dist_kwargs)
         action = dist.mean()
         log_prob = dist.log_prob(action)
         return ActorStep(action=action, log_prob=log_prob, distribution=dist, carry=carry)

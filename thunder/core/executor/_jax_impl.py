@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
 import flax.nnx as nnx
 import jax
@@ -16,6 +17,7 @@ from thunder.core.context import (
     ExecutionContext,
     ExecutionContextManager,
     OptimGroup,
+    OptimGroupSpec,
 )
 
 if TYPE_CHECKING:
@@ -182,7 +184,10 @@ class _DynamicScaler:
 
 jax.tree_util.register_pytree_node(
     _DynamicScaler,
-    lambda s: ((), (s.init_scale, s.growth_factor, s.backoff_factor, s.growth_interval)),
+    lambda s: (
+        (),
+        (s.init_scale, s.growth_factor, s.backoff_factor, s.growth_interval),
+    ),
     lambda aux, _: _DynamicScaler(*aux),
 )
 
@@ -202,9 +207,11 @@ class JaxExecutor:
         self.distributed = distributed
         self.donate = donate
         self._devices = self.devices(device)
-        self.compute_dtype = {"fp32": jnp.float32, "bf16": jnp.bfloat16, "fp16": jnp.float16}.get(
-            precision, jnp.float32
-        )
+        self.compute_dtype = {
+            "fp32": jnp.float32,
+            "bf16": jnp.bfloat16,
+            "fp16": jnp.float16,
+        }.get(precision, jnp.float32)
         self.mixed_precision = self.compute_dtype is not jnp.float32
         self.use_scaler = self.compute_dtype is jnp.float16
         self._mesh = None
@@ -212,7 +219,7 @@ class JaxExecutor:
     def init(
         self,
         models: ModelPack,
-        optim_config: Dict[str, Any],
+        optim_config: Dict[str, OptimGroupSpec | Dict[str, Any]],
         distributed_strategy: Optional[Callable[[Tuple, Any], Any]] = None,
     ) -> ExecutionContext:
         """ """
@@ -230,7 +237,9 @@ class JaxExecutor:
             )
 
         def apply_sharding_to_tree(params_tree):
-            strategy_fn = distributed_strategy or (lambda p, x: jax.sharding.PartitionSpec())
+            strategy_fn = distributed_strategy or (
+                lambda p, x: jax.sharding.PartitionSpec()
+            )
 
             def _map_fn(path, val):
                 spec = strategy_fn(path, val)
@@ -259,24 +268,25 @@ class JaxExecutor:
         # Initialize Optimize Group
         opt_groups: Dict[str, OptimGroup] = {}
         for opt_key, cfg in optim_config.items():
-            cfg = cfg.copy()
-            target_names = cfg.pop("targets")
-            if isinstance(target_names, str):
-                target_names = [target_names]
-            target_names = tuple(target_names)
-            target_modules = {t: getattr(models, t) for t in target_names}
+            spec = OptimGroupSpec.factory(cfg)
+            target_names = spec.target_names
+            target_modules = {t: getattr(wrapped_models, t) for t in target_names}
             scaler = _DynamicScaler() if self.use_scaler else _IdentityScaler()
             scaler_state = scaler.init()
             # Create Optax optimizer
-            cls_name = cfg.pop("class", "adam").lower()
-            lr = cfg.pop("lr", 3e-4)
-            tx = getattr(optax, cls_name)(learning_rate=lr, **cfg)
+            optim_cls = spec.optimizer or "adam"
+            lr = spec.lr if spec.lr is not None else 3e-4
+            optim_kwargs = dict(spec.kwargs)
+            if isinstance(optim_cls, str):
+                optim_cls = getattr(optax, optim_cls.lower())
+            tx = optim_cls(learning_rate=lr, **optim_kwargs)
             nnx_opt = nnx.Optimizer(nnx.Dict(target_modules), tx)
+            scheduler = self._init_scheduler(spec.scheduler)
             opt_groups[opt_key] = OptimGroup(
                 name=opt_key,
                 targets=target_names,
                 optimizer=nnx_opt,
-                scheduler=None,
+                scheduler=scheduler,
                 scaler=scaler,
                 scaler_state=scaler_state,
             )
@@ -286,6 +296,14 @@ class JaxExecutor:
         )
         ctx.update_meta(**meta)
         return ctx
+
+    @staticmethod
+    def _init_scheduler(scheduler_spec: Any) -> Any:
+        if scheduler_spec is None:
+            return None
+        if isinstance(scheduler_spec, type):
+            return scheduler_spec()
+        return scheduler_spec
 
     def init_manager(self) -> ExecutionContextManager:
         """ """
@@ -319,77 +337,86 @@ class JaxExecutor:
         ctx: ExecutionContext,
         opt: str,
         objectives: Tuple[Objective, ...],
-        max_grad_norm: float = 42.0,
-    ) -> Dict[str, Any]:
+        max_grad_norm: float = 1.0,
+    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
 
         group = ctx.opt_groups[opt]
-        nnx_opt = group.optimizer
-        scaler_state, metrics = self._jit_optimize(
-            ctx.models,
-            nnx_opt,
+        graphdef, state = nnx.split((ctx.models, group.optimizer))
+        state, scaler_state, metrics = self._jit_optimize(
+            graphdef,
+            state,
+            ctx.step,
+            ctx.batch,
+            ctx.cache,
             group.scaler,
             group.scaler_state,
-            ctx.batch,
             objectives,
             max_grad_norm,
-            self.compute_dtype,
         )
-        group.scaler_state = scaler_state
-        return metrics
+        nnx.update((ctx.models, group.optimizer), state)
+
+        new_group = replace(group, scaler_state=scaler_state)
+        new_opt_groups = dict(ctx.opt_groups)
+        new_opt_groups[opt] = new_group
+        return ctx.replace(opt_groups=new_opt_groups), metrics
 
     @staticmethod
-    @nnx.jit(static_argnames=["objectives", "compute_dtype", "scaler"])
+    @partial(jax.jit, static_argnames=["objectives", "scaler"])
     def _jit_optimize(
-        models: ModelPack,
-        optimizer: nnx.Optimizer,
+        graphdef: nnx.GraphDef,
+        state: nnx.State,
+        step: int,
+        batch: Batch,
+        data: Batch,
         scaler: _DynamicScaler | _IdentityScaler,
         scaler_state: ScaleState,
-        batch: Batch,
         objectives: Tuple[Objective, ...],
         max_grad_norm: float,
-        compute_dtype: jnp.dtype,
-    ) -> Tuple[ScaleState, Dict[str, Any]]:
-        full_graphdef, full_state = nnx.split(models)
-        optim_names = set(optimizer.model.keys())
-        _, frozen_state = nnx.split_state(full_state, lambda path, var: path[0] in optim_names, ...)
+    ) -> Tuple[nnx.State, ScaleState, Dict[str, Any]]:
+        """
+        TODO: Support Scheduler
+        """
+        models, optimizer = nnx.merge(graphdef, state)
+        optimizer: nnx.Optimizer
 
-        def loss_fn(opt_state: nnx.State):
-            """ """
-            if compute_dtype != jnp.float32:
-                cast_opt_state = jax.tree_util.tree_map(
-                    lambda x: x.astype(compute_dtype), opt_state
-                )
-                cast_frozen_state = jax.tree_util.tree_map(
-                    lambda x: x.astype(compute_dtype), frozen_state
-                )
-                local_models = nnx.merge(full_graphdef, cast_frozen_state, cast_opt_state)
-            else:
-                local_models = nnx.merge(full_graphdef, frozen_state, opt_state)
+        def loss_fn(opt_models):
+            opt_model_map = dict(opt_models.items())
+            local_models = type(models)(
+                **{
+                    name: opt_model_map.get(name, getattr(models, name))
+                    for name in models._fields
+                }
+            )
+            local_ctx = ExecutionContext(
+                step=step,
+                models=local_models,
+                opt_groups={},
+                executor=None,
+                manager=None,
+                cache=data,
+                batch=batch,
+            )
             total_loss = 0.0
             metrics = {}
             for obj in objectives:
-                l, m = obj.forward(batch, local_models)
+                l, m = obj.evaluate(local_ctx)
                 total_loss += l
                 metrics.update(m)
-            scaled_loss = scaler.scale(jnp.asarray(total_loss, dtype=jnp.float32), scaler_state)
+            total_loss = jnp.asarray(total_loss, dtype=jnp.float32)
+            metrics["loss_total"] = total_loss
+            scaled_loss = scaler.scale(total_loss, scaler_state)
             return scaled_loss, metrics
 
-        opt_state = nnx.state(optimizer.model)
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-        (loss, metrics), grads = grad_fn(opt_state)
+        (_, metrics), grads = grad_fn(optimizer.model)
         grads = scaler.unscale(grads, scaler_state)
         grad_norm = optax.tree.norm(grads)
-        # scale = jnp.where(
-        #     max_grad_norm > 0, jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6)), 1.0
-        # )
         scale = jnp.minimum(1.0, max_grad_norm / (grad_norm + 1e-6))
         grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
         scaler.step(optimizer, grads)
         new_scaler_state = scaler.update(scaler_state, grads)
-        # nnx.update(models, nnx.state(optimizer.model))
         metrics["grad_norm"] = optax.tree.norm(grads)
-        metrics["loss_total"] = loss
-        return new_scaler_state, metrics
+        return nnx.state((models, optimizer)), new_scaler_state, metrics
 
     @staticmethod
     def jit(fn: Optional[Callable] = None, **kwargs):
@@ -491,7 +518,9 @@ class JaxExecutor:
         try:
             from torch.utils.dlpack import to_dlpack
 
-            return jax.tree_util.tree_map(lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data)
+            return jax.tree_util.tree_map(
+                lambda x: jax.dlpack.from_dlpack(to_dlpack(x)), data
+            )
         except ImportError:
             raise ImportError("Please install `pytorch` to use `from_torch` function.")
 
