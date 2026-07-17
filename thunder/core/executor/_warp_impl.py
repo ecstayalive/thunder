@@ -14,4 +14,8 @@ if TYPE_CHECKING:
 class WarpExecutor:
     """ """
 
+    @staticmethod
+    def detach(data: Any) -> Any:
+        return data
+
     ...

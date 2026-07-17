@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+import math
 from typing import Iterable, TYPE_CHECKING
 
 import gymnasium as gym
@@ -18,19 +17,20 @@ from thunder.core import (
     Objective,
     Operation,
     Pipeline,
-    PipelineValidationError,
     Ref,
-    SYSTEM_EXACT_REFS,
 )
 from thunder.env.env import ThunderEnv
-from .buffer import gather
+from thunder.utils import Matrix, Scalar
+from .buffer import gather, gather_env
+from .env import EnvMetrics, NormalizeObsWrapper
 from .functional import get_trajectory_lengths
 
 if TYPE_CHECKING:
-    from thunder.nn.torch import GruMlp, LstmMlp, Normal
-    from .actor import Actor
+    from thunder.nn.torch import Distribution, GruMlp, LstmMlp
+    from thunder.utils import Workspace
     from .agent import Agent
     from .buffer import BatchSampler, Buffer
+    from .models import Actor
 
 
 class SIGRegObj(Objective):
@@ -128,25 +128,36 @@ class SIGRegObj(Objective):
 class Rollout(Operation):
     """ """
 
-    @dataclass
-    class EnvMetrics:
-        def update(self): ...
-        def compute(self): ...
-        def reset(self): ...
+    provides = ("batch", "cache")
 
-    def __init__(self, env: ThunderEnv, agent: Agent, step: int = 32, name="rollout"):
+    def __init__(
+        self,
+        env: ThunderEnv,
+        agent: Agent,
+        step: int = 32,
+        explore: bool = True,
+        name="rollout",
+    ):
         super().__init__(name)
         self.env = env
         self.step = step
         self.autoreset_mode = self.env.autoreset_mode
+        self.explore = explore
         self.agent = agent
+        self.metrics = EnvMetrics()
+        if isinstance(env, NormalizeObsWrapper):
+            env.train()
         self.obs, _ = env.reset()
 
     def forward(self, ctx: ExecutionContext | None = None):
+        self.metrics.reset(clear_episodes=False)
+        initial: Batch = self.agent.snapshot()
+        final: Batch | None = None
         with torch.inference_mode():
-            for _ in range(self.step):
-                action = self.agent.act(self.obs)
+            for i in range(self.step):
+                action = self.agent.act(self.obs, self.explore)
                 next_obs, rewards, terminated, timeouts, info = self.env.step(action)
+                self.metrics.update(rewards, terminated, timeouts, info)
                 self.agent.collect(
                     next_obs=next_obs,
                     rewards=rewards,
@@ -154,14 +165,18 @@ class Rollout(Operation):
                     timeouts=timeouts,
                     info=info,
                 )
+                if i == self.step - 1:
+                    final = self.agent.snapshot()
                 dones: torch.Tensor = (terminated | timeouts).bool()
-                reset_idx = dones.nonzero(as_tuple=False).squeeze(-1)
-                if self.autoreset_mode is gym.vector.AutoresetMode.DISABLED:
-                    next_obs, _ = self.env.reset(indices=reset_idx)
-                self.agent.reset(reset_idx)
+                if self.autoreset_mode is not gym.vector.AutoresetMode.SAME_STEP:
+                    reset_idx = dones.nonzero(as_tuple=False).squeeze(-1)
+                    if reset_idx.numel() > 0:
+                        next_obs, _ = self.env.reset(indices=reset_idx)
+                self.agent.reset(dones)
                 self.obs = next_obs
-        ctx = ctx.replace(batch=self.agent.buffer.data())
-        return ctx, info
+        cache = Batch(initial=initial, final=final)
+        ctx = ctx.replace(batch=self.agent.buffer.data(), cache=cache)
+        return ctx, self.metrics.compute()
 
     def __repr__(self):
         """ """
@@ -175,6 +190,101 @@ class Rollout(Operation):
                 "agent": type(self.agent).__name__,
                 "step": self.step,
                 "autoreset_mode": self.autoreset_mode.name,
+                "explore": self.explore,
+            }
+        )
+        return fields
+
+
+class Play(Operation):
+    """Actor-only inference loop for evaluation/play."""
+
+    def __init__(self, env: ThunderEnv, agent: Agent, explore: bool = False, name=""):
+        super().__init__(name)
+        self.env = env
+        self.autoreset_mode = self.env.autoreset_mode
+        self.explore = explore
+        self.agent = agent
+        self.env_metrics = EnvMetrics()
+        self.reward_manager = getattr(env.unwrapped, "reward_manager", None)
+        self.observation_manager = getattr(env.unwrapped, "observation_manager", None)
+        if isinstance(env, NormalizeObsWrapper):
+            env.eval()
+        self.obs, _ = env.reset()
+
+    def reward_terms(self) -> dict[str, torch.Tensor]:
+        """"""
+        if self.reward_manager is None:
+            return {}
+        step_reward = self.reward_manager._step_reward
+        return {
+            name: step_reward[:, i]
+            for i, name in enumerate(self.reward_manager.active_terms)
+        }
+
+    def observation_terms(self) -> dict[str, torch.Tensor]:
+        """"""
+        if self.observation_manager is None:
+            return {}
+        manager = self.observation_manager
+        terms = {}
+        for group, names in manager.active_terms.items():
+            group_obs = self.obs.get(group)
+            if group_obs is None:
+                continue
+            if manager.group_obs_concatenate[group]:
+                widths = [math.prod(s) for s in manager.group_obs_term_dim[group]]
+                group_obs = group_obs.split(widths, dim=-1)
+            terms.update({f"{group}/{n}": v for n, v in zip(names, group_obs)})
+        return terms
+
+    def reward_metrics(self) -> dict[str, Matrix]:
+        return {
+            f"RewardTerm/{name}": Matrix(value.detach())
+            for name, value in self.reward_terms().items()
+        }
+
+    def observation_metrics(self) -> dict[str, Matrix]:
+        return {
+            f"Observation/{name}": Matrix(value.detach())
+            for name, value in self.observation_terms().items()
+        }
+
+    def forward(self, ctx: ExecutionContext | None = None):
+        metrics = {}
+        self.env_metrics.reset(clear_episodes=False)
+        with torch.inference_mode():
+            action = self.agent.infer(self.obs, self.explore)
+            next_obs, rewards, terminated, timeouts, info = self.env.step(action)
+            self.env_metrics.update(rewards, terminated, timeouts, info)
+            dones: torch.Tensor = (terminated | timeouts).bool()
+            if self.autoreset_mode is not gym.vector.AutoresetMode.SAME_STEP:
+                reset_idx = dones.nonzero(as_tuple=False).squeeze(-1)
+                if reset_idx.numel() > 0:
+                    next_obs, _ = self.env.reset(indices=reset_idx)
+            self.agent.reset(dones)
+            self.obs = next_obs
+            metrics.update(self.env_metrics.compute())
+            metrics.update(self.reward_metrics())
+            metrics.update(self.observation_metrics())
+            metrics.update(
+                {
+                    "Action": Matrix(action.detach()),
+                    "Reward": Matrix(rewards.detach()),
+                    "Terminated": Matrix(terminated.float()),
+                    "Timeout": Matrix(timeouts.float()),
+                }
+            )
+        return ctx, metrics
+
+    def _repr_fields(self):
+        fields = super()._repr_fields()
+        fields.update(
+            {
+                "env": type(self.env).__name__,
+                "agent": type(self.agent).__name__,
+                "autoreset_mode": self.autoreset_mode.name,
+                "explore": self.explore,
             }
         )
         return fields
@@ -190,62 +300,46 @@ class MiniBatchLoop(Pipeline):
         jit: bool = False,
         epoch: int = 5,
         name="",
-        validate: str | None = "error",
     ):
         self.sampler = sampler
         self.epoch = epoch
-        super().__init__(pipeline, name=name, jit=jit, validate=validate)
+        super().__init__(pipeline, name=name, jit=jit)
 
     def setup(self):
         self._pipeline = tuple(self.pipeline)
-        pipeline_requires, pipeline_provides = self.analyze_contract(
-            exact_refs=SYSTEM_EXACT_REFS,
-            prefix_refs=(),
-        )
+        pipeline_requires, pipeline_provides = self.analyze_contract()
         self._bound_batch_requires = frozenset(
             ref for ref in pipeline_requires if ref.startswith("batch")
         )
-        self.requires = frozenset(
+        external_requires = frozenset(
             ref for ref in pipeline_requires if not ref.startswith("batch")
         )
+        self.requires = external_requires
+        if self._bound_batch_requires:
+            self.requires = frozenset((*self.requires, Ref("batch")))
         self.provides = frozenset(
             ref for ref in pipeline_provides if not ref.startswith("batch")
         )
-        self._scope_bound = not self._bound_batch_requires
-        self._validate_contract(
-            initial_exact_refs=(
-                *SYSTEM_EXACT_REFS,
+        self.validate(
+            initial_refs=(
                 *self._bound_batch_requires,
-                *self.requires,
-            ),
-            initial_prefix_refs=(),
-            mode=self._validate_mode,
+                *external_requires,
+            )
         )
         self.forward_fn = self._compile_forward()
-
-    def _bind_scope(self, ctx: ExecutionContext, batch: Batch) -> None:
-        inner_ctx = ctx.replace(batch=batch)
-        missing = tuple(
-            ref for ref in self._bound_batch_requires if not ref.exists(inner_ctx)
-        )
-        if missing:
-            raise PipelineValidationError(
-                f"OptimizeLoop '{self.name}' batch scope validation failed. "
-                f"Missing loader fields: {', '.join(map(repr, missing))}"
-            )
-        self._scope_bound = True
 
     def forward(self, ctx: ExecutionContext):
         m = {}
         batch = ctx.batch
+        cache = ctx.cache
         for _ in range(self.epoch):
             for rows, cols in self.sampler(batch):
-                if not self._scope_bound:
-                    self._bind_scope(ctx, batch)
-                mini_batch = gather(batch, rows, cols)
-                ctx = ctx.replace(batch=mini_batch)
+                ctx = ctx.replace(
+                    batch=gather(batch, rows, cols),
+                    cache=gather_env(cache, cols),
+                )
                 ctx, m = self.forward_fn(ctx)
-                ctx = ctx.replace(batch=batch)
+                ctx = ctx.replace(batch=batch, cache=cache)
         return ctx, m
 
     def _repr_fields(self):
@@ -262,10 +356,7 @@ class SoftUpdate(Operation):
         self.source = source
         self.target = target
         self.tau = tau
-        # Scheme
-        self.requires = frozenset(
-            {Ref(f"models[{source!r}]"), Ref(f"models[{target!r}]")}
-        )
+
         self.provides = frozenset()
 
     def forward(self, ctx: ExecutionContext):
@@ -290,10 +381,6 @@ class HardUpdate(Operation):
         super().__init__(name)
         self.source = source
         self.target = target
-        # Scheme
-        self.requires = frozenset(
-            {Ref(f"models[{source!r}]"), Ref(f"models[{target!r}]")}
-        )
         self.provides = frozenset()
 
     def forward(self, ctx: ExecutionContext):
@@ -312,7 +399,23 @@ class HardUpdate(Operation):
 
 
 class SplitTraj(Operation):
-    """ """
+    """Re-granulate an env-major rollout from per-env rows to per-trajectory rows.
+
+    Fully generic — no field is named. Both containers are transformed via a
+    parallel ``tree_map``:
+
+    - ``batch`` (dense per-step ``[N, L, ...]``): ``_split_leaf`` cuts each env's
+      timeline at dones and zero-pads the pieces into ``[num_trajs, chunk_len, ...]``
+      with a validity ``mask``;
+    - ``cache`` (sparse per-env ``[N, ...]`` boundary snapshots): ``_scatter_leaf``
+      scatters each env's value into that env's first trajectory and zeros the
+      rest — which equals the reset state ``agent.reset`` applies at episode
+      boundaries during rollout.
+
+    A recurrent forward regenerates intermediate states from the initial one, so
+    only the trajectory-start carry is needed. The carry layout is never inspected
+    here; consumers (e.g. a PPO loss) read whatever they placed in the cache.
+    """
 
     requires = ("batch.terminated", "batch.timeouts")
     provides = ("batch.mask",)
@@ -329,25 +432,31 @@ class SplitTraj(Operation):
         traj_lengths: torch.Tensor = get_trajectory_lengths(dones)
         num_trajs = traj_lengths.shape[0]
         row_indices = torch.arange(chunk_len, device=device).unsqueeze(0)
+        # Batch
         mask = traj_lengths.unsqueeze(1) > row_indices
+        # Cache
+        starts = torch.cumsum(traj_lengths, dim=0) - traj_lengths
+        leading = (starts % chunk_len) == 0
 
-        def _transform_leaf(leaf: torch.Tensor) -> torch.Tensor:
-            """ """
+        def _split_leaf(leaf: torch.Tensor | None) -> torch.Tensor:
+            """Per-step leaf [N, L, *] -> zero-padded per-trajectory [num_trajs, chunk_len, *]."""
             if leaf is None:
                 return None
-            flat_tensor = leaf.flatten(0, 1)
-            embedding_shape = flat_tensor.shape[1:]
-            # Allocate [Num_Trajs, Max_Len, ...]
-            pooled = torch.zeros(
-                (num_trajs, chunk_len, *embedding_shape),
-                dtype=flat_tensor.dtype,
-                device=device,
-            )
-            pooled[mask] = flat_tensor
+            pooled = leaf.new_zeros((num_trajs, chunk_len, *leaf.shape[2:]))
+            pooled[mask] = leaf.flatten(0, 1)
             return pooled
 
-        ctx.batch = pytree.tree_map(_transform_leaf, ctx.batch)
-        ctx.batch = ctx.batch.replace(mask=mask)
+        def _scatter_leaf(leaf: torch.Tensor | None) -> torch.Tensor:
+            """Per-env leaf [N, *] -> per-trajectory [num_trajs, *]: each env's value
+            into its first trajectory, zeros (reset) for the rest."""
+            if leaf is None:
+                return None
+            scattered = leaf.new_zeros((num_trajs, *leaf.shape[1:]))
+            scattered[leading] = leaf
+            return scattered
+
+        ctx.batch = pytree.tree_map(_split_leaf, ctx.batch).replace(mask=mask)
+        ctx.cache = pytree.tree_map(_scatter_leaf, ctx.cache)
         return ctx, {}
 
 
@@ -417,25 +526,40 @@ class UnpadTraj(Operation):
 
 
 class SaveModels(Operation):
+    """Periodically checkpoint model weights into a workspace.
+
+    The workspace is the single authority for the checkpoint directory and file
+    naming; this op no longer creates directories ad hoc.
+    """
+
     def __init__(
-        self, interval: int, path="./logs/models/", name="save_models", enable=True
+        self, interval: int, workspace: Workspace, name="save_models", enable=True
     ):
         super().__init__(name)
         self.interval = interval
         self.enable = enable
-        if not os.path.exists(path) and enable:
-            os.makedirs(path)
-        self.path = path
+        self.workspace = workspace
 
     def forward(self, ctx):
-        if self.enable and ctx.step % self.interval == 0:
-            torch.save(ctx.models.state_dict(), f"{self.path}/weights_{ctx.step}.pth")
+        if (
+            self.enable
+            and ctx.manager.is_main_process
+            and (ctx.step + 1) % self.interval == 0
+        ):
+            self.workspace.ensure()
+            torch.save(
+                ctx.models.state_dict(), self.workspace.checkpoint_path(ctx.step + 1)
+            )
         return ctx, {}
 
     def _repr_fields(self):
         fields = super()._repr_fields()
         fields.update(
-            {"interval": self.interval, "path": self.path, "enable": self.enable}
+            {
+                "interval": self.interval,
+                "path": str(self.workspace.checkpoint_dir),
+                "enable": self.enable,
+            }
         )
         return fields
 
@@ -460,13 +584,14 @@ class ComputeLastValue(Operation):
         "batch.terminated",
         "batch.values",
         "batch.timeouts",
-        "batch.next_critic_carry",
+        "batch.next_obs",
+        "cache.final.critic_carry",
     )
     provides = ("batch.next_values",)
 
     def __init__(
         self,
-        autoreset_mode: gym.vector.AutoresetMode.DISABLED = gym.vector.AutoresetMode.NEXT_STEP,
+        autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.NEXT_STEP,
         name="",
     ):
         super().__init__(name=name)
@@ -475,32 +600,26 @@ class ComputeLastValue(Operation):
     def forward(self, ctx):
         critic: LstmMlp | GruMlp = ctx.models.critic
         batch: Batch = ctx.batch
+        cache: Batch = ctx.cache
+
         terminated: torch.Tensor = batch.terminated.bool()
         timeouts: torch.Tensor = batch.timeouts.bool()
-
         next_values = torch.empty_like(batch.values)
         next_values[:, :-1] = batch.values[:, 1:]
 
-        critic_obs = (
-            batch.next_obs.get("critic", batch.next_obs["policy"])[:, -1]
-            .unsqueeze(1)
-            .contiguous()
-        )
-        critic_carry = pytree.tree_map(self._get_last_carry, batch.next_critic_carry)
+        last_obs = {
+            k: v[:, -1].unsqueeze(1).contiguous() for k, v in batch.next_obs.items()
+        }
         with torch.inference_mode():
-            last_values, _ = critic(critic_obs, critic_carry)
+            last_values, _ = critic(last_obs, cache.final.critic_carry)
         next_values[:, -1] = last_values.squeeze(-1).squeeze(1)
         next_values[terminated] = 0.0
         if self.autoreset_mode is gym.vector.AutoresetMode.SAME_STEP:
             next_values[timeouts & ~terminated] = batch.values[timeouts & ~terminated]
         ctx.batch = batch.replace(next_values=next_values)
+        ctx.cache = cache.replace(final=None)
 
         return ctx, {}
-
-    def _get_last_carry(self, leaf: torch.Tensor):
-        if leaf is None:
-            return None
-        return leaf[:, -1].transpose(0, 1).contiguous()
 
 
 class ComputeGae(Operation):
@@ -566,14 +685,14 @@ class ComputeGae(Operation):
         return fields
 
 
-class PpoSuggorateLoss(Objective):
+class PpoSurrogateLoss(Objective):
     requires = (
         "batch.obs",
         "batch.actions",
         "batch.advantages",
         "batch.mask",
         "batch.log_prob",
-        "batch.policy_carry",
+        "cache.initial.policy_carry",
     )
 
     def __init__(
@@ -581,7 +700,7 @@ class PpoSuggorateLoss(Objective):
         weight: float = 1.0,
         clip_ratio: float = 0.2,
         entropy_coef: float = 0.1,
-        name: str = "ppo_suggorate_loss",
+        name: str = "ppo_surrogate_loss",
     ):
         super().__init__(weight=weight, name=name)
         self.clip_ratio = clip_ratio
@@ -591,12 +710,11 @@ class PpoSuggorateLoss(Objective):
         batch: Batch = ctx.batch
         actor: Actor = ctx.models.actor
 
-        policy_carry0 = pytree.tree_map(self._get_carry0, batch["policy_carry"])
-        policy_obs = batch.obs["policy"]
-        dist, _ = actor(policy_obs, policy_carry0)
-        dist: Normal
+        dist, _ = actor(batch.obs, ctx.cache.initial.policy_carry)
+        dist: Distribution
         log_prob = dist.log_prob(batch.actions)
-        mask = batch.mask.bool()
+        mask = batch.mask.to(dtype=log_prob.dtype)
+        mask_count = mask.sum().clamp(min=1.0)
 
         log_ratio = log_prob - batch.log_prob
         ratio = torch.exp(log_ratio)
@@ -605,29 +723,27 @@ class PpoSuggorateLoss(Objective):
             torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
             * batch.advantages
         )
-        suggorate_loss = -torch.mean(torch.minimum(unclipped[mask], clipped[mask]))
-        entropy = dist.entropy()[mask]
-        loss = suggorate_loss - self.entropy_coef * entropy.mean()
+        suggorate_loss = -(torch.minimum(unclipped, clipped) * mask).sum() / mask_count
+        entropy = dist.entropy()
+        entropy_mean = (entropy * mask).sum() / mask_count
+        loss = suggorate_loss - self.entropy_coef * entropy_mean
 
         # Metrics
-        approx_kl = ((torch.exp(log_ratio) - 1.0) - log_ratio)[mask]
-        clip_fraction = ((ratio - 1.0).abs() > self.clip_ratio).float()[mask]
-        approx_kl_mean = approx_kl.detach().mean()
+        kl = (torch.exp(log_ratio) - 1.0) - log_ratio
+        clip_fraction = ((ratio - 1.0).abs() > self.clip_ratio).to(dtype=mask.dtype)
+        kl_mean = ((kl * mask).sum() / mask_count).detach()
+        ratio_mean = (ratio * mask).sum() / mask_count
+        clip_fraction_mean = (clip_fraction * mask).sum() / mask_count
         # exports
-        self.exports["approx_kl"] = approx_kl_mean
+        self.exports["kl"] = kl_mean
         return loss, {
-            "policy_loss": suggorate_loss.detach(),
-            "ratio": ratio[mask].detach().mean(),
-            "approx_kl": approx_kl_mean,
-            "clip_fraction": clip_fraction.detach().mean(),
-            "entropy": entropy.detach().mean(),
-            "std": dist.std().detach().mean(),
+            "policy_loss": Scalar(suggorate_loss.detach()),
+            "entropy": Scalar(entropy_mean.detach()),
+            "ratio": Scalar(ratio_mean.detach()),
+            "kl": Scalar(kl_mean),
+            "clip_fraction": Scalar(clip_fraction_mean.detach()),
+            "std": Scalar(dist.std().detach().mean()),
         }
-
-    def _get_carry0(self, leaf):
-        if leaf is None:
-            return None
-        return leaf[:, 0].transpose(0, 1).contiguous()
 
     def _repr_fields(self):
         fields = super()._repr_fields()
@@ -642,7 +758,7 @@ class CriticLoss(Objective):
     requires = (
         "batch.mask",
         "batch.obs",
-        "batch.critic_carry",
+        "cache.initial.critic_carry",
         "batch.returns",
         "batch.values",
     )
@@ -654,26 +770,32 @@ class CriticLoss(Objective):
         self.value_clip = value_clip
 
     def compute(self, ctx: ExecutionContext):
-        batch = ctx.batch
+        batch: Batch = ctx.batch
         critic: GruMlp | LstmMlp = ctx.models.critic
-        critic_carry0 = pytree.tree_map(self._get_carry0, batch["critic_carry"])
-        critic_obs = batch.obs.get("critic", batch.obs["policy"])
-        value, _ = critic(critic_obs, critic_carry0)
+        value, _ = critic(batch.obs, ctx.cache.initial.critic_carry)
         value = value.squeeze(-1)
+        mask = batch.mask.to(dtype=value.dtype)
+        mask_count = mask.sum().clamp(min=1.0)
         delta_value = value - batch.values
         clipped_value = batch.values + delta_value.clamp(
             -self.value_clip, self.value_clip
         )
-        value_loss = torch.maximum(
-            (value - batch.returns).square(),
-            (clipped_value - batch.returns).square(),
-        )[batch.mask]
-        return value_loss.mean(), {"value": value[batch.mask].mean()}
-
-    def _get_carry0(self, leaf):
-        if leaf is None:
-            return None
-        return leaf[:, 0].transpose(0, 1).contiguous()
+        value_loss = (value - batch.returns).square()
+        clipped_value_loss = (clipped_value - batch.returns).square()
+        loss = (torch.maximum(value_loss, clipped_value_loss) * mask).sum() / mask_count
+        # Metrics
+        clip_fraction = (delta_value.abs() > self.value_clip).to(dtype=mask.dtype)
+        return loss, {
+            "value_loss": Scalar(((value_loss * mask).sum() / mask_count).detach()),
+            "clipped_value_loss": Scalar(
+                ((clipped_value_loss * mask).sum() / mask_count).detach()
+            ),
+            "value_clip_fraction": Scalar(
+                ((clip_fraction * mask).sum() / mask_count).detach()
+            ),
+            "value": Scalar(((value * mask).sum() / mask_count).detach()),
+            "returns": Scalar(((batch.returns * mask).sum() / mask_count).detach()),
+        }
 
     def _repr_fields(self):
         fields = super()._repr_fields()

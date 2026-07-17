@@ -1,13 +1,23 @@
 import math
 import warnings
-from typing import Optional, Tuple, TypeVar
+from dataclasses import dataclass
+from typing import ClassVar, Optional, Tuple, Type, TypeVar
+
+from .activation import resolve_activation
 
 import torch
 import torch.nn as nn
 
-from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
+from .base import ModelSpec
 
-__all__ = ["_ConvNdBlock", "Conv1dBlock", "Conv2dBlock", "ResBasicBlock", "ResBottleneckBlock"]
+__all__ = [
+    "_ConvNdBlock",
+    "Conv1dBlock",
+    "Conv2dBlock",
+    "ResBasicBlock",
+    "ResBottleneckBlock",
+    "CnnSpec",
+]
 
 
 T = TypeVar("T")
@@ -45,15 +55,23 @@ class _ConvNdBlock(nn.Module):
         self.channels = channels
         self.conv_nums: int = len(channels)
         self.kernel_sizes = kernel_sizes
-        self.strides = tuple(1 for _ in range(self.conv_nums)) if strides is None else strides
-        self.paddings = tuple(0 for _ in range(self.conv_nums)) if paddings is None else paddings
-        self.dilations = tuple(1 for _ in range(self.conv_nums)) if dilations is None else dilations
+        self.strides = (
+            tuple(1 for _ in range(self.conv_nums)) if strides is None else strides
+        )
+        self.paddings = (
+            tuple(0 for _ in range(self.conv_nums)) if paddings is None else paddings
+        )
+        self.dilations = (
+            tuple(1 for _ in range(self.conv_nums)) if dilations is None else dilations
+        )
         # Pooling
         self.pool_kernel = pool_kernel
         self.pool_nums: int = 0 if pool_kernel is None else len(pool_kernel)
         assert self.pool_nums < self.conv_nums, "Too many pooling layers."
         self.pool_interval: int = (
-            self.conv_nums if pool_kernel is None else self.conv_nums // (self.pool_nums + 1)
+            self.conv_nums
+            if pool_kernel is None
+            else self.conv_nums // (self.pool_nums + 1)
         )
         # Output shape
         if gap:
@@ -65,8 +83,7 @@ class _ConvNdBlock(nn.Module):
             self.out_channels: int = self.channels[-1]
             self.out_features: int = math.prod(self.out_shape)
         # Activation
-        activation_name = ACTIVATION_CLS_NAME[activation.lower()]
-        self.activation_cls = getattr(nn, activation_name)
+        self.activation_cls = resolve_activation(activation)
         self.activate_output = activate_output
 
     @staticmethod
@@ -177,10 +194,16 @@ class Conv1dBlock(_ConvNdBlock):
                 and i // self.pool_interval < self.pool_nums
                 and self.pool_kernel is not None
             ):
-                layers.append(nn.MaxPool1d(kernel_size=pool_kernel[i // self.pool_interval]))
+                layers.append(
+                    nn.MaxPool1d(kernel_size=pool_kernel[i // self.pool_interval])
+                )
         layers.append(
             nn.Conv1d(
-                self.in_channels if self.conv_nums == 1 else self.channels[self.conv_nums - 2],
+                (
+                    self.in_channels
+                    if self.conv_nums == 1
+                    else self.channels[self.conv_nums - 2]
+                ),
                 self.channels[self.conv_nums - 1],
                 self.kernel_sizes[self.conv_nums - 1],
                 self.strides[self.conv_nums - 1],
@@ -261,10 +284,16 @@ class Conv2dBlock(_ConvNdBlock):
                 and i // self.pool_interval < self.pool_nums
                 and self.pool_kernel is not None
             ):
-                layers.append(nn.MaxPool2d(kernel_size=pool_kernel[i // self.pool_interval]))
+                layers.append(
+                    nn.MaxPool2d(kernel_size=pool_kernel[i // self.pool_interval])
+                )
         layers.append(
             nn.Conv2d(
-                self.in_channels if self.conv_nums == 1 else self.channels[self.conv_nums - 2],
+                (
+                    self.in_channels
+                    if self.conv_nums == 1
+                    else self.channels[self.conv_nums - 2]
+                ),
                 self.channels[self.conv_nums - 1],
                 self.kernel_sizes[self.conv_nums - 1],
                 self.strides[self.conv_nums - 1],
@@ -306,8 +335,7 @@ class ResBasicBlock(nn.Module):
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        activation_name = ACTIVATION_CLS_NAME[activation.lower()]
-        activation_instance = getattr(nn, activation_name)
+        activation_instance = resolve_activation(activation)
         out_channels = in_channels
         straight_pass_layers = [
             nn.Conv2d(
@@ -356,10 +384,11 @@ class ResBottleneckBlock(nn.Module):
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        activation_name = ACTIVATION_CLS_NAME[activation.lower()]
-        activation_instance = getattr(nn, activation_name)
+        activation_instance = resolve_activation(activation)
         if in_channels == out_channels:
-            warnings.warn("The input channel should be different with the output channel.")
+            warnings.warn(
+                "The input channel should be different with the output channel."
+            )
         straight_pass_layers = [
             nn.Conv2d(
                 in_channels,
@@ -392,3 +421,44 @@ class ResBottleneckBlock(nn.Module):
         straight_output = self.straight_pass(input)
         short_cut_output = self.short_cut_pass(input)
         return straight_output + short_cut_output
+
+
+class _Cnn(nn.Module):
+    """Runs a :class:`Conv2dBlock` (global-avg-pooled) over an image stream then
+    projects to ``out_shape``, following ``forward(input, carry=None) -> (output, carry)``.
+
+    Folds the leading time axis into the batch so the conv sees ``[B*L, C, H, W]``:
+    inputs are ``[B, L, C, H, W]`` and outputs ``[B, L, out_shape]``; ``carry`` is
+    passed through (a CNN is stateless).
+    """
+
+    def __init__(self, conv: Conv2dBlock, proj: nn.Linear):
+        super().__init__()
+        self.conv = conv
+        self.proj = proj
+
+    def forward(self, input: torch.Tensor, carry=None):
+        b, l = input.shape[:2]
+        x = self.conv(input.reshape(b * l, *input.shape[2:]))
+        x = self.proj(x.reshape(b * l, -1))
+        return x.reshape(b, l, -1), carry
+
+
+@dataclass
+class CnnSpec(ModelSpec):
+    channels: Tuple[int, ...] = (32, 64)
+    kernel_sizes: Tuple[int, ...] = (3, 3)
+    activation: str = "mish"
+
+    class_type: ClassVar[Type[nn.Module]] = Conv2dBlock
+
+    def factory(self, *in_shapes, **ctx) -> _Cnn:
+        conv = self.class_type(
+            in_shape=tuple(in_shapes[0]),
+            channels=self.channels,
+            kernel_sizes=self.kernel_sizes,
+            activation=self.activation,
+            gap=True,
+        )
+        proj = nn.Linear(self.channels[-1], self.out_shape)
+        return _Cnn(conv, proj)

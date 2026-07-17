@@ -1,18 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.utils._cxx_pytree as pytree
 
 from thunder.core import Batch, Executor, ModelPack, OptimGroupSpec, OptimizeOp
 from thunder.env import ThunderEnv
-from thunder.nn.torch import ConsistentNormalHead, DictRunningNorm1d, GruMlp, LstmMlp
-from ..actor import Actor
-from ..operations import *
+from thunder.nn.torch import DictRunningNorm1d
+
 from ..buffer import Buffer, SequenceBatchSampler
+from ..models import Actor, ActorSpec, Critic, CriticSpec
+from ..operations import (
+    ClearBuffer,
+    ComputeGae,
+    ComputeLastValue,
+    CriticLoss,
+    MiniBatchLoop,
+    PpoSurrogateLoss,
+    Rollout,
+    SplitTraj,
+)
 from ..scheduler import AdaptiveKlSchedulerSpec
 from .agent import Agent, AgentSpec
 
@@ -20,7 +29,7 @@ if TYPE_CHECKING:
 
     class PpoModelPack:
         actor: Actor
-        critic: GruMlp
+        critic: Critic
 
 
 @dataclass
@@ -28,38 +37,31 @@ class PpoAgentSpec(AgentSpec):
     name: str = "ppo"
     running_norm: bool = True
     # ppo hyperparmeters
-    gamma: float = 0.996
+    gamma: float = 0.99
     lambda_: float = 0.95
     clip_ratio: float = 0.2
     value_clip: float = 0.2
     value_loss_coef: float = 0.5
-    entropy_coef: float = 0.005
+    entropy_coef: float = 0.0
     # optimizer hyperparameters
     num_epochs: int = 5
     lr: float = 5e-4
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 1.0
     enable_scheduler: bool = True
     desired_kl: float = 0.01
     min_lr: float = 1e-5
     max_lr: float = 1e-2
     lr_factor: float = 1.2
-    # model hyperparameters
-    rnn_hidden_size: int = 128
-    d_model: int = 128
-    mlp_shape: tuple[int, ...] = (256, 256)
-    activation: str = "mish"
-    init_std: float = 0.3
-    min_std: float = 0.1
-    max_std: float = 1.0
     compile: bool = True
-    resume: str | None = None
+    # model: defaults reproduce the original GruMlp actor + ConsistentNormal head / GruMlp critic
+    actor: ActorSpec = field(default_factory=ActorSpec)
+    critic: CriticSpec = field(default_factory=CriticSpec)
     # buffer hyperparameters
     rollout_steps: int = 32
     minibatch_size: int = 1024
 
 
 class PpoAgent(Agent):
-
     def __init__(self, models: PpoModelPack, **kwargs):
         super().__init__(models=models, **kwargs)
         self.t = Batch()
@@ -67,35 +69,35 @@ class PpoAgent(Agent):
         self.critic_carry: torch.Tensor = None
         self.models: PpoModelPack
         self.actor: Actor = self.models.actor
-        self.critic: GruMlp | LstmMlp = self.models.critic
+        self.critic: Critic = self.models.critic
 
-    def _carry_transpose(self, carry):
-        if carry is None:
-            return None
-        return carry.transpose(0, 1)
-
-    def act(self, obs):
+    def act(self, obs, explore: bool = True):
+        self.t = Batch()
         self.t.obs = obs
-        # actor
-        self.t["policy_carry"] = pytree.tree_map(
-            self._carry_transpose, self.policy_carry
-        )
-        policy_obs = obs["policy"].unsqueeze(1)
-        _step = self.actor.explore(policy_obs, self.policy_carry)
+        obs_seq = {k: v.unsqueeze(1) for k, v in obs.items()}
+        if explore:
+            _step = self.actor.explore(obs_seq, self.policy_carry)
+        else:
+            _step = self.actor.determine(obs_seq, self.policy_carry)
         self.policy_carry = _step.carry
-        self.t["next_policy_carry"] = self.policy_carry
         self.t.actions = _step.action.squeeze(1)
         self.t["log_prob"] = _step.log_prob.squeeze(1)
         # critic
-        self.t["critic_carry"] = pytree.tree_map(
-            self._carry_transpose, self.critic_carry
-        )
-        critic_obs = obs.get("critic", obs["policy"]).unsqueeze(1)
-        value, self.critic_carry = self.critic(critic_obs, self.critic_carry)
-        self.t["next_critic_carry"] = self.critic_carry
+        value, self.critic_carry = self.critic(obs_seq, self.critic_carry)
+        value: torch.Tensor
         self.t.values = value.squeeze(-1).squeeze(1)
 
         return self.t.actions
+
+    def infer(self, obs, explore: bool = False):
+        # add a length-1 time axis to every obs stream for the sequence models
+        obs_seq = {k: v.unsqueeze(1) for k, v in obs.items()}
+        if explore:
+            _step = self.actor.explore(obs_seq, self.policy_carry)
+        else:
+            _step = self.actor.determine(obs_seq, self.policy_carry)
+        self.policy_carry = _step.carry
+        return _step.action.squeeze(1)
 
     def collect(self, **kwargs):
         self.t.next_obs = kwargs["next_obs"]
@@ -105,71 +107,57 @@ class PpoAgent(Agent):
         self.buffer.add_transition(self.t)
         self.t = Batch()
 
-    def reset(self, indices):
+    def reset(self, dones: torch.Tensor):
+        dones = dones.bool().reshape(-1)
 
-        def _reset_leaf(hidden_state: torch.Tensor):
+        def _reset_leaf(hidden_state: torch.Tensor | None):
             if hidden_state is None:
                 return None
-            # For Mamba and Transformer, dim=0
-            # For LSTM/GRU, dim=1
-            hidden_state = hidden_state.index_fill(1, indices, 0.0)
-            return hidden_state
+            mask = dones.to(device=hidden_state.device)
+            shape = [1] * hidden_state.ndim
+            shape[0] = mask.numel()
+            keep = (~mask).reshape(shape).to(dtype=hidden_state.dtype)
+            return hidden_state * keep
 
         self.policy_carry = pytree.tree_map(_reset_leaf, self.policy_carry)
         self.critic_carry = pytree.tree_map(_reset_leaf, self.critic_carry)
 
-    @classmethod
-    def factory(cls, env: ThunderEnv, spec: PpoAgentSpec) -> PpoAgent:
-        obs, _ = env.reset()
-        policy_obs_dim = obs["policy"].shape[-1]
-        critic_obs_dim = obs.get("critic", obs["policy"]).shape[-1]
-        action_dim = env.action_space.shape[-1]
-        actor = Actor(
-            backbone=GruMlp(
-                policy_obs_dim,
-                spec.d_model,
-                spec.rnn_hidden_size,
-                [],
-                rnn_batch_first=True,
-            ),
-            dist=ConsistentNormalHead(
-                spec.d_model,
-                action_dim,
-                hidden_features=spec.mlp_shape,
-                activation=spec.activation,
-                init_std=spec.init_std,
-                min_std=spec.min_std,
-                max_std=spec.max_std,
-                event_shape=torch.Size([action_dim]),
-            ),
-        )
-        critic = GruMlp(
-            critic_obs_dim,
-            1,
-            spec.rnn_hidden_size,
-            spec.mlp_shape,
-            rnn_batch_first=True,
-        )
-        if spec.running_norm:
-            from thunder.rl.torch.env import ObsNormalizationWrapper
+    def snapshot(self) -> Batch:
+        """Capture the agent's internal recurrent state at the current step."""
+        return Batch(policy_carry=self.policy_carry, critic_carry=self.critic_carry)
 
-            norm_specs = {"policy": policy_obs_dim}
-            if "critic" in obs:
-                norm_specs["critic"] = critic_obs_dim
+    @classmethod
+    def factory(
+        cls, env: ThunderEnv, spec: PpoAgentSpec
+    ) -> Tuple[PpoAgent, ThunderEnv]:
+        # per-key feature shape: int dim for vectors, (C, H, W) tuple for images
+        obs_shapes = {
+            k: (s.shape[-1] if len(s.shape) == 1 else tuple(s.shape))
+            for k, s in env.single_observation_space.items()
+        }
+        action_dim = env.single_action_space.shape[-1]
+        actor = spec.actor.factory(obs_shapes, action_dim)
+        critic = spec.critic.factory(obs_shapes)
+        if spec.running_norm:
+            from thunder.rl.torch.env import NormalizeObsWrapper
+
+            norm_specs = {
+                k: obs_shapes[k]
+                for k in (*spec.actor.obs_keys, *spec.critic.obs_keys)
+                if isinstance(obs_shapes[k], int)
+            }
             normalizer = DictRunningNorm1d(norm_specs)
-            env = ObsNormalizationWrapper(env, normalizer)
+            env = NormalizeObsWrapper(env, normalizer)
             models = ModelPack(actor=actor, critic=critic, normalizer=normalizer)
         else:
             models = ModelPack(actor=actor, critic=critic)
-        if spec.resume is not None:
-            models.load_state_dict(torch.load(spec.resume))
         executor = Executor(
             precision=spec.precision, device=spec.device, compile=spec.compile
         )
         buffer = Buffer(capacity=spec.rollout_steps, device=executor.default_device())
         scheduler = (
             AdaptiveKlSchedulerSpec(
-                key="approx_kl",
+                key="kl",
                 desired_kl=spec.desired_kl,
                 min_lr=spec.min_lr,
                 max_lr=spec.max_lr,
@@ -185,12 +173,17 @@ class PpoAgent(Agent):
             optim_config={
                 "ppo": OptimGroupSpec(
                     targets=("actor", "critic"),
-                    optimizer=torch.optim.Adam,
+                    optimizer=torch.optim.AdamW,
                     lr=spec.lr,
                     scheduler=scheduler,
+                    kwargs={"capturable": True, "weight_decay": 0.0},
                 )
             },
         )
+        if spec.resume is not None:
+            agent.models.load_state_dict(
+                torch.load(spec.resume, map_location=spec.device)
+            )
         agent.setup_pipeline(
             [
                 Rollout(env, agent, step=spec.rollout_steps),
@@ -203,7 +196,7 @@ class PpoAgent(Agent):
                         OptimizeOp(
                             "ppo",
                             (
-                                PpoSuggorateLoss(
+                                PpoSurrogateLoss(
                                     weight=1.0,
                                     clip_ratio=spec.clip_ratio,
                                     entropy_coef=spec.entropy_coef,

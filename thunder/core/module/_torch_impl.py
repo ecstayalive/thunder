@@ -27,13 +27,44 @@ class TorchModelPack(nn.Module):
         for k in self._keys:
             yield k, getattr(self, k)
 
-    # def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
-    #     super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+    @staticmethod
+    def _unwrap(module: nn.Module) -> nn.Module:
+        """Peel the executor's runtime wrappers down to the canonical module."""
+        while True:
+            if isinstance(module, nn.parallel.DistributedDataParallel):
+                module = module.module
+            elif hasattr(module, "_orig_mod"):
+                module = module._orig_mod
+            else:
+                return module
 
-    # def load_state_dict(
-    #     self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
-    # ):
-    #     super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
+    def state_dict(self, *, keep_vars: bool = False) -> Dict[str, torch.Tensor]:
+        out = {}
+        for name, module in self.items():
+            sub = self._unwrap(module).state_dict(keep_vars=keep_vars)
+            out.update({f"{name}.{key}": value for key, value in sub.items()})
+        return out
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
+        # Canonicalize first so checkpoints written by older versions (with
+        # wrapper segments baked into the keys) keep loading.
+        def canonical(key: str) -> str:
+            segments = (s for s in key.split(".") if s not in ("module", "_orig_mod"))
+            return ".".join(segments)
+
+        state_dict = {canonical(key): value for key, value in state_dict.items()}
+        if strict:
+            stray = [k for k in state_dict if k.split(".", 1)[0] not in self._keys]
+            if stray:
+                raise KeyError(f"Unexpected model keys in state_dict: {stray}")
+        for name, module in self.items():
+            prefix = f"{name}."
+            sub = {
+                key[len(prefix) :]: value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+            self._unwrap(module).load_state_dict(sub, strict=strict)
 
     @property
     def _fields(self):
@@ -47,6 +78,9 @@ class TorchModule(nn.Module, ABC):
 
     @abstractmethod
     def forward(
-        self, embedding: torch.Tensor | Dict[str, torch.Tensor], carry: Any = None, **kwargs
+        self,
+        embedding: torch.Tensor | Dict[str, torch.Tensor],
+        carry: Any = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         pass

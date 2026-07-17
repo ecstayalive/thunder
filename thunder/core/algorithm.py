@@ -25,7 +25,7 @@ class Algorithm(ABC):
         executor: Optional[Executor] = None,
         optim_config: Optional[Dict[str, Any]] = None,
         pipeline: Optional[Pipeline | Iterable[Operation]] = None,
-        name: str = "algorithm",
+        name: str = "",
     ):
         self.name = name
         self.models = models
@@ -79,8 +79,8 @@ class Algorithm(ABC):
         self.ctx = self.ctx.replace(batch=batch)
         with self.ctx.manager:
             self.ctx, metrics = self.pipeline(self.ctx)
+        # self.executor.reduce_mean(metrics)
         self.ctx = self.ctx.replace(step=self.ctx.step + 1)
-        metrics.update({"ExecutionContext": self.ctx})
         return metrics
 
     def __repr__(self):

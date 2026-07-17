@@ -3,18 +3,39 @@ from __future__ import annotations
 from typing import Any, Generator, Iterator, Optional, Tuple
 
 import torch
-import torch.utils._pytree as pytree
+import torch.utils._cxx_pytree as pytree
 
 from thunder.core import Batch, Executor
 
 
 def gather(data: Batch, rows: torch.Tensor, cols: torch.Tensor) -> Batch:
-    """ """
+    """
+    Args:
+    """
 
     def _gather(leaf):
         if leaf is None:
             return None
         return leaf[cols, rows]
+
+    return pytree.tree_map(_gather, data)
+
+
+def gather_env(data: Batch, cols: torch.Tensor) -> Batch:
+    """Gather time-less, per-env leaves (e.g. a rollout-boundary cache snapshot).
+
+    Takes the same env-index tensor ``cols`` that :func:`gather` consumes and
+    reduces it to one env id per output row, per the sampler contract: ``cols`` is
+    ``[B, T]`` for sequence/chunk samplers (env id is constant along each row) or
+    ``[B]`` for per-transition samplers. Unlike :func:`gather`, the per-env
+    snapshot has no time axis, so only the env index is applied."""
+
+    env_ids = cols[:, 0] if cols.ndim == 2 else cols
+
+    def _gather(leaf):
+        if leaf is None:
+            return None
+        return leaf[env_ids]
 
     return pytree.tree_map(_gather, data)
 

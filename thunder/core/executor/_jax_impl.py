@@ -367,7 +367,7 @@ class JaxExecutor:
         state: nnx.State,
         step: int,
         batch: Batch,
-        data: Batch,
+        cache: Batch,
         scaler: _DynamicScaler | _IdentityScaler,
         scaler_state: ScaleState,
         objectives: Tuple[Objective, ...],
@@ -393,7 +393,7 @@ class JaxExecutor:
                 opt_groups={},
                 executor=None,
                 manager=None,
-                cache=data,
+                cache=cache,
                 batch=batch,
             )
             total_loss = 0.0
@@ -403,7 +403,7 @@ class JaxExecutor:
                 total_loss += l
                 metrics.update(m)
             total_loss = jnp.asarray(total_loss, dtype=jnp.float32)
-            metrics["loss_total"] = total_loss
+            # metrics["loss_total"] = total_loss
             scaled_loss = scaler.scale(total_loss, scaler_state)
             return scaled_loss, metrics
 
@@ -415,7 +415,7 @@ class JaxExecutor:
         grads = jax.tree_util.tree_map(lambda g: g * scale, grads)
         scaler.step(optimizer, grads)
         new_scaler_state = scaler.update(scaler_state, grads)
-        metrics["grad_norm"] = optax.tree.norm(grads)
+        # metrics["grad_norm"] = optax.tree.norm(grads)
         return nnx.state((models, optimizer)), new_scaler_state, metrics
 
     @staticmethod
@@ -445,6 +445,16 @@ class JaxExecutor:
     @staticmethod
     def to_device(data: Any, device: Optional[Any | str] = None):
         return jax.device_put(data, JaxExecutor.default_device(device))
+
+    @staticmethod
+    def detach(data: Any):
+        def _detach(x):
+            try:
+                return jax.lax.stop_gradient(x)
+            except TypeError:
+                return x
+
+        return jax.tree_util.tree_map(_detach, data)
 
     @staticmethod
     def to_numpy(data: Any):

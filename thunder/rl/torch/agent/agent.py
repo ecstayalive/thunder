@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from typing import Any, Dict, Iterable, Literal, Optional, TYPE_CHECKING
 
-from thunder.core import Algorithm, Executor, ModelPack, Operation, Pipeline
+from thunder.core import Algorithm, AttrData, Executor, ModelPack, Operation, Pipeline
 
 from ..buffer import Buffer
 
@@ -17,6 +17,8 @@ class AgentSpec:
     name: str
     device: str = "cuda:0"
     precision: Literal["fp32", "fp16", "bf16"] = "fp32"
+    compile: bool = False
+    resume: str | None = None
 
 
 class Agent(Algorithm):
@@ -34,13 +36,23 @@ class Agent(Algorithm):
         super().__init__(models, executor, optim_config, pipeline, name=name)
         self.buffer = buffer if buffer is not None else Buffer()
 
-    def act(self, obs):
+    def act(self, obs, explore: bool = True):
         """_summary_
 
         Args:
             obs (_type_): _description_
         """
-        pass
+        raise NotImplementedError
+
+    def infer(self, obs, explore: bool = False):
+        """Inference-only action selection: no value estimation and no
+        trajectory bookkeeping. Used by evaluation/play pipelines.
+
+        Args:
+            obs: Batched observations from the environment.
+            explore: Sample from the policy distribution instead of its mode.
+        """
+        raise NotImplementedError
 
     def collect(self, **kwargs):
         """_summary_
@@ -48,15 +60,18 @@ class Agent(Algorithm):
         Args:
             **kwargs: _description_
         """
-        pass
+        return
 
-    def reset(self, indices):
+    def reset(self, dones):
         """_summary_
 
         Args:
-            indices (int): _description_
+            dones: Boolean mask of environments whose agent state should reset.
         """
-        pass
+        return
+
+    def snapshot(self) -> AttrData:
+        return AttrData()
 
     @classmethod
     def factory(cls, env: ThunderEnv, spec: AgentSpec, **kwargs) -> Agent:
@@ -66,4 +81,4 @@ class Agent(Algorithm):
             env (ThunderEnvWrapper): _description_
             **kwargs: _description_
         """
-        pass
+        raise NotImplementedError

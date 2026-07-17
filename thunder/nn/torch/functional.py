@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -37,6 +38,34 @@ def squash(input: Tensor, dim: int = -1, keepdim: bool = True) -> Tensor:
 
 
 @torch.compile
+def swiglu(input: Tensor, dim: int = -1) -> Tensor:
+    r"""SwiGLU gated activation, splits ``input`` into gate and value halves
+    along ``dim`` and returns ``silu(gate) * value``, halving the size of ``dim``.
+    For details: https://arxiv.org/abs/2002.05202
+
+    Args:
+        input: input feature vectors, the size of ``dim`` must be even
+        dim: the dimension split into gate and value halves
+
+    Returns:
+        The gated feature vectors, with the size of ``dim`` halved
+
+    Examples:
+
+        >>> input = torch.randn(1, 10, 8)
+        >>> output = swiglu(input)
+        >>> print(output.shape)
+            torch.Size([1, 10, 4])
+    """
+    if input.shape[dim] % 2 != 0:
+        raise ValueError(
+            f"swiglu requires an even size along dim {dim}, got {input.shape[dim]}"
+        )
+    gate, value = input.chunk(2, dim=dim)
+    return F.silu(gate) * value
+
+
+@torch.compile
 def inverse_softplus(input: Tensor) -> Tensor:
     r"""Inverse softplus function
     For details: https://github.com/pytorch/pytorch/issues/72759
@@ -57,7 +86,9 @@ def inverse_softplus(input: Tensor) -> Tensor:
 
 
 @torch.compile
-def position_embedding_2d(channels: int, height: int, width: int, temperature: int = 10000):
+def position_embedding_2d(
+    channels: int, height: int, width: int, temperature: int = 10000
+):
     """This is position embedding for spatial attention.
     For spatial attention, d_model can be considered as the channel dimension.
     Half channel stores its height information, half channel stores its width information.
@@ -81,7 +112,11 @@ def position_embedding_2d(channels: int, height: int, width: int, temperature: i
     pe_x[:, 0::2] = x_ang.sin()
     pe_x[:, 1::2] = x_ang.cos()
     pe_full = torch.cat(
-        [pe_y.unsqueeze(1).expand(-1, width, -1), pe_x.unsqueeze(0).expand(height, -1, -1)], dim=-1
+        [
+            pe_y.unsqueeze(1).expand(-1, width, -1),
+            pe_x.unsqueeze(0).expand(height, -1, -1),
+        ],
+        dim=-1,
     )
     # [H, W, C] -> [C, H, W]
     return pe_full.permute(2, 0, 1)

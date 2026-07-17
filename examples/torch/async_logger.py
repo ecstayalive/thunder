@@ -1,9 +1,12 @@
 import time
 
-from thunder.utils.torch import *
+import torch
+
+from thunder.utils import AsyncLogger, Scalar, TensorBoardLogger, Workspace
 
 if __name__ == "__main__":
-    tb_logger = TensorBoardLogger(log_dir="./logs/thunder/tests")
+    workspace = Workspace("./logs", "thunder/tests", run_name="async_logger")
+    tb_logger = TensorBoardLogger(workspace)
 
     logger = AsyncLogger([tb_logger])
 
@@ -12,7 +15,7 @@ if __name__ == "__main__":
     for i in range(100):
         data = torch.randn(100, 100, device=device)
         loss = data.mean()
-        logger.log({"loss": loss}, step=i)
+        logger.log({"loss": Scalar(loss.detach())}, step=i)
         time.sleep(0.01)
     logger.close()
     print("Done")

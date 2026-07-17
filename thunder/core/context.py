@@ -58,7 +58,7 @@ class OptimGroupSpec:
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def factory(cls, cfg: "OptimGroupSpec | Dict[str, Any]") -> "OptimGroupSpec":
+    def factory(cls, cfg: OptimGroupSpec | Dict[str, Any]) -> OptimGroupSpec:
         if isinstance(cfg, cls):
             return cfg
         if isinstance(cfg, dict):
@@ -160,8 +160,8 @@ class ExecutionContext:
     manager: ExecutionContextManager
     meta: Dict[str, Any] = field(default_factory=dict)
     # Data
-    cache: Optional[AttrData] = None
     batch: Optional[AttrData] = None
+    cache: Optional[AttrData] = None
 
     def replace(self, **changes) -> ExecutionContext:
         return replace(self, **changes)
@@ -425,7 +425,7 @@ def ref_path_exists(root: Any, path: _RefPath) -> bool:
 
 
 if _BACKEND == "torch":
-    import torch.utils._pytree as pytree
+    import torch.utils._cxx_pytree as pytree
 
     def _flatten_optim_group(obj: OptimGroup):
         children = [obj.optimizer, obj.scaler_state]

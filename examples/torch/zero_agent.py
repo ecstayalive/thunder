@@ -3,16 +3,16 @@
 import torch
 
 from thunder.core import Executor, ModelPack
-from thunder.env.loader import EnvLoaderSpec, ThunderEnv, make_env
+from thunder.env.env import EnvLoaderSpec, make_env, ThunderEnv
 from thunder.rl.torch import Agent, Rollout
 from thunder.utils import ArgParser
 
 
 class DummyAgent(Agent):
     @classmethod
-    def from_env(cls, env: ThunderEnv) -> Agent:
+    def factory(cls, env: ThunderEnv) -> Agent:
         agent = cls(models=ModelPack(), optim_config={})
-        agent.act = lambda obs: torch.zeros(
+        agent.act = lambda obs, explore: torch.zeros(
             env.action_space.shape, device=Executor.default_device()
         )
         agent.setup_pipeline([Rollout(env, agent)])
@@ -22,6 +22,6 @@ class DummyAgent(Agent):
 if __name__ == "__main__":
     loader_spec: EnvLoaderSpec = ArgParser(EnvLoaderSpec).parse()
     env = make_env(loader_spec)
-    agent = DummyAgent.from_env(env)
+    agent = DummyAgent.factory(env)
     while True:
         agent.step()

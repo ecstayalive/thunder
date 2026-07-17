@@ -1,6 +1,22 @@
+import pytest
 import torch
 
 from thunder.nn.torch import Mamba2Block, MambaBlock
+
+
+def test_mamba2_rejects_unknown_activation():
+    with pytest.raises(KeyError):
+        Mamba2Block(d_model=128, headdim=32, activation="does_not_exist")
+
+
+def test_mamba2_rejects_swiglu_activation():
+    with pytest.raises(ValueError, match="halves"):
+        Mamba2Block(d_model=128, headdim=32, activation="swiglu")
+
+
+def test_mamba_rejects_swiglu_activation():
+    with pytest.raises(ValueError, match="halves"):
+        MambaBlock(64, official_ops=False, activation="swiglu")
 
 
 def _assert_chunk_consistency(model, x, split_idx, atol=1e-4, rtol=1e-4):

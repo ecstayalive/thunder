@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Iterator, Optional, Protocol, runtime_checkable, Tuple
 
 
 @runtime_checkable
@@ -25,8 +25,12 @@ class ModuleProtocol(Protocol):
 
     backend: str
 
-    def __call__(self, embedding: Any, carry: Any = None, **kwargs: Any) -> Tuple[Any, Any]: ...
+    def __call__(
+        self, embedding: Any, carry: Any = None, **kwargs: Any
+    ) -> Tuple[Any, Any]: ...
 
-    def forward(self, embedding: Any, carry: Any = None, **kwargs: Any) -> Tuple[Any, Any]: ...
+    def forward(
+        self, embedding: Any, carry: Any = None, **kwargs: Any
+    ) -> Tuple[Any, Any]: ...
 
     def reset(self): ...

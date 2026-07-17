@@ -11,9 +11,9 @@ _REGISTERED_ATTR_DATA_TYPES: set[type[Any]] = set()
 
 
 def _flatten_attr_data(
-    obj: "AttrData",
+    obj: AttrData,
 ) -> tuple[tuple[Any, ...], tuple[tuple[str, ...], tuple[str, ...]]]:
-    core_names = tuple(name for name, _, _ in type(obj).__attr_data_core_fields__)
+    core_names = tuple(name for name, _, _, _ in type(obj).__attr_data_core_fields__)
     data_keys = tuple(sorted(obj._data))
     children = tuple(getattr(obj, name) for name in core_names) + tuple(
         obj._data[key] for key in data_keys
@@ -22,7 +22,7 @@ def _flatten_attr_data(
 
 
 if _BACKEND == "torch":
-    import torch.utils._pytree as pytree
+    import torch.utils._cxx_pytree as pytree
 
     _register_pytree_node = pytree.register_pytree_node
 
@@ -74,33 +74,59 @@ def attr_dataclass(cls: type[TAttrData] | None = None, **dataclass_kwargs):
             raise TypeError("attr_dataclass can only be used with AttrData subclasses.")
         if "__dataclass_fields__" not in cls.__dict__:
             cls = dataclass(**dataclass_kwargs)(cls)
-        cls.__attr_data_core_fields__ = tuple(
-            (f.name, f.default, f.default_factory)
+        core_fields = tuple(
+            (f.name, f.default, f.default_factory, f.kw_only)
             for f in fields(cls)
             if f.name != "_data"
         )
+        cls.__attr_data_core_fields__ = core_fields
         cls.__attr_data_field_set__ = frozenset(cls.__dataclass_fields__)
 
-        def __init__(self, _data=None, **kwargs):
+        no_default, has_default, has_factory = 0, 1, 2
+        init_plan = []
+        for name, default, default_factory, kw_only in core_fields:
+            if default is not MISSING:
+                init_plan.append((name, has_default, default, kw_only))
+            elif default_factory is not MISSING:
+                init_plan.append((name, has_factory, default_factory, kw_only))
+            else:
+                init_plan.append((name, no_default, None, kw_only))
+        init_plan = tuple(init_plan)
+        positional_plan = tuple(field for field in init_plan if not field[3])
+        cls_name = cls.__name__
+        post_init = getattr(cls, "__post_init__", None)
+
+        def __init__(self, *args, _data=None, **kwargs):
             if type(self) is not cls:
                 raise TypeError(
                     f"{type(self).__name__} must be decorated with @attr_dataclass."
                 )
 
             data = {} if _data is None else dict(_data)
+            if len(args) > len(positional_plan):
+                raise TypeError(
+                    f"{cls_name} expected at most {len(positional_plan)} "
+                    f"positional arguments, got {len(args)}"
+                )
+            for (name, _, _, _), value in zip(positional_plan, args):
+                if name in data or name in kwargs:
+                    raise TypeError(f"Got multiple values for argument: '{name}'")
+                data[name] = value
             data.update(kwargs)
 
-            for name, default, default_factory in cls.__attr_data_core_fields__:
+            for name, default_kind, default_value, _ in init_plan:
                 if name in data:
                     object.__setattr__(self, name, data.pop(name))
-                elif default is not MISSING:
-                    object.__setattr__(self, name, default)
-                elif default_factory is not MISSING:
-                    object.__setattr__(self, name, default_factory())
+                elif default_kind == has_default:
+                    object.__setattr__(self, name, default_value)
+                elif default_kind == has_factory:
+                    object.__setattr__(self, name, default_value())
                 else:
                     raise TypeError(f"Missing required argument: '{name}'")
 
             object.__setattr__(self, "_data", data)
+            if post_init is not None:
+                post_init(self)
 
         cls.__init__ = __init__
         _register_attr_data_type(cls)
@@ -124,14 +150,12 @@ class AttrData:
                 f"'{self.__class__.__name__}' has no attribute '{name}'"
             )
         try:
-            data = object.__getattribute__(self, "_data")
-        except AttributeError as exc:
+            return self._data[name]
+        except KeyError as exc:
             raise AttributeError(
                 f"'{self.__class__.__name__}' has no attribute '{name}'"
             ) from exc
-        try:
-            return data[name]
-        except KeyError as exc:
+        except AttributeError as exc:
             raise AttributeError(
                 f"'{self.__class__.__name__}' has no attribute '{name}'"
             ) from exc
@@ -192,7 +216,7 @@ class AttrData:
             return str(value)
 
         items = []
-        for name, _, _ in self.__class__.__attr_data_core_fields__:
+        for name, _, _, _ in self.__class__.__attr_data_core_fields__:
             value = getattr(self, name)
             if value is not None:
                 items.append(f"{name}={_fmt(value)}")
@@ -221,10 +245,6 @@ class Batch(AttrData):
     next_values: Optional[Any] = None
     advantages: Optional[Any] = None
     returns: Optional[Any] = None
-    # Carry
-    policy_carry: Optional[Any] = None
-    critic_carry: Optional[Any] = None
-    represent_carry: Optional[Any] = None
 
 
 __all__ = ["AttrData", "Batch", "attr_dataclass"]

@@ -1,6 +1,7 @@
 import math
 import warnings
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import ClassVar, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,9 @@ except ImportError:
     mamba_chunk_scan_combined = None
 
 import thunder.nn.torch.ops as ops
-from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
+from .activation import resolve_activation
+
+from .base import ModelSpec
 
 
 class RMSNormGated(nn.Module):
@@ -79,7 +82,9 @@ def _depthwise_causal_conv1d_chunk(
             last_conv_state = x[..., -(kernel_size - 1) :]
         else:
             pad_len = (kernel_size - 1) - seqlen
-            last_conv_state = torch.cat([x.new_zeros(batch, channels, pad_len), x], dim=-1)
+            last_conv_state = torch.cat(
+                [x.new_zeros(batch, channels, pad_len), x], dim=-1
+            )
     else:
         x_full = torch.cat([conv_state, x], dim=-1)
         y = F.conv1d(
@@ -158,16 +163,21 @@ class MambaBlock(nn.Module):
         self.x_proj = nn.Linear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
-        self.activate_layer = getattr(nn, ACTIVATION_CLS_NAME[activation])()
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dt_proj = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **factory_kwargs
+        )
+        self.activate_layer = resolve_activation(activation)()
+        self.out_proj = nn.Linear(
+            self.d_inner, self.d_model, bias=bias, **factory_kwargs
+        )
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
         nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.d_inner, **factory_kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
         # More stable and efficient inverse of softplus
@@ -177,7 +187,9 @@ class MambaBlock(nn.Module):
             self.dt_proj.bias.copy_(inv_dt)
         # self.dt_proj.bias._no_reinit=True
 
-        A = torch.arange(1, d_state + 1, dtype=torch.float32, device=device).repeat(self.d_inner, 1)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32, device=device).repeat(
+            self.d_inner, 1
+        )
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
 
@@ -188,7 +200,9 @@ class MambaBlock(nn.Module):
             pass  # TODO:
 
     def forward(
-        self, input: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self,
+        input: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -240,7 +254,9 @@ class MambaBlock(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         A = -torch.exp(self.A_log.float())
         deltaBC = self.x_proj(x)
-        delta, B, C = torch.split(deltaBC, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        delta, B, C = torch.split(
+            deltaBC, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
 
         delta = self.dt_proj.weight @ delta.transpose(1, 2)
         x = x.transpose(1, 2)
@@ -341,10 +357,11 @@ class Mamba2Block(nn.Module):
             bias=conv_bias,
             **factory_kwargs,
         )
-        act_cls = getattr(nn, ACTIVATION_CLS_NAME.get(activation, "SiLU"))
+        act_cls = resolve_activation(activation)
         self.activate_layer = act_cls()
         dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.nheads, **factory_kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
@@ -352,18 +369,26 @@ class Mamba2Block(nn.Module):
         self.dt_bias = nn.Parameter(inv_dt)
         self.dt_bias._no_weight_decay = True
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
+        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(
+            *A_init_range
+        )
         A_log = torch.log(A).to(dtype=dtype)
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
         self.D = nn.Parameter(torch.ones(self.nheads, device=device))
         self.D._no_weight_decay = True
         if self.rmsnorm:
-            self.norm = RMSNormGated(self.d_inner, norm_before_gate=False, **factory_kwargs)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+            self.norm = RMSNormGated(
+                self.d_inner, norm_before_gate=False, **factory_kwargs
+            )
+        self.out_proj = nn.Linear(
+            self.d_inner, self.d_model, bias=bias, **factory_kwargs
+        )
 
     def forward(
-        self, input: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self,
+        input: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -485,3 +510,38 @@ class Mamba2Block(nn.Module):
             input_t = input_t.unsqueeze(1)  # (B, 1, D)
         out, last_state = self.forward(input_t, state)  # (B, 1, D)
         return out[:, -1, :], last_state
+
+
+@dataclass
+class MambaSpec(ModelSpec):
+    """:class:`Mamba2Block` is dim-preserving (input dim == output dim == ``out_shape``),
+    and already follows ``forward(input, state) -> (output, state)``. To feed an obs
+    stream whose dim differs from ``out_shape``, prepend a projection via
+    ``SequentialSpec`` (e.g. ``SequentialSpec((LinearBlockSpec(out_shape=d), MambaSpec(out_shape=d)))``).
+    """
+
+    d_state: int = 64
+    d_conv: int = 4
+    expand: int = 2
+    headdim: int = 64
+    activation: str = "silu"
+    official_ops: bool = False
+
+    class_type: ClassVar[Type[nn.Module]] = Mamba2Block
+
+    def factory(self, *in_shapes, **ctx) -> Mamba2Block:
+        if in_shapes[0] != self.out_shape:
+            raise ValueError(
+                f"MambaSpec is dim-preserving but got in={in_shapes[0]} != out_shape="
+                f"{self.out_shape}. Prepend a projection (e.g. LinearBlockSpec) via "
+                "SequentialSpec."
+            )
+        return self.class_type(
+            self.out_shape,
+            d_state=self.d_state,
+            d_conv=self.d_conv,
+            expand=self.expand,
+            headdim=self.headdim,
+            activation=self.activation,
+            official_ops=self.official_ops,
+        )

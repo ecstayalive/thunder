@@ -5,13 +5,15 @@ from typing import Any, Dict
 
 import torch
 
+from thunder.utils import Scalar
+
 
 @dataclass(slots=True)
 class AdaptiveKlSchedulerSpec:
     cls: type["AdaptiveKlScheduler"] = field(
         default_factory=lambda: AdaptiveKlScheduler
     )
-    key: str = "approx_kl"
+    key: str = "kl"
     desired_kl: float = 0.01
     min_lr: float = 1e-5
     max_lr: float = 1e-2
@@ -30,7 +32,7 @@ class AdaptiveKlScheduler:
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
-        key: str = "approx_kl",
+        key: str = "kl",
         desired_kl: float = 0.01,
         min_lr: float = 1e-5,
         max_lr: float = 1e-2,
@@ -80,24 +82,23 @@ class AdaptiveKlScheduler:
             return {}
 
         kl = exports[self.key].detach()
-        old_lr = self._get_lr()
-        new_lr = old_lr
-
-        if kl > self.desired_kl * 2.0:
-            new_lr = max(self.min_lr, old_lr / self.factor)
-        elif 0.0 < kl < self.desired_kl / 2.0:
-            new_lr = min(self.max_lr, old_lr * self.factor)
-
-        if new_lr != old_lr:
-            self._set_lr(new_lr)
-
-        return {"scheduler/lr": new_lr}
-
-    def _get_lr(self) -> float:
         if not self.optimizer.param_groups:
             raise RuntimeError("Optimizer has no parameter groups.")
-        return float(self.optimizer.param_groups[0]["lr"])
-
-    def _set_lr(self, lr: float) -> None:
+        lr = self.optimizer.param_groups[0]["lr"]
+        if not isinstance(lr, torch.Tensor):
+            raise TypeError("AdaptiveKlScheduler requires Tensor optimizer lr.")
+        min_lr = torch.as_tensor(self.min_lr, device=lr.device, dtype=lr.dtype)
+        max_lr = torch.as_tensor(self.max_lr, device=lr.device, dtype=lr.dtype)
+        factor = torch.as_tensor(self.factor, device=lr.device, dtype=lr.dtype)
+        desired_kl = torch.as_tensor(self.desired_kl, device=kl.device, dtype=kl.dtype)
+        decrease = torch.maximum(min_lr, lr / factor)
+        increase = torch.minimum(max_lr, lr * factor)
+        new_lr = torch.where(
+            kl > desired_kl * 2.0,
+            decrease,
+            torch.where((kl > 0.0) & (kl < desired_kl / 2.0), increase, lr),
+        )
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group_lr: torch.Tensor = group["lr"]
+            group_lr.copy_(new_lr.to(device=group_lr.device, dtype=group_lr.dtype))
+        return {"scheduler/lr": Scalar(new_lr.detach())}

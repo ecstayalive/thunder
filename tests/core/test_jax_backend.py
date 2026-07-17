@@ -40,15 +40,19 @@ class SimpleRNN(nnx.Module):
 
 class JaxMSEObjective(op_mod.Objective):
 
-    def compute(
-        self, batch: data_mod.Batch, models: module_mod.ModelPack
-    ) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, ctx: ctx_mod.ExecutionContext) -> Tuple[Any, Dict[str, Any]]:
+        batch: data_mod.Batch = ctx.batch
+        models: module_mod.ModelPack = ctx.models
         target_net: nnx.Module = getattr(models, self.kwargs.get("net", "net"))
         pred = target_net(batch.obs["obs"])
         targets = batch.actions
         error = pred - targets
         if batch.mask is not None:
-            mask_3d = jnp.expand_dims(batch.mask, axis=-1) if batch.mask.ndim == 2 else batch.mask
+            mask_3d = (
+                jnp.expand_dims(batch.mask, axis=-1)
+                if batch.mask.ndim == 2
+                else batch.mask
+            )
             error = error * mask_3d
             valid_count = jnp.sum(mask_3d) * error.shape[-1]
             loss = jnp.sum(jnp.square(error)) / jnp.clip(valid_count, min=1.0)
@@ -59,12 +63,14 @@ class JaxMSEObjective(op_mod.Objective):
 
 class MultiNetObjective(op_mod.Objective):
 
-    def compute(
-        self, batch: data_mod.Batch, models: module_mod.ModelPack
-    ) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, ctx: ctx_mod.ExecutionContext) -> Tuple[Any, Dict[str, Any]]:
+        batch: data_mod.Batch = ctx.batch
+        models: module_mod.ModelPack = ctx.models
         pred1 = getattr(models, self.kwargs.get("net1", "net1"))(batch.obs["obs"])
         pred2 = getattr(models, self.kwargs.get("net2", "net2"))(batch.obs["obs"])
-        loss = jnp.mean((pred1 - batch.actions) ** 2) + jnp.mean((pred2 - batch.actions) ** 2)
+        loss = jnp.mean((pred1 - batch.actions) ** 2) + jnp.mean(
+            (pred2 - batch.actions) ** 2
+        )
         return loss, {}
 
 
@@ -86,7 +92,9 @@ class JaxCounterOp(op_mod.Operation):
 def jax_batch_3d():
     return data_mod.Batch(
         obs={
-            "obs": jnp.array([[[1.0] * 4, [1.0] * 4, [1.0] * 4], [[2.0] * 4, [2.0] * 4, [0.0] * 4]])
+            "obs": jnp.array(
+                [[[1.0] * 4, [1.0] * 4, [1.0] * 4], [[2.0] * 4, [2.0] * 4, [0.0] * 4]]
+            )
         },
         actions=jnp.array(
             [[[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]], [[2.0, 2.0], [2.0, 2.0], [0.0, 0.0]]]
@@ -127,9 +135,13 @@ def test_jax_nnx_optimization_step(jax_batch_3d):
     rngs = nnx.Rngs(0)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor(donate=False)
-    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    ctx = executor.init(
+        models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
+    )
     ctx.batch = jax_batch_3d
-    initial_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), ctx.models.net.net.kernel[...])
+    initial_params = jax.tree_util.tree_map(
+        lambda x: jnp.copy(x), ctx.models.net.net.kernel[...]
+    )
     obj = JaxMSEObjective(1.0, "test")
     op = op_mod.OptimizeOp("opt", [obj])
     new_ctx, metrics = op(ctx)
@@ -173,7 +185,9 @@ def test_jax_gradient_clipping_logic(jax_batch_3d):
     rngs = nnx.Rngs(3)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
-    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}})
+    ctx = executor.init(
+        models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 1.0}}
+    )
     ctx.batch = jax_batch_3d
     obj = JaxMSEObjective(1.0, "test")
     op_large = op_mod.OptimizeOp("opt", [obj], max_grad_norm=1e6)
@@ -194,7 +208,9 @@ def test_jax_multi_op(jax_batch_3d):
     def soft_update(source, target, tau):
         s_state = nnx.state(source)
         t_state = nnx.state(target)
-        new_state = jax.tree_util.tree_map(lambda s, t: (1 - tau) * t + tau * s, s_state, t_state)
+        new_state = jax.tree_util.tree_map(
+            lambda s, t: (1 - tau) * t + tau * s, s_state, t_state
+        )
         nnx.update(target, new_state)
         return {}
 
@@ -207,7 +223,9 @@ def test_jax_multi_op(jax_batch_3d):
     initial_net2_params = jax.tree_util.tree_map(jnp.copy, nnx.state(net2))
     net1_params = nnx.state(net1)
     assert not jax.tree_util.tree_all(
-        jax.tree_util.tree_map(lambda x, y: jnp.array_equal(x, y), initial_net2_params, net1_params)
+        jax.tree_util.tree_map(
+            lambda x, y: jnp.array_equal(x, y), initial_net2_params, net1_params
+        )
     )
     counter = JaxCounterOp(interval=5)
     update_op = op_mod.CallableOp(
@@ -223,11 +241,17 @@ def test_jax_multi_op(jax_batch_3d):
     assert m["algorithm/counter/count"] == 1
     current_net2_params = nnx.state(algo.ctx.models.net2)
     assert not jtu.tree_all(
-        jtu.tree_map(lambda x, y: jnp.array_equal(x, y), initial_net2_params, current_net2_params)
+        jtu.tree_map(
+            lambda x, y: jnp.array_equal(x, y), initial_net2_params, current_net2_params
+        )
     )
-    expected_params = jtu.tree_map(lambda s, t: 0.1 * s + 0.9 * t, net1_params, initial_net2_params)
+    expected_params = jtu.tree_map(
+        lambda s, t: 0.1 * s + 0.9 * t, net1_params, initial_net2_params
+    )
     is_correct = jtu.tree_map(
-        lambda curr, exp: jnp.allclose(curr, exp, atol=1e-5), current_net2_params, expected_params
+        lambda curr, exp: jnp.allclose(curr, exp, atol=1e-5),
+        current_net2_params,
+        expected_params,
     )
     assert jtu.tree_all(is_correct)
     for i in range(4):
@@ -251,9 +275,9 @@ def test_jax_jit_speedup(jax_batch_3d):
             return ctx, {}
 
     class DummyObjective(op_mod.Objective):
-        def compute(self, batch: data_mod.Batch, model: module_mod.ModelPack):
+        def compute(self, ctx: ctx_mod.ExecutionContext):
             input = jax.random.normal(jax.random.key(0), (d_model, d_model))
-            output = models.net(input)
+            output = ctx.models.net(input)
             return jnp.mean(jnp.square(output)), {}
 
     rngs = nnx.Rngs(0)
@@ -267,6 +291,7 @@ def test_jax_jit_speedup(jax_batch_3d):
         op_mod.OptimizeOp("opt", [DummyObjective()], max_grad_norm=1.0),
     ]
     algo.setup_pipeline(pipeline, jit=False)
+    algo.step(jax_batch_3d)
     start_time = time.time()
     for _ in range(50):
         algo.step(jax_batch_3d)
@@ -296,10 +321,14 @@ def test_jax_mixed_precision_bf16(jax_batch_3d):
             super().__init__("forward")
 
         def forward(self, ctx):
-            ctx.batch["y"] = ctx.models.net(jax.random.normal(jax.random.key(0), (4, 4)))
+            ctx.batch["y"] = ctx.models.net(
+                jax.random.normal(jax.random.key(0), (4, 4))
+            )
             return ctx, {}
 
-    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 0.1}})
+    ctx = executor.init(
+        models, {"opt": {"targets": ["net"], "class": "sgd", "lr": 0.1}}
+    )
     ctx.batch = jax_batch_3d
     with ctx.manager:
         forward_op = ForwardOp()
@@ -364,6 +393,27 @@ def test_jax_batch_device_transfer(jax_batch_3d):
     assert jnp.all(moved_batch.obs["obs"] == jax_batch_3d.obs["obs"])
 
 
+def test_jax_attr_data_subclass_requires_attr_dataclass():
+    class Payload(data_mod.AttrData):
+        obs: Any = None
+
+    with pytest.raises(TypeError):
+        Payload(obs=jnp.ones((2, 3)), meta=jnp.ones((2, 1)))
+
+
+def test_jax_attr_dataclass_accepts_dataclass_kwargs():
+    @data_mod.attr_dataclass(slots=True)
+    class Payload(data_mod.AttrData):
+        obs: Any = None
+
+    payload = Payload(obs=jnp.ones((2, 3)), meta=jnp.ones((2, 1)))
+    mapped = jax.tree_util.tree_map(lambda leaf: leaf * 2, payload)
+
+    assert isinstance(mapped, Payload)
+    assert jnp.array_equal(mapped.obs, jnp.full((2, 3), 2.0))
+    assert jnp.array_equal(mapped._data["meta"], jnp.full((2, 1), 2.0))
+
+
 def test_jax_context_immutability_and_replace():
     executor = exec_mod.Executor()
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, nnx.Rngs(0)))
@@ -396,9 +446,11 @@ def test_jax_optimizer_target_mismatch_error(jax_batch_3d):
 
 def test_jax_objective_extra_kwargs_injection(jax_batch_3d):
     class KwargObjective(op_mod.Objective):
-        def compute(self, batch, models) -> Tuple[Any, Dict[str, Any]]:
+        def compute(self, ctx) -> Tuple[Any, Dict[str, Any]]:
             alpha = self.kwargs.get("alpha", 1.0)
-            return jnp.mean(batch.obs["obs"]) * alpha, {f"{self.name}/alpha_used": alpha}
+            return jnp.mean(ctx.batch.obs["obs"]) * alpha, {
+                f"{self.name}/alpha_used": alpha
+            }
 
     rngs = nnx.Rngs(0)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
@@ -408,7 +460,7 @@ def test_jax_objective_extra_kwargs_injection(jax_batch_3d):
     ctx = executor.init(models, {})
     ctx.batch = jax_batch_3d
 
-    _, metrics = obj.forward(ctx.batch, ctx.models)
+    _, metrics = obj.forward(ctx)
     assert metrics["test/alpha_used"] == 0.5
 
 
@@ -416,7 +468,9 @@ def test_jax_optim_group_integrity(jax_batch_3d):
     rngs = nnx.Rngs(0)
     models = module_mod.ModelPack(net=Simple3DFlaxNet(4, 2, rngs))
     executor = exec_mod.Executor()
-    ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam", "lr": 1e-3}})
+    ctx = executor.init(
+        models, {"opt": {"targets": ["net"], "class": "adam", "lr": 1e-3}}
+    )
 
     group = ctx.opt_groups["opt"]
     assert group.name == "opt"
@@ -461,7 +515,7 @@ def test_jax_model_pack_getattr_proxy():
 
 def test_jax_nan_inf_handling_in_optimize(jax_batch_3d):
     class NanObjective(op_mod.Objective):
-        def compute(self, batch, models):
+        def compute(self, ctx):
             return jnp.nan, {}
 
     rngs = nnx.Rngs(0)
@@ -469,7 +523,7 @@ def test_jax_nan_inf_handling_in_optimize(jax_batch_3d):
     executor = exec_mod.Executor()
     ctx = executor.init(models, {"opt": {"targets": ["net"], "class": "adam"}})
     ctx.batch = jax_batch_3d
-    metrics = executor.optimize(ctx, "opt", (NanObjective(name="nan"),))
+    ctx, metrics = executor.optimize(ctx, "opt", (NanObjective(name="nan"),))
     assert jnp.isnan(metrics["nan/loss"])
 
 
@@ -483,4 +537,22 @@ def test_jax_executor_donate_buffers_flag():
 def test_jax_batch_extra_getattr():
     batch = data_mod.Batch(obs=jnp.zeros(1))
     batch.custom_key = 123
+    assert batch._data["custom_key"] == 123
     assert batch.custom_key == 123
+
+
+def test_jax_batch_repr_uses_attr_data_repr():
+    batch = data_mod.Batch(obs=jnp.zeros((2, 3)), custom_key=123)
+    s = repr(batch)
+
+    assert "Batch(" in s
+    assert "obs=Arr(2, 3)" in s
+    assert "custom_key=123" in s
+    assert "_data=" not in s
+
+
+def test_jax_attr_data_base_routes_unknown_kwargs():
+    payload = data_mod.AttrData(meta=jnp.ones((2, 3)))
+
+    assert jnp.array_equal(payload.meta, jnp.ones((2, 3)))
+    assert jnp.array_equal(payload._data["meta"], jnp.ones((2, 3)))

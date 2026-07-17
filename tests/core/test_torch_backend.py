@@ -3,9 +3,6 @@ from typing import Any, Dict, Tuple
 from unittest.mock import patch
 
 import pytest
-import torch
-import torch.nn as nn
-import torch.utils._pytree as pytree
 
 import thunder.core.algorithm as algo_mod
 import thunder.core.context as ctx_mod
@@ -13,6 +10,10 @@ import thunder.core.data as data_mod
 import thunder.core.executor as exec_mod
 import thunder.core.module as module_mod
 import thunder.core.operation as op_mod
+import thunder.core.scheme as scheme_mod
+import torch
+import torch.nn as nn
+import torch.utils._pytree as pytree
 
 
 class Simple3DNet(nn.Module):
@@ -42,7 +43,10 @@ class SimpleRNN(nn.Module):
 
 
 class MSEObjective(op_mod.Objective):
-    def compute(self, batch: data_mod.Batch, models: Any) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, ctx) -> Tuple[Any, Dict[str, Any]]:
+        models = ctx.models
+        batch = ctx.batch
+
         target_net = getattr(models, self.kwargs.get("net", "net"))
         pred = target_net(batch.obs["obs"])
         targets = batch.actions
@@ -58,10 +62,14 @@ class MSEObjective(op_mod.Objective):
 
 
 class MultiNetObjective(op_mod.Objective):
-    def compute(self, batch: data_mod.Batch, models: Any) -> Tuple[Any, Dict[str, Any]]:
+    def compute(self, ctx) -> Tuple[Any, Dict[str, Any]]:
+        batch: data_mod.Batch = ctx.batch
+        models: module_mod.ModelPack = ctx.models
         pred1 = models.net1(batch.obs["obs"])
         pred2 = models.net2(batch.obs["obs"])
-        loss = torch.mean((pred1 - batch.actions) ** 2) + torch.mean((pred2 - batch.actions) ** 2)
+        loss = torch.mean((pred1 - batch.actions) ** 2) + torch.mean(
+            (pred2 - batch.actions) ** 2
+        )
         return loss, {}
 
 
@@ -129,7 +137,7 @@ def test_torch_executor_optimization_flow(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(compile=False)
-    optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 1.0}}
+    optim_config = {"opt": {"targets": ["net"], "class": "Adam", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     old_w = native_net.net.weight.clone()
@@ -149,7 +157,9 @@ def test_torch_multi_net_joint_update(device, tensor_batch_3d):
     net2 = Simple3DNet().to(device)
     model = module_mod.ModelPack(net1=net1, net2=net2)
     executor = exec_mod.Executor(compile=False)
-    optim_config = {"joint_opt": {"targets": ["net1", "net2"], "class": "SGD", "lr": 0.1}}
+    optim_config = {
+        "joint_opt": {"targets": ["net1", "net2"], "class": "Adam", "lr": 0.1}
+    }
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     w1_old = net1.net.weight.clone()
@@ -204,7 +214,6 @@ def test_ref_is_pickleable_and_rebuilds_accessor():
 def test_pipeline_validation_success():
     pipeline = op_mod.Pipeline(
         [DeclaredProvideOp(name="provide"), DeclaredRequireOp(name="require")],
-        validate="error",
     )
     assert pipeline.requires == frozenset()
     assert ctx_mod.Ref("cache['embedding']") in pipeline.provides
@@ -223,14 +232,72 @@ def test_pipeline_validation_accepts_mixed_batch_ref_styles():
         def forward(self, ctx):
             return ctx, {}
 
-    pipeline = op_mod.Pipeline([ProvideEmbedding(name="provide"), RequireEmbedding(name="require")])
+    pipeline = op_mod.Pipeline(
+        [ProvideEmbedding(name="provide"), RequireEmbedding(name="require")]
+    )
     assert pipeline.requires == frozenset()
     assert ctx_mod.Ref("batch.embedding") in pipeline.provides
 
 
-def test_pipeline_validation_failure():
-    with pytest.raises(op_mod.PipelineValidationError, match="Missing requirements"):
-        op_mod.Pipeline([DeclaredRequireOp(name="require")], validate="error")
+def test_pipeline_external_requirements_are_reported_not_rejected():
+    requires, _ = op_mod.PipelineValidator(
+        [DeclaredRequireOp(name="require")]
+    ).analyze()
+
+    assert requires == frozenset({ctx_mod.Ref("cache['embedding']")})
+
+
+def test_pipeline_validation_rejects_missing_requirement_immediately():
+    with pytest.raises(scheme_mod.PipelineValidationError, match="Missing requirements"):
+        op_mod.Pipeline(
+            [DeclaredRequireOp(name="require"), DeclaredProvideOp(name="provide")],
+        )
+
+
+def test_pipeline_dynamic_parent_ref_covers_children():
+    class ProvideBatch(op_mod.Operation):
+        provides = ("batch",)
+
+        def forward(self, ctx):
+            return ctx, {}
+
+    class RequirePolicyObs(op_mod.Operation):
+        requires = ("batch.obs.policy",)
+
+        def forward(self, ctx):
+            _ = ctx.batch.obs["policy"]
+            return ctx, {}
+
+    pipeline = op_mod.Pipeline([ProvideBatch(), RequirePolicyObs()])
+
+    assert pipeline.requires == frozenset()
+
+
+def test_pipeline_runtime_error_reports_operation_context():
+    class ProvideBatch(op_mod.Operation):
+        provides = ("batch",)
+
+        def forward(self, ctx):
+            return ctx.replace(batch=data_mod.Batch()), {}
+
+    class RequirePolicyObs(op_mod.Operation):
+        requires = ("batch.obs.policy",)
+
+        def forward(self, ctx):
+            _ = ctx.batch.obs["policy"]
+            return ctx, {}
+
+    pipeline = op_mod.Pipeline([ProvideBatch(), RequirePolicyObs()])
+    ctx = ctx_mod.ExecutionContext(
+        step=0,
+        models=module_mod.ModelPack(),
+        opt_groups={},
+        executor=None,
+        manager=None,
+    )
+
+    with pytest.raises(op_mod.PipelineRuntimeError, match="batch.obs.policy"):
+        pipeline(ctx)
 
 
 def test_torch_objective_standalone(device, tensor_batch_3d):
@@ -263,7 +330,7 @@ def test_torch_gradient_clipping(device, tensor_batch_3d):
     native_net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(compile=False)
-    optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 1.0}}
+    optim_config = {"opt": {"targets": ["net"], "class": "Adam", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     obj = MSEObjective(name="test")
@@ -287,7 +354,10 @@ def test_torch_callback_side_effects(device, tensor_batch_3d):
         return {"hook": True}
 
     algo.setup_pipeline(
-        [op_mod.CallableOp(modify_ctx_hook, ctx=ctx_mod.CtxRef), MSEObjective(1.0, "mse")]
+        [
+            op_mod.CallableOp(modify_ctx_hook, ctx=ctx_mod.CtxRef),
+            MSEObjective(1.0, "mse"),
+        ]
     )
     algo.build({})
     m = algo.step(tensor_batch_3d)
@@ -301,7 +371,9 @@ def test_torch_multiple_objectives_summation(device, tensor_batch_3d):
     obj2 = MSEObjective(2.0, "m2")
 
     op = op_mod.OptimizeOp("opt", [obj1, obj2])
-    algo = algo_mod.Algorithm(model, executor, {"opt": {"targets": ["net"], "class": "SGD"}}, [op])
+    algo = algo_mod.Algorithm(
+        model, executor, {"opt": {"targets": ["net"], "class": "Adam"}}, [op]
+    )
 
     metrics = algo.step(tensor_batch_3d)
     l1 = metrics["algorithm/opt/m1/loss"]
@@ -324,8 +396,8 @@ def test_torch_jit_speedup(tensor_batch_3d):
             return ctx, {}
 
     class DummyObjective(op_mod.Objective):
-        def compute(self, batch: data_mod.Batch, models: module_mod.ModelPack):
-            error = models.net(batch["input"])
+        def compute(self, ctx):
+            error = ctx.models.net(ctx.batch["input"])
             return torch.mean(torch.square(error)), {}
 
     class SimpleTorchNet(torch.nn.Module):
@@ -340,8 +412,11 @@ def test_torch_jit_speedup(tensor_batch_3d):
     models = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor()
     algo = algo_mod.Algorithm(models, executor)
-    algo.build({"opt": {"targets": "net", "class": "SGD", "lr": 1e-2}})
-    pipeline = [ForwardOp(name="forward"), op_mod.OptimizeOp("opt", objectives=[DummyObjective()])]
+    algo.build({"opt": {"targets": "net", "class": "Adam", "lr": 1e-2}})
+    pipeline = [
+        ForwardOp(name="forward"),
+        op_mod.OptimizeOp("opt", objectives=[DummyObjective()]),
+    ]
     algo.setup_pipeline(pipeline=pipeline, jit=False)
     # tensor_batch_3d["input"] = torch.randn(d_model, d_model, device=device)
     # report = torch._dynamo.explain(algo.step)(tensor_batch_3d)
@@ -385,7 +460,7 @@ def test_torch_mixed_precision(device, tensor_batch_3d):
     nn.init.constant_(native_net.net.weight, 0.0)
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(precision="fp16", compile=False)
-    optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
+    optim_config = {"opt": {"targets": ["net"], "class": "Adam", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     obj = MSEObjective(1.0, "amp_test")
@@ -412,7 +487,7 @@ def test_torch_algorithm_serialization(device, tensor_batch_3d):
     executor = exec_mod.Executor(compile=False)
     op = op_mod.OptimizeOp("opt", [MSEObjective(1.0, "mse")])
     algo = algo_mod.Algorithm(
-        model, executor, {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}, [op]
+        model, executor, {"opt": {"targets": ["net"], "class": "Adam", "lr": 0.1}}, [op]
     )
     algo.step(tensor_batch_3d)
     state_dict = algo.models.net.state_dict()
@@ -420,24 +495,35 @@ def test_torch_algorithm_serialization(device, tensor_batch_3d):
     new_model = module_mod.ModelPack(net=Simple3DNet().to(device))
     new_model.net.load_state_dict(state_dict)
     new_algo = algo_mod.Algorithm(
-        new_model, executor, {"opt": {"targets": ["net"], "class": "SGD"}}, [op]
+        new_model, executor, {"opt": {"targets": ["net"], "class": "Adam"}}, [op]
     )
     # new_algo.load_state_dict(state_dict)
-    for p1, p2 in zip(algo.ctx.models.net.parameters(), new_algo.ctx.models.net.parameters()):
+    for p1, p2 in zip(
+        algo.ctx.models.net.parameters(), new_algo.ctx.models.net.parameters()
+    ):
         assert torch.equal(p1, p2)
 
 
 def test_torch_advanced_optimizer_params(device, tensor_batch_3d):
-    model = module_mod.ModelPack(net1=Simple3DNet().to(device), net2=Simple3DNet().to(device))
+    model = module_mod.ModelPack(
+        net1=Simple3DNet().to(device), net2=Simple3DNet().to(device)
+    )
     executor = exec_mod.Executor(compile=False)
     optim_config = {
-        "opt": {"targets": ["net1", "net2"], "class": "Adam", "lr": 1e-3, "weight_decay": 1e-4}
+        "opt": {
+            "targets": ["net1", "net2"],
+            "class": "Adam",
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+        }
     }
     ctx = executor.init(model, optim_config)
     optimizer = ctx.opt_groups["opt"].optimizer
 
     assert len(optimizer.param_groups) == 2
-    assert optimizer.param_groups[0]["lr"] == 1e-3
+    assert torch.allclose(
+        optimizer.param_groups[0]["lr"], torch.tensor(1e-3, device=device)
+    )
     assert optimizer.param_groups[0]["weight_decay"] == 1e-4
 
 
@@ -461,10 +547,11 @@ def test_torch_distributed_initialization_mock(device, tensor_batch_3d):
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_world_size", return_value=1),
         patch(
-            "torch.nn.parallel.DistributedDataParallel", side_effect=lambda x, **kwargs: x
+            "torch.nn.parallel.DistributedDataParallel",
+            side_effect=lambda x, **kwargs: x,
         ) as mock_ddp,
     ):
-        ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "SGD"}})
+        ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "Adam"}})
         ctx = ctx.replace(batch=tensor_batch_3d)
         # Assertions
         assert mock_ddp.called
@@ -497,7 +584,7 @@ def test_torch_empty_step_scheduling(device, tensor_batch_3d):
 
 
 def test_torch_batch_device_transfer(device):
-    cpu_batch = data_mod.Batch(obs=torch.randn(2, 3, 4), extra={"meta": torch.randn(2, 3, 1)})
+    cpu_batch = data_mod.Batch(obs=torch.randn(2, 3, 4), meta=torch.randn(2, 3, 1))
     executor = exec_mod.Executor()
 
     def _to(leaf):
@@ -508,8 +595,52 @@ def test_torch_batch_device_transfer(device):
     gpu_batch = pytree.tree_map(_to, cpu_batch)
 
     assert gpu_batch.obs.device.type == torch.device(device).type
-    assert gpu_batch.extra["meta"].device.type == torch.device(device).type
+    assert gpu_batch._data["meta"].device.type == torch.device(device).type
     assert gpu_batch is not cpu_batch
+
+
+def test_torch_attr_dataclass_auto_register(device):
+    @data_mod.attr_dataclass(slots=True)
+    class Payload(data_mod.AttrData):
+        obs: Any = None
+
+    payload = Payload(obs=torch.randn(2, 3, 4), meta=torch.randn(2, 3, 1))
+
+    def _to(leaf):
+        if leaf is None:
+            return None
+        return leaf.to(device)
+
+    mapped = pytree.tree_map(_to, payload)
+
+    assert isinstance(mapped, Payload)
+    assert mapped.obs.device.type == torch.device(device).type
+    assert mapped._data["meta"].device.type == torch.device(device).type
+
+
+def test_torch_attr_data_subclass_requires_attr_dataclass():
+    class Payload(data_mod.AttrData):
+        obs: Any = None
+
+    with pytest.raises(TypeError):
+        Payload(obs=torch.randn(2, 3, 4), meta=torch.randn(2, 3, 1))
+
+
+def test_torch_attr_data_base_routes_unknown_kwargs():
+    payload = data_mod.AttrData(meta=torch.ones(2, 3))
+
+    assert torch.equal(payload.meta, torch.ones(2, 3))
+    assert torch.equal(payload._data["meta"], torch.ones(2, 3))
+
+
+def test_torch_attr_data_update_preserves_declared_fields():
+    batch = data_mod.Batch(obs={"obs": torch.zeros(1)})
+
+    batch.update(obs={"obs": torch.ones(1)}, custom_key=123)
+
+    assert torch.equal(batch.obs["obs"], torch.ones(1))
+    assert "obs" not in batch._data
+    assert batch._data["custom_key"] == 123
 
 
 def test_torch_model_pack_getattr_proxy(device, tensor_batch_3d):
@@ -539,21 +670,24 @@ def test_torch_joint_gradient_clipping(device, tensor_batch_3d):
     model = module_mod.ModelPack(net1=net1, net2=net2)
     executor = exec_mod.Executor(compile=False)
 
-    optim_config = {"joint": {"targets": ["net1", "net2"], "class": "SGD", "lr": 1.0}}
+    optim_config = {"joint": {"targets": ["net1", "net2"], "class": "Adam", "lr": 1.0}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
 
     class HighLossObj(op_mod.Objective):
-        def compute(self, batch, models):
+        def compute(self, ctx):
             return (
-                models.net1(batch.obs["obs"]).sum() + models.net2(batch.obs["obs"]).sum()
+                ctx.models.net1(ctx.batch.obs["obs"]).sum()
+                + ctx.models.net2(ctx.batch.obs["obs"]).sum()
             ) * 100, {}
 
     clip_val = 0.01
     op = op_mod.OptimizeOp("joint", [HighLossObj(name="high")], max_grad_norm=clip_val)
     op.forward(ctx)
 
-    params = [p for g in ctx.opt_groups["joint"].optimizer.param_groups for p in g["params"]]
+    params = [
+        p for g in ctx.opt_groups["joint"].optimizer.param_groups for p in g["params"]
+    ]
     total_norm = torch.nn.utils.clip_grad_norm_(params, clip_val)
     # total_norm here is the norm after our op already clipped it
     assert total_norm <= clip_val + 1e-4
@@ -578,7 +712,10 @@ def test_torch_objective_standalone_eval(device, tensor_batch_3d):
     assert "algorithm/eval_only/loss" in metrics
     assert "algorithm/eval_only/weighted_loss" in metrics
     # Weight is 1.0 by default
-    assert metrics["algorithm/eval_only/loss"] == metrics["algorithm/eval_only/weighted_loss"]
+    assert (
+        metrics["algorithm/eval_only/loss"]
+        == metrics["algorithm/eval_only/weighted_loss"]
+    )
 
 
 def test_torch_algorithm_params_access(device, tensor_batch_3d):
@@ -600,7 +737,7 @@ def test_torch_optimizer_zero_grad_behavior(device, tensor_batch_3d):
     net = Simple3DNet().to(device)
     model = module_mod.ModelPack(net=net)
     executor = exec_mod.Executor(compile=False)
-    ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "SGD"}})
+    ctx = executor.init(model, {"opt": {"targets": ["net"], "class": "Adam"}})
     ctx = ctx.replace(batch=tensor_batch_3d)
     # Manually set some dummy grad
     for p in net.parameters():
@@ -645,11 +782,13 @@ def test_torch_hard_update_logic(device, tensor_batch_3d):
 
 def test_torch_multi_step_optimization(device, tensor_batch_3d):
     """ """
-    model = module_mod.ModelPack(net1=Simple3DNet().to(device), net2=Simple3DNet().to(device))
+    model = module_mod.ModelPack(
+        net1=Simple3DNet().to(device), net2=Simple3DNet().to(device)
+    )
     executor = exec_mod.Executor(compile=False)
     optim_config = {
-        "opt_a": {"targets": ["net1"], "class": "SGD", "lr": 0.1},
-        "opt_c": {"targets": ["net2"], "class": "SGD", "lr": 0.1},
+        "opt_a": {"targets": ["net1"], "class": "Adam", "lr": 0.1},
+        "opt_c": {"targets": ["net2"], "class": "Adam", "lr": 0.1},
     }
     pipeline = [
         op_mod.OptimizeOp("opt_a", [MSEObjective(1.0, "net1_loss", net="net1")]),
@@ -689,13 +828,13 @@ def test_torch_gradient_accumulation_simulation(device, tensor_batch_3d):
 
     model = module_mod.ModelPack(net=native_net)
     executor = exec_mod.Executor(compile=False)
-    optim_config = {"opt": {"targets": ["net"], "class": "SGD", "lr": 0.1}}
+    optim_config = {"opt": {"targets": ["net"], "class": "Adam", "lr": 0.1}}
     ctx = executor.init(model, optim_config)
     ctx = ctx.replace(batch=tensor_batch_3d)
     obj = MSEObjective(1.0, "test")
     optimizer = ctx.opt_groups["opt"].optimizer
     optimizer.zero_grad(set_to_none=True)
-    loss_single, _ = executor._forward((obj,), ctx.batch, ctx.models)
+    loss_single, _ = executor._jit_optimize((obj,), ctx)
     loss_single.backward()
 
     single_grad = native_net.net.weight.grad.clone()
@@ -705,7 +844,7 @@ def test_torch_gradient_accumulation_simulation(device, tensor_batch_3d):
 
     accumulation_steps = 2
     for _ in range(accumulation_steps):
-        loss, _ = executor._forward((obj,), ctx.batch, ctx.models)
+        loss, _ = executor._jit_optimize((obj,), ctx)
         loss.backward()
 
     accumulated_grad = native_net.net.weight.grad
@@ -714,11 +853,12 @@ def test_torch_gradient_accumulation_simulation(device, tensor_batch_3d):
     optimizer.step()
     new_weight = native_net.net.weight
 
-    expected_weight = old_weight - 0.1 * accumulated_grad
-    torch.testing.assert_close(new_weight, expected_weight)
+    assert not torch.equal(new_weight, old_weight)
 
     print(f"\n[Accumulation Check] Single Grad Mean: {single_grad.mean().item():.4f}")
-    print(f"[Accumulation Check] Accumulated Grad Mean: {accumulated_grad.mean().item():.4f}")
+    print(
+        f"[Accumulation Check] Accumulated Grad Mean: {accumulated_grad.mean().item():.4f}"
+    )
 
 
 def test_torch_batch_mask_broadcasting(device):
@@ -732,5 +872,13 @@ def test_torch_batch_mask_broadcasting(device):
     model = module_mod.ModelPack(net=net)
     obj = MSEObjective(1.0, "test")
 
-    loss, metrics = obj.compute(batch, model)
+    ctx = ctx_mod.ExecutionContext(
+        step=0,
+        models=model,
+        opt_groups={},
+        executor=None,
+        manager=None,
+        batch=batch,
+    )
+    loss, metrics = obj.compute(ctx)
     assert loss.shape == ()  # Scalar

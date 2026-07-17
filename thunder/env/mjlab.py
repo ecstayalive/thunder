@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .env import EnvLoaderSpec, ThunderEnv, register_loader
+from .env import EnvLoaderSpec, register_loader, ThunderEnv
 
 
 @dataclass(kw_only=True)

@@ -1,16 +1,16 @@
 import math
-from typing import Iterator
+from dataclasses import dataclass
+from typing import ClassVar, Iterator, Tuple, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from thunder.nn.torch.mapping import ACTIVATION_CLS_NAME
+from .activation import Sin, resolve_activation
+from .base import ModelSpec
 
-from .activation import Sin
-
-__all__ = ["LinearBlock", "SirenBlock"]
+__all__ = ["LinearBlock", "SirenBlock", "LinearBlockSpec"]
 
 
 class LinearBlock(nn.Module):
@@ -22,7 +22,9 @@ class LinearBlock(nn.Module):
         hidden_features: For example, one tuple (256, 126, 10) stands that
             there are three hidden layer, which sizes are 256, 126, 10.
         activation: The type of activation function used in
-            this mlp block
+            this mlp block. GLU-family activations (e.g. ``swiglu``) halve
+            their input, so the linear layer feeding them doubles its output
+            features while the declared widths keep their meaning.
         activation_output: Whether the output needs to be activated
 
 
@@ -43,9 +45,10 @@ class LinearBlock(nn.Module):
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        # get block attributions
-        activation_fn_name = ACTIVATION_CLS_NAME[activation.lower()]
-        activation_cls = getattr(nn, activation_fn_name)
+        activation_cls = resolve_activation(activation, allow_halving=True)
+        # GLU-family activations consume 2x features and emit x, so the linear
+        # layers feeding them project to twice the declared width
+        expansion = 2 if getattr(activation_cls, "halves_dim", False) else 1
         if hidden_features is not None:
             arch = (in_features, *hidden_features, out_features)
         else:
@@ -55,11 +58,14 @@ class LinearBlock(nn.Module):
         for in_dimension, out_dimension in zip(arch[:-2], arch[1:-1]):
             layers.extend(
                 (
-                    nn.Linear(in_dimension, out_dimension, **factory_kwargs),
+                    nn.Linear(
+                        in_dimension, expansion * out_dimension, **factory_kwargs
+                    ),
                     activation_cls(),
                 )
             )
-        layers.append(nn.Linear(arch[-2], arch[-1], **factory_kwargs))
+        final_features = expansion * arch[-1] if activate_output else arch[-1]
+        layers.append(nn.Linear(arch[-2], final_features, **factory_kwargs))
         if activate_output:
             layers.append(activation_cls())
         self.linear_block = nn.Sequential(*layers)
@@ -152,8 +158,40 @@ class SirenBlock(nn.Module):
                 )
 
     def forward(self, input: Tensor) -> Tensor:
-        input = F.linear(input, self.omega * self.siren_head_weight, self.siren_head_bias)
+        input = F.linear(
+            input, self.omega * self.siren_head_weight, self.siren_head_bias
+        )
         return self.siren_tail(input)
 
     def extra_repr(self) -> str:
         return f"(siren_head): Linear(in_features={self.arch[0]}, out_features={self.arch[1]}, bias=True)"
+
+
+class _LinearBlock(nn.Module):
+    """."""
+
+    def __init__(self, block: LinearBlock):
+        super().__init__()
+        self.block = block
+
+    def forward(self, input: Tensor, carry=None):
+        return self.block(input), carry
+
+
+@dataclass
+class LinearBlockSpec(ModelSpec):
+    hidden_features: Tuple[int, ...] = (256, 128)
+    activation: str = "mish"
+    activate_output: bool = False
+
+    class_type: ClassVar[Type[nn.Module]] = LinearBlock
+
+    def factory(self, *in_shapes, **ctx) -> _LinearBlock:
+        block = self.class_type(
+            in_shapes[0],
+            self.out_shape,
+            list(self.hidden_features),
+            activation=self.activation,
+            activate_output=self.activate_output,
+        )
+        return _LinearBlock(block)

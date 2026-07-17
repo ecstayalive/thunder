@@ -1,8 +1,10 @@
-from typing import Iterator, Optional, Tuple, overload
+from dataclasses import dataclass
+from typing import ClassVar, Iterator, Literal, Optional, overload, Tuple, Type
 
 import torch
 import torch.nn as nn
 
+from .base import ModelSpec
 from .linear_blocks import LinearBlock
 
 
@@ -47,11 +49,11 @@ class LstmMlp(nn.Module):
         rnn_hidden_size: int,
         mlp_shape: Iterator[int] = None,
         rnn_num_layers: int = 1,
-        rnn_batch_first: bool = False,
+        rnn_batch_first: bool = True,
         rnn_dropout: float = 0.0,
         rnn_bidirectional: bool = False,
         rnn_proj_size: int = 0,
-        activation: str = "softsign",
+        activation: str = "mish",
         activate_output: bool = False,
         device=None,
         dtype=None,
@@ -88,7 +90,16 @@ class LstmMlp(nn.Module):
         input: torch.Tensor,
         hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if hx is not None:
+            hx = (
+                hx[0].transpose(0, 1).contiguous(),
+                hx[1].transpose(0, 1).contiguous(),
+            )
         rnn_output, rnn_hidden = self.rnn(input, hx)
+        rnn_hidden = (
+            rnn_hidden[0].transpose(0, 1),
+            rnn_hidden[1].transpose(0, 1),
+        )
         output = self.mlp(rnn_output)
         return output, rnn_hidden
 
@@ -131,10 +142,10 @@ class GruMlp(nn.Module):
         rnn_hidden_size: int,
         mlp_shape: Iterator[int] = None,
         rnn_num_layers: int = 1,
-        rnn_batch_first: bool = False,
+        rnn_batch_first: bool = True,
         rnn_dropout: float = 0.0,
         rnn_bidirectional: bool = False,
-        activation: str = "softsign",
+        activation: str = "mish",
         activate_output: bool = False,
         device=None,
         dtype=None,
@@ -166,7 +177,10 @@ class GruMlp(nn.Module):
     def forward(
         self, input: torch.Tensor, hx: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hx is not None:
+            hx = hx.transpose(0, 1).contiguous()
         rnn_output, rnn_hidden = self.rnn(input, hx)
+        rnn_hidden = rnn_hidden.transpose(0, 1)
         output = self.mlp(rnn_output)
         return output, rnn_hidden
 
@@ -198,6 +212,8 @@ class RecurrentMlp(nn.Module):
         activation_output: Whether the output needs to be activated
     """
 
+    __constants__ = ["rnn_type"]
+
     def __init__(
         self,
         rnn_type: str,
@@ -206,11 +222,11 @@ class RecurrentMlp(nn.Module):
         rnn_hidden_size: int,
         mlp_shape: Iterator[int] = None,
         rnn_num_layers: int = 1,
-        rnn_batch_first: bool = False,
+        rnn_batch_first: bool = True,
         rnn_dropout: float = 0.0,
         rnn_bidirectional: bool = False,
         rnn_proj_size: int = 0,
-        activation: str = "softsign",
+        activation: str = "mish",
         activate_output: bool = False,
         device=None,
         dtype=None,
@@ -277,6 +293,86 @@ class RecurrentMlp(nn.Module):
         ...
 
     def forward(self, input: torch.Tensor, hx=None):
+        if hx is not None:
+            if self.rnn_type == "lstm":
+                hx = (
+                    hx[0].transpose(0, 1).contiguous(),
+                    hx[1].transpose(0, 1).contiguous(),
+                )
+            else:
+                hx = hx.transpose(0, 1).contiguous()
         rnn_output, rnn_hidden = self.rnn(input, hx)
+        if self.rnn_type == "lstm":
+            rnn_hidden = (
+                rnn_hidden[0].transpose(0, 1),
+                rnn_hidden[1].transpose(0, 1),
+            )
+        else:
+            rnn_hidden = rnn_hidden.transpose(0, 1)
         output = self.mlp(rnn_output)
         return output, rnn_hidden
+
+
+@dataclass
+class GruMlpSpec(ModelSpec):
+    rnn_hidden_size: int = 256
+    mlp_shape: Tuple[int, ...] = ()
+    rnn_num_layers: int = 1
+    activation: str = "mish"
+
+    class_type: ClassVar[Type[nn.Module]] = GruMlp
+
+    def factory(self, *in_shapes, **ctx) -> GruMlp:
+        return self.class_type(
+            in_shapes[0],
+            self.out_shape,
+            self.rnn_hidden_size,
+            list(self.mlp_shape),
+            rnn_num_layers=self.rnn_num_layers,
+            rnn_batch_first=True,
+            activation=self.activation,
+        )
+
+
+@dataclass
+class LstmMlpSpec(ModelSpec):
+    rnn_hidden_size: int = 256
+    mlp_shape: Tuple[int, ...] = ()
+    rnn_num_layers: int = 1
+    activation: str = "mish"
+
+    class_type: ClassVar[Type[nn.Module]] = LstmMlp
+
+    def factory(self, *in_shapes, **ctx) -> LstmMlp:
+        return self.class_type(
+            in_shapes[0],
+            self.out_shape,
+            self.rnn_hidden_size,
+            list(self.mlp_shape),
+            rnn_num_layers=self.rnn_num_layers,
+            rnn_batch_first=True,
+            activation=self.activation,
+        )
+
+
+@dataclass
+class RecurrentMlpSpec(ModelSpec):
+    rnn_type: Literal["gru", "lstm"] = "gru"
+    rnn_hidden_size: int = 256
+    mlp_shape: Tuple[int, ...] = ()
+    rnn_num_layers: int = 1
+    activation: str = "mish"
+
+    class_type: ClassVar[Type[nn.Module]] = RecurrentMlp
+
+    def factory(self, *in_shapes, **ctx) -> RecurrentMlp:
+        return self.class_type(
+            self.rnn_type,
+            in_shapes[0],
+            self.out_shape,
+            self.rnn_hidden_size,
+            list(self.mlp_shape),
+            rnn_num_layers=self.rnn_num_layers,
+            rnn_batch_first=True,
+            activation=self.activation,
+        )

@@ -1,40 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, is_dataclass
-from types import UnionType
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    get_args,
-    get_type_hints,
-    List,
-    Optional,
-    Tuple,
-    TYPE_CHECKING,
-    TypeVar,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import gymnasium as gym
 
 from thunder.core import Executor
 
+from .typing import ActionType, ArrayType, ObservationType
+
 if TYPE_CHECKING:
     from gymnasium import Space
     from gymnasium.envs.registration import EnvSpec
 
-    from thunder.env.typing import ActionType, ArrayType, ObservationType
-
 _LOADER_REGISTRY: Dict[str, Callable[[Any], gym.Env]] = {}
-_LOADER_SPEC_REGISTRY: Dict[str, type] = {}
 
 
 @dataclass
 class EnvLoaderSpec:
     """
-
-    Args:
-
+    Attributes:
+        framework: Framework identifier
+        task: Registered environment.
+        num_envs: Number of parallel environments to spawn.
+        num_agents: Number of agents per environment (for multi-agent envs).
+        seed: Random seed for environment initialization.
+        device: Compute device string.
     """
 
     framework: str
@@ -42,9 +33,10 @@ class EnvLoaderSpec:
     num_envs: int = 1
     num_agents: int = 1
     seed: int = 0
+    device: str = "cuda"
 
 
-class ThunderEnv(gym.Env):
+class ThunderEnv(gym.Env[ObservationType, ActionType]):
     """_summary_
 
     Raises:
@@ -64,12 +56,13 @@ class ThunderEnv(gym.Env):
         "builtins": "numpy",
     }
     autoreset_mode: gym.vector.AutoresetMode = gym.vector.AutoresetMode.SAME_STEP
+    # _train: bool = False
 
     def __init__(self, env: gym.Env | gym.vector.VectorEnv):
         self.env: gym.Env | gym.vector.VectorEnv = env
         self._data_type: Optional[str] = None
-        self._inbound_fn: callable = None
-        self._outbound_fn: callable = None
+        self._inbound_fn: Callable[[Any], Any] = None
+        self._outbound_fn: Callable[[Any], Any] = None
 
         self._action_space: Space[WrapperActType] | None = None
         self._observation_space: Space[WrapperObsType] | None = None
@@ -87,11 +80,13 @@ class ThunderEnv(gym.Env):
     def step(
         self, action: ActionType
     ) -> Tuple[ObservationType, ArrayType, ArrayType, ArrayType, Dict[str, Any]]:
-        next_obs, reward, done, timeouts, info = self.env.step(self._inbound_fn(action))
+        next_obs, reward, terminated, timeouts, info = self.env.step(
+            self._inbound_fn(action)
+        )
         return (
             self._outbound_fn(next_obs),
             self._outbound_fn(reward),
-            self._outbound_fn(done),
+            self._outbound_fn(terminated),
             self._outbound_fn(timeouts),
             info,
         )
@@ -146,6 +141,39 @@ class ThunderEnv(gym.Env):
     def observation_space(self) -> gym.spaces.Dict:
         return self.env.observation_space
 
+    @property
+    def single_observation_space(self) -> gym.spaces.Dict:
+        space = getattr(self.env.unwrapped, "single_observation_space", None)
+        return space or self._unbatch_space(self.observation_space, self.num_envs)
+
+    @property
+    def single_action_space(self) -> gym.Space:
+        space = getattr(self.env.unwrapped, "single_action_space", None)
+        return space or self._unbatch_space(self.action_space, self.num_envs)
+
+    @staticmethod
+    def _unbatch_space(space: gym.Space, num_envs: int) -> gym.Space:
+        """Strip the leading ``num_envs`` axis to yield a single-env space.
+
+        Only removes the first axis when it actually equals ``num_envs``, so a
+        space that is already per-env is returned unchanged.
+        """
+        if isinstance(space, gym.spaces.Dict):
+            return gym.spaces.Dict(
+                {
+                    key: ThunderEnv._unbatch_space(sub, num_envs)
+                    for key, sub in space.spaces.items()
+                }
+            )
+        if isinstance(space, gym.spaces.Box) and space.shape[:1] == (num_envs,):
+            return gym.spaces.Box(
+                low=space.low[0],
+                high=space.high[0],
+                shape=space.shape[1:],
+                dtype=space.dtype,
+            )
+        return space
+
     def __getattr__(self, name: str):
         """
         If a method/attribute is not found in ThunderWrapper,
@@ -176,11 +204,13 @@ class ObservationWrapper(ThunderEnv):
     def step(
         self, action: ActionType
     ) -> Tuple[ObservationType, ArrayType, ArrayType, ArrayType, Dict[str, Any]]:
-        next_obs, reward, done, timeouts, info = self.env.step(self._inbound_fn(action))
+        next_obs, reward, terminated, timeouts, info = self.env.step(
+            self._inbound_fn(action)
+        )
         return (
             self.observation(self._outbound_fn(next_obs)),
             self._outbound_fn(reward),
-            self._outbound_fn(done),
+            self._outbound_fn(terminated),
             self._outbound_fn(timeouts),
             info,
         )
@@ -198,16 +228,17 @@ class ObservationWrapper(ThunderEnv):
 
 
 class RewardWrapper(ThunderEnv):
-
     def step(
         self, action: ActionType
     ) -> Tuple[ObservationType, ArrayType, ArrayType, ArrayType, Dict[str, Any]]:
         """Modifies the :attr:`env` :meth:`step` reward using :meth:`self.reward`."""
-        next_obs, reward, done, timeouts, info = self.env.step(self._inbound_fn(action))
+        next_obs, reward, terminated, timeouts, info = self.env.step(
+            self._inbound_fn(action)
+        )
         return (
             self._outbound_fn(next_obs),
             self.reward(self._outbound_fn(reward)),
-            self._outbound_fn(done),
+            self._outbound_fn(terminated),
             self._outbound_fn(timeouts),
             info,
         )
@@ -254,36 +285,7 @@ class ActionWrapper(ThunderEnv):
         raise NotImplementedError
 
 
-def _iter_annotation_types(annotation: Any):
-    if annotation is None:
-        return
-    origin = getattr(annotation, "__origin__", None)
-    if origin is None:
-        origin = getattr(annotation, "__class__", None)
-    if origin is UnionType or str(origin) == "typing.Union":
-        for arg in get_args(annotation):
-            yield from _iter_annotation_types(arg)
-        return
-    yield annotation
-
-
-def _infer_loader_spec_cls(loader: Callable) -> type | None:
-    try:
-        annotation = get_type_hints(loader).get("spec")
-    except Exception:
-        annotation = getattr(loader, "__annotations__", {}).get("spec")
-
-    for candidate in _iter_annotation_types(annotation):
-        if not isinstance(candidate, type):
-            continue
-        if candidate is EnvLoaderSpec:
-            continue
-        if issubclass(candidate, EnvLoaderSpec) and is_dataclass(candidate):
-            return candidate
-    return None
-
-
-def register_loader(framework: str, spec_cls: type | None = None):
+def register_loader(framework: str):
     """_summary_
 
     Args:
@@ -292,23 +294,9 @@ def register_loader(framework: str, spec_cls: type | None = None):
 
     def decorator(func: Callable):
         _LOADER_REGISTRY[framework] = func
-        resolved_spec_cls = spec_cls or _infer_loader_spec_cls(func)
-        if resolved_spec_cls is not None:
-            _LOADER_SPEC_REGISTRY[framework] = resolved_spec_cls
         return func
 
     return decorator
-
-
-def get_loader_spec_cls(framework: str, default: type | None = None) -> type | None:
-    if framework not in _LOADER_SPEC_REGISTRY:
-        import importlib
-
-        try:
-            importlib.import_module(f"thunder.env.{framework}")
-        except ModuleNotFoundError:
-            return default
-    return _LOADER_SPEC_REGISTRY.get(framework, default)
 
 
 def make_env(

@@ -1,4 +1,5 @@
 import numpy as np
+
 import torch
 import torch.nn as nn
 
@@ -37,7 +38,12 @@ class RunningNorm1d(nn.Module):
     """
 
     def __init__(
-        self, num_features: int, eps: float = 1e-5, affine: bool = False, device=None, dtype=None
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        affine: bool = False,
+        device=None,
+        dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -50,7 +56,9 @@ class RunningNorm1d(nn.Module):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-        self.register_buffer("running_mean", torch.zeros(num_features, **factory_kwargs))
+        self.register_buffer(
+            "running_mean", torch.zeros(num_features, **factory_kwargs)
+        )
         self.register_buffer("running_var", torch.ones(num_features, **factory_kwargs))
         self.register_buffer("running_std", torch.ones(num_features, **factory_kwargs))
         self.running_mean: torch.Tensor
@@ -80,7 +88,10 @@ class RunningNorm1d(nn.Module):
             nn.init.zeros_(self.bias)
 
     def forward(
-        self, input: torch.Tensor, update_stats: bool = False, mask: torch.Tensor | None = None
+        self,
+        input: torch.Tensor,
+        update_stats: bool = False,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if update_stats:
             self.update(input, mask=mask)
@@ -88,10 +99,12 @@ class RunningNorm1d(nn.Module):
 
     def normalize(self, input: torch.Tensor) -> torch.Tensor:
         if self.affine:
-            return (input - self.running_mean) / self.running_std * self.weight + self.bias
+            return (
+                input - self.running_mean
+            ) / self.running_std * self.weight + self.bias
         return (input - self.running_mean) / self.running_std
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def update(self, input: torch.Tensor, mask: torch.Tensor | None = None) -> None:
         if input.shape[-1] != self.num_features:
             raise ValueError(
@@ -147,15 +160,17 @@ class DictRunningNorm1d(nn.Module):
     def __init__(self, specs: dict[str, int], eps=1e-5):
         super().__init__()
         self.keys = tuple(specs.keys())
-        self.norms = nn.ModuleDict({key: RunningNorm1d(dim, eps=eps) for key, dim in specs.items()})
+        self.norms = nn.ModuleDict(
+            {key: RunningNorm1d(dim, eps=eps) for key, dim in specs.items()}
+        )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def update(self, obs):
         for key in self.keys:
-            self.norms[key].update(obs.get(key, obs[key]))
+            self.norms[key].update(obs[key])
 
     def forward(self, obs):
         obs = dict(obs)
         for key in self.keys:
-            obs[key] = self.norms[key](obs.get(key, obs[key]))
+            obs[key] = self.norms[key](obs[key])
         return obs

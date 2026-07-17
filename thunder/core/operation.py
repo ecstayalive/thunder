@@ -1,121 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from functools import partial
-from typing import (
-    Any,
-    Callable,
-    ClassVar,
-    Dict,
-    Iterable,
-    Optional,
-    Tuple,
-    TYPE_CHECKING,
-)
+from typing import Any, ClassVar, Dict, Iterable, Optional, Tuple, TYPE_CHECKING
 
-from .context import Ref, replace_ref_path
+from .context import Ref
 from .executor import Executor
+from .scheme import normalize_refs, PipelineRuntimeError, PipelineValidator, RefSpec
 
 if TYPE_CHECKING:
     from .context import ExecutionContext
-    from .data import Batch
-    from .module import ModelPack
-
-
-_RefSpec = Any
-
-
-def _normalize_refs(refs: Iterable[_RefSpec] | None) -> frozenset[Ref]:
-    """ """
-    if refs is None:
-        return frozenset()
-    return frozenset(ref if isinstance(ref, Ref) else Ref(ref) for ref in refs)
-
-
-class PipelineValidationError(ValueError):
-    pass
-
-
-_SYSTEM_PREFIX_REFS = _normalize_refs(
-    (
-        "batch.obs",
-        "batch.actions",
-        "batch.rewards",
-        "batch.terminated",
-        "batch.timeouts",
-        "batch.mask",
-        "batch.next_obs",
-        "batch.values",
-    )
-)
-_SYSTEM_EXACT_REFS = _normalize_refs(
-    (
-        "step",
-        "batch",
-        "cache",
-        "models",
-        "executor",
-        "manager",
-        "opt_groups",
-        "meta",
-    )
-)
-SYSTEM_EXACT_REFS = _SYSTEM_EXACT_REFS
-SYSTEM_PREFIX_REFS = _SYSTEM_PREFIX_REFS
-
-
-@dataclass(slots=True)
-class _RefNode:
-    terminal: bool = False
-    children: Dict[Any, "_RefNode"] = field(default_factory=dict)
-
-
-class RefIndex:
-    __slots__ = ("_prefix_root", "_exact")
-
-    def __init__(
-        self,
-        exact_refs: Iterable[_RefSpec] = (),
-        prefix_refs: Iterable[_RefSpec] = (),
-    ):
-        self._prefix_root = _RefNode()
-        self._exact: set[Ref] = set()
-        self.update_exact(exact_refs)
-        self.update_prefix(prefix_refs)
-
-    def add_exact(self, ref: _RefSpec) -> None:
-        self._exact.add(ref if isinstance(ref, Ref) else Ref(ref))
-
-    def add_prefix(self, ref: _RefSpec) -> None:
-        ref = ref if isinstance(ref, Ref) else Ref(ref)
-        node = self._prefix_root
-        for step in ref.path:
-            node = node.children.setdefault(step, _RefNode())
-        node.terminal = True
-
-    def update_exact(self, refs: Iterable[_RefSpec]) -> None:
-        for ref in refs:
-            self.add_exact(ref)
-
-    def update_prefix(self, refs: Iterable[_RefSpec]) -> None:
-        for ref in refs:
-            self.add_prefix(ref)
-
-    def covers(self, ref: _RefSpec) -> bool:
-        ref = ref if isinstance(ref, Ref) else Ref(ref)
-        if ref in self._exact:
-            return True
-        node = self._prefix_root
-        if node.terminal:
-            return True
-        for step in ref.path:
-            node = node.children.get(step)
-            if node is None:
-                return False
-            if node.terminal:
-                return True
-        return False
 
 
 class Operation(ABC):
@@ -126,8 +20,8 @@ class Operation(ABC):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        cls.requires = _normalize_refs(getattr(cls, "requires", ()))
-        cls.provides = _normalize_refs(getattr(cls, "provides", ()))
+        cls.requires = normalize_refs(getattr(cls, "requires", ()))
+        cls.provides = normalize_refs(getattr(cls, "provides", ()))
 
     def __init__(self, name: str = "", **kwargs):
         self.name = name
@@ -138,9 +32,28 @@ class Operation(ABC):
         self, ctx: ExecutionContext
     ) -> Tuple[ExecutionContext, Dict[str, Any]]:
         """ """
-        ctx, metrics = self.forward(ctx)
+        try:
+            ctx, metrics = self.forward(ctx)
+        except PipelineRuntimeError:
+            raise
+        except Exception as exc:
+            raise PipelineRuntimeError(self._fmt_runtime_error(ctx, exc)) from exc
         metrics = {f"{self._prefix}{k}": v for k, v in metrics.items()}
         return ctx, metrics
+
+    def _fmt_runtime_error(self, ctx: ExecutionContext, exc: Exception) -> str:
+        op_name = f"'{self.name}'" if self.name else "<unnamed>"
+        requires = ", ".join(map(repr, self.requires)) or "<none>"
+        provides = ", ".join(map(repr, self.provides)) or "<none>"
+        batch = getattr(ctx, "batch", None)
+        cache = getattr(ctx, "cache", None)
+        return (
+            f"\033[91m{type(self).__name__}({op_name}) failed during execution.\n"
+            f"Original error: {type(exc).__name__}: {exc}\n"
+            f"Declared requires: {requires}\n"
+            f"Declared provides: {provides}\n"
+            f"Context snapshot: batch={batch!r}, cache={cache!r}\033[0m"
+        )
 
     def _repr_fields(self) -> Dict[str, Any]:
         fields = {"name": self.name}
@@ -199,7 +112,6 @@ class Objective(Operation):
     def __init__(self, weight: float = 1.0, name: str = "objective", **kwargs):
         super().__init__(name=name, **kwargs)
         self.weight = weight
-
         #
         self.exports: Dict[str, Any] = {}
 
@@ -213,12 +125,15 @@ class Objective(Operation):
         return ctx, metrics
 
     def evaluate(self, ctx: ExecutionContext) -> Tuple[Any, Dict[str, Any]]:
+        from thunder.utils.logging import Scalar
+
         self.exports.clear()
         loss, metrics = self.compute(ctx)
         weighted_loss = self.curriculum(ctx) * self.weight * loss
+        metrics = {f"{self._prefix}{k}": v for k, v in metrics.items()}
         metrics = {
-            f"loss": loss,
-            f"weighted_loss": weighted_loss,
+            f"{self._prefix}loss": Scalar(Executor.detach(loss)),
+            f"{self._prefix}weighted_loss": Scalar(Executor.detach(weighted_loss)),
             **metrics,
         }
         return weighted_loss, metrics
@@ -250,33 +165,22 @@ class Pipeline(Operation):
     forward_fn: callable
 
     def __init__(
-        self,
-        pipeline: Iterable[Operation],
-        name="",
-        jit: bool = False,
-        validate: str | None = "error",
-        initial_exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
-        initial_prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
-        **kwargs,
+        self, pipeline: Iterable[Operation], name="", jit: bool = False, **kwargs
     ):
         super().__init__(name, **kwargs)
         self.jit = jit
         self.pipeline = list(pipeline)
-        self._validate_mode = validate
-        self._initial_exact_refs = tuple(initial_exact_refs)
-        self._initial_prefix_refs = tuple(initial_prefix_refs)
         self.setup()
-
-    def __call__(
-        self, ctx: ExecutionContext
-    ) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        return self.forward(ctx)
 
     def forward(self, ctx: ExecutionContext):
         return self.forward_fn(ctx)
 
     @staticmethod
-    def _forward(ctx: ExecutionContext, pipeline: Tuple[Operation, ...], prefix: str):
+    def _forward(
+        ctx: ExecutionContext,
+        pipeline: Tuple[Operation, ...],
+        prefix: str,
+    ):
         metrics = {}
         for op in pipeline:
             ctx, m = op(ctx)
@@ -286,86 +190,57 @@ class Pipeline(Operation):
 
     def setup(self):
         self._pipeline = tuple(self.pipeline)
-        self._refresh_contracts()
-        self._validate_contract(
-            initial_exact_refs=self._initial_exact_refs,
-            initial_prefix_refs=self._initial_prefix_refs,
-            mode=self._validate_mode,
-        )
+        requires, provides = self._analyze_contract()
+        self.requires = requires
+        self.provides = provides
+        self.validate(initial_refs=requires)
         self.forward_fn = self._compile_forward()
 
     def _compile_forward(self):
         forward_fn = partial(
-            self._forward, pipeline=self._pipeline, prefix=self._prefix
+            self._forward,
+            pipeline=self._pipeline,
+            prefix=self._prefix,
         )
         return Executor.jit(forward_fn) if self.jit else forward_fn
 
-    def _validate_contract(
-        self,
-        initial_exact_refs: Iterable[_RefSpec],
-        initial_prefix_refs: Iterable[_RefSpec],
-        mode: str | None,
-    ) -> None:
-        if mode is None:
-            return
-        self.validate(
-            initial_exact_refs=initial_exact_refs,
-            initial_prefix_refs=initial_prefix_refs,
-            mode=mode,
-        )
-
     def _refresh_contracts(self) -> None:
-        requires, provides = self._analyze_contract(
-            exact_refs=self._initial_exact_refs,
-            prefix_refs=self._initial_prefix_refs,
-        )
+        requires, provides = self._analyze_contract()
         self.requires = requires
         self.provides = provides
 
     def analyze_contract(
         self,
-        exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
-        prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
+        initial_refs: Iterable[RefSpec] = (),
     ) -> Tuple[frozenset[Ref], frozenset[Ref]]:
-        return self._analyze_contract(exact_refs=exact_refs, prefix_refs=prefix_refs)
+        return self._analyze_contract(initial_refs=initial_refs)
 
     def _analyze_contract(
         self,
-        exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
-        prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
+        initial_refs: Iterable[RefSpec] = (),
+        _seen: Optional[frozenset] = None,
     ) -> Tuple[frozenset[Ref], frozenset[Ref]]:
-        available = RefIndex(exact_refs=exact_refs, prefix_refs=prefix_refs)
-        external_requires: list[Ref] = []
-        provided_refs: list[Ref] = []
+        if _seen is None:
+            _seen = frozenset()
+        if id(self) in _seen:
+            return frozenset(), frozenset()
+        _seen = _seen | frozenset({id(self)})
+
+        ops = []
         for op in self.pipeline:
-            missing = [ref for ref in op.requires if not available.covers(ref)]
-            external_requires.extend(missing)
-            available.update_prefix(missing)
-            available.update_prefix(op.provides)
-            provided_refs.extend(op.provides)
-        return frozenset(external_requires), frozenset(provided_refs)
+            if isinstance(op, Pipeline) and id(op) not in _seen:
+                sub_req, sub_prov = op._analyze_contract(_seen=_seen)
+                ops.append((sub_req, sub_prov))
+            else:
+                ops.append(op)
+        return PipelineValidator(ops, name=self.name).analyze(initial_refs)
 
     def validate(
         self,
-        initial_exact_refs: Iterable[_RefSpec] = _SYSTEM_EXACT_REFS,
-        initial_prefix_refs: Iterable[_RefSpec] = _SYSTEM_PREFIX_REFS,
+        initial_refs: Iterable[RefSpec] = (),
         mode: str = "error",
     ) -> None:
-        available = RefIndex(
-            exact_refs=initial_exact_refs, prefix_refs=initial_prefix_refs
-        )
-        for idx, op in enumerate(self.pipeline):
-            missing = tuple(ref for ref in op.requires if not available.covers(ref))
-            if missing:
-                message = (
-                    f"Pipeline '{self.name}' validation failed at op[{idx}] '{op.name}'. "
-                    f"Missing requirements: {', '.join(map(repr, missing))}"
-                )
-                if mode == "warn":
-                    print(f"[Thunder][Pipeline Warning] {message}")
-                else:
-                    raise PipelineValidationError(message)
-            available.update_prefix(op.provides)
+        PipelineValidator(self.pipeline, name=self.name).validate(initial_refs, mode)
 
     def __iter__(self):
         return iter(self.pipeline)
@@ -441,41 +316,6 @@ class OptimizeOp(Operation):
 
     def _repr_children(self) -> Iterable[Tuple[str, Operation]]:
         return ((str(i), obj) for i, obj in enumerate(self.objectives))
-
-
-class CallableOp(Operation):
-    __slots__ = ("_fn",)
-
-    def __init__(self, fn: Callable, name="callable_op", returns=None, **bindings):
-        super().__init__(name=name)
-        self._fn = self._compile(fn, bindings, returns)
-
-    def forward(self, ctx: ExecutionContext) -> Tuple[ExecutionContext, Dict[str, Any]]:
-        return self._fn(ctx)
-
-    def _repr_fields(self) -> Dict[str, Any]:
-        fields = super()._repr_fields()
-        fields["callable"] = getattr(self._fn, "__name__", type(self._fn).__name__)
-        return fields
-
-    def _compile(self, fn: Callable, bindings: Dict[str, Any], returns: Ref | None):
-        def _resolve(value, ctx):
-            if isinstance(value, Ref):
-                return value(ctx)
-            if callable(value):
-                return value(ctx)
-            return value
-
-        def _call(ctx):
-            kwargs = {key: _resolve(value, ctx) for key, value in bindings.items()}
-            result = fn(**kwargs)
-            if returns is not None:
-                return replace_ref_path(ctx, returns.path, result), {}
-            if isinstance(result, tuple) and len(result) == 2:
-                return result
-            return ctx, result if isinstance(result, dict) else {}
-
-        return _call
 
 
 class NullOperation(Operation):

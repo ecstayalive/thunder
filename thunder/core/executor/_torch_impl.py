@@ -18,6 +18,18 @@ if TYPE_CHECKING:
     from ..operation import Objective
 
 
+class _DistributedDataParallel(nn.parallel.DistributedDataParallel):
+    """ """
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name == "module":
+                raise
+            return getattr(self.module, name)
+
+
 class _IdentityScaler:
     def __init__(self, enabled: bool = False):
         pass
@@ -48,7 +60,7 @@ class TorchExecutor:
     def __init__(
         self,
         precision: str = "fp32",
-        distributed: bool = False,
+        distributed: Optional[bool] = None,
         device: Optional[str] = None,
         enable_cudnn_benchmark: bool = True,
         compile=False,
@@ -78,6 +90,12 @@ class TorchExecutor:
         self.mixed_precision = (
             self.device.type == "cuda" and self.compute_dtype is not torch.float32
         )
+        # The live process group is the single source of truth: when ``distributed``
+        # is left unspecified, derive it from whether one has been initialized.
+        if distributed is None:
+            distributed = (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            )
         self.distributed = distributed
         self.use_scaler = (
             self.compute_dtype is torch.float16 and self.device.type == "cuda"
@@ -101,15 +119,15 @@ class TorchExecutor:
             model = model.to(self.device)
             if self.compile:
                 model = torch.compile(model, **self.compile_args)
-            if self.distributed:
+            if self.distributed and any(p.requires_grad for p in model.parameters()):
                 if distributed_strategy is not None:
                     model = distributed_strategy(model)
                 else:
                     device_ids = (
                         [self.device.index] if self.device.type == "cuda" else None
                     )
-                    model = torch.nn.parallel.DistributedDataParallel(
-                        model, device_ids=device_ids, find_unused_parameters=True
+                    model = _DistributedDataParallel(
+                        model, device_ids=device_ids, find_unused_parameters=False
                     )
             new_model_pack[name] = model
         new_models_pack = type(models)(**new_model_pack)
@@ -126,10 +144,28 @@ class TorchExecutor:
                     )
                 target_module = new_model_pack[t_name]
                 all_optimize_params.append({"params": target_module.parameters()})
-            optim_cls = spec.optimizer or "Adam"
+            optimizers = {
+                "Adam": torch.optim.Adam,
+                "AdamW": torch.optim.AdamW,
+                "Muon": torch.optim.Muon,
+            }
+            optim_cls = spec.optimizer or "AdamW"
             if isinstance(optim_cls, str):
-                optim_cls = getattr(torch.optim, optim_cls)
-            optimizer = optim_cls(all_optimize_params, **spec.optimizer_kwargs())
+                if optim_cls not in optimizers:
+                    names = ", ".join(optimizers)
+                    raise ValueError(f"Torch optimizer only supports {names}.")
+                optim_cls = optimizers[optim_cls]
+            elif optim_cls not in optimizers.values():
+                names = ", ".join(optimizers)
+                raise ValueError(
+                    f"Torch optimizer only supports {names}, "
+                    f"but got {optim_cls.__name__}."
+                )
+            optim_kwargs = spec.optimizer_kwargs()
+            optim_kwargs["lr"] = torch.tensor(
+                float(optim_kwargs.get("lr", 1e-3)), device=self.device
+            )
+            optimizer = optim_cls(all_optimize_params, **optim_kwargs)
             scheduler = self._init_scheduler(spec.scheduler, optimizer)
             opt_groups[opt_key] = OptimGroup(
                 name=opt_key,
@@ -200,11 +236,12 @@ class TorchExecutor:
         optim_group: OptimGroup = ctx.opt_groups[opt]
         optimizer: torch.optim.Optimizer = optim_group.optimizer
         loss, metrics = self._jit_optimize(objectives, ctx)
-        metrics["total_loss"] = loss.detach()
+        # metrics["total_loss"] = loss.detach()
         if optim_group.scheduler is not None:
             exports = {}
             for obj in objectives:
                 exports.update(obj.export())
+            self.reduce_mean(exports)
             scheduler_metrics = optim_group.scheduler.step(exports)
             if scheduler_metrics:
                 metrics.update(scheduler_metrics)
@@ -221,6 +258,28 @@ class TorchExecutor:
             self.scaler.step(optimizer)
             self.scaler.update()
         return ctx, metrics
+
+    def reduce_mean(self, values: Dict[str, Any]) -> None:
+        """Average every scalar-tensor entry of ``values`` across the group.
+
+        Packs all scalars into one buffer so the reduction costs a single NCCL
+        collective rather than one per entry. A no-op outside distributed mode,
+        so single-GPU paths are unaffected.
+        """
+        if not self.distributed:
+            return
+        keys = [
+            k
+            for k, v in values.items()
+            if isinstance(v, torch.Tensor) and v.numel() == 1
+        ]
+        if not keys:
+            return
+        packed = torch.stack([values[k].detach().reshape(()) for k in keys])
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        packed /= torch.distributed.get_world_size()
+        for key, value in zip(keys, packed.unbind()):
+            values[key] = value
 
     @staticmethod
     def jit(fn: Callable, **kwargs):
@@ -259,6 +318,15 @@ class TorchExecutor:
             return x
 
         return tree_map(_put_data, data)
+
+    @staticmethod
+    def detach(data: Any) -> Any:
+        def _detach(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach()
+            return x
+
+        return tree_map(_detach, data)
 
     @staticmethod
     def to_numpy(data: Any) -> Any:
